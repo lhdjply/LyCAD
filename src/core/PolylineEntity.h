@@ -18,6 +18,8 @@ namespace lycad {
 struct PolylineVertex {
     Point2D point;
     double  bulge = 0.0;
+    double  startWidth = 0.0;    ///< 本段起点宽度（DXF 40），0 = 无
+    double  endWidth = 0.0;      ///< 本段终点宽度（DXF 41），0 = 无
 };
 
 /// 多段线的一段（由相邻两顶点与起始顶点的 bulge 推导）
@@ -57,6 +59,10 @@ public:
     /// 轴对齐矩形（闭合多段线）
     static PolylineEntity makeRectangle(const Point2D& corner1, const Point2D& corner2);
 
+    /// 由「起点 + 终点 + 起点凸度」推导一段几何（直线或圆弧）。
+    /// 供填充边界、标注等需要相同 bulge 语义的场景复用。
+    static PolylineSegment makeSegment(const Point2D& start, const Point2D& end, double bulge);
+
     // ---- 顶点操作 ------------------------------------------------------------
     const std::vector<Vertex>& vertices() const noexcept { return m_vertices; }
     std::size_t vertexCount() const noexcept { return m_vertices.size(); }
@@ -69,6 +75,7 @@ public:
     void removeVertex(std::size_t index);
     void setVertexPosition(std::size_t index, const Point2D& p);
     void setVertexBulge(std::size_t index, double bulge);
+    void setVertexWidths(std::size_t index, double startWidth, double endWidth);
     void clear() noexcept;
 
     /// 仅取坐标序列，供 DXF 输出与几何计算使用
@@ -90,6 +97,29 @@ public:
     /// 逐段总长（含圆弧段弧长）
     double perimeter() const;
 
+    // ---- 宽度（PCB 走线等场合的核心语义） ------------------------------------
+    //
+    // DXF 的宽度有两层：
+    //   · 恒定宽度（组码 43）：整条多段线统一宽度，设置后逐顶点宽度被忽略；
+    //   · 逐顶点宽度（组码 40/41）：每个顶点带起止宽度，宽度沿线段线性过渡。
+    // 两者都为 0 时按普通细线处理。
+
+    /// 恒定宽度（世界单位，0 = 无）
+    double constantWidth() const noexcept { return m_constantWidth; }
+    void setConstantWidth(double w) noexcept { m_constantWidth = std::max(w, 0.0); }
+
+    /// 全线最大宽度（含恒定宽度与逐顶点宽度），用于拾取与包围盒
+    double maxWidth() const noexcept;
+
+    /// 是否存在任何非零宽度
+    bool hasWidth() const noexcept { return maxWidth() > kGeomTol; }
+
+    /// 第 index 段的有效宽度（恒定宽度优先；否则取该段两端宽度的较大值）
+    double segmentWidth(std::size_t index) const noexcept;
+
+    /// 逐顶点宽度是否完全一致（渲染时可走单路径快速通道）
+    bool hasUniformWidth() const noexcept;
+
     // ---- Entity 接口 ---------------------------------------------------------
     std::unique_ptr<Entity> clone() const override;
     Box2D boundingBox() const override;
@@ -110,6 +140,7 @@ public:
 private:
     std::vector<Vertex> m_vertices;
     bool m_closed = false;
+    double m_constantWidth = 0.0;    ///< DXF 43，0 = 无
 };
 
 } // namespace lycad

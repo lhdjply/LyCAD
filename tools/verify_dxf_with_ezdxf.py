@@ -83,7 +83,7 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
     modelspace = doc.modelspace()
     types = [e.dxftype() for e in modelspace]
     print(f"  实体: {types}")
-    check(len(types) == 17, f"实体数应为 17，实际 {len(types)}")
+    check(len(types) == 18, f"实体数应为 18，实际 {len(types)}")
     check(types.count("LINE") == 4, f"LINE 数应为 4，实际 {types.count('LINE')}")
     check(types.count("CIRCLE") == 2, f"CIRCLE 数应为 2，实际 {types.count('CIRCLE')}")
     check(types.count("ARC") == 1, "ARC 数应为 1")
@@ -91,8 +91,8 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
     check(types.count("TEXT") == 2, f"TEXT 数应为 2，实际 {types.count('TEXT')}")
     check(types.count("DIMENSION") == 4, f"DIMENSION 数应为 4，实际 {types.count('DIMENSION')}")
     poly_type = "LWPOLYLINE" if has_lwpolyline else "POLYLINE"
-    # R2000：外框 + 圆弧段多段线 = 2；R12 额外多一条由 HATCH 降级而来的闭合多段线
-    expected_polys = 3 if not has_hatch else 2
+    # R2000：外框 + 圆弧段多段线 + 带宽度走线 = 3；R12 额外多一条由 HATCH 降级而来的闭合多段线
+    expected_polys = 4 if not has_hatch else 3
     check(types.count(poly_type) == expected_polys,
           f"{poly_type} 数应为 {expected_polys}，实际 {types.count(poly_type)}")
 
@@ -143,7 +143,8 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
         return [round(b[0] if isinstance(b, tuple) else b, 6) for b in raw]
 
     closed = [poly for poly in polylines if is_closed(poly)]
-    check(len(closed) == expected_polys, f"闭合多段线应为 {expected_polys} 条，实际 {len(closed)} 条")
+    check(len(closed) == expected_polys - 1,
+          f"闭合多段线应为 {expected_polys - 1} 条（带宽走线为开环），实际 {len(closed)} 条")
 
     # 用凸度区分「直线外框」与「含圆弧段的多段线」
     arc_polys = [poly for poly in polylines if any(abs(b) > 1e-9 for b in bulges_of(poly))]
@@ -169,6 +170,17 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
         # 正凸度 = 逆时针弧段，负凸度 = 顺时针弧段，两者的符号必须都被保留
         check(0.6 in bulges, f"缺失凸度 +0.6（逆时针弧段），实际 {bulges}")
         check(-0.4 in bulges, f"缺失凸度 -0.4（顺时针弧段），实际 {bulges}")
+
+    # 带宽度多段线（PCB 走线语义）：宽度值必须完整保留
+    if has_lwpolyline:
+        wide = [p for p in modelspace.query("LWPOLYLINE")
+                if abs((p.dxf.const_width or 0.0) - 2.0) < 1e-9]
+        check(len(wide) == 1, f"应有一条恒定宽度 2.0 的多段线，实际 {len(wide)}")
+    else:
+        # R12：宽度在 POLYLINE 头部的 40/41 组码（ezdxf: default_start/end_width）
+        wide = [p for p in modelspace.query("POLYLINE")
+                if abs((p.dxf.get('default_start_width', 0.0) or 0.0) - 2.0) < 1e-9]
+        check(len(wide) == 1, f"R12 中应有默认宽度 2.0 的 POLYLINE，实际 {len(wide)}")
 
     # R12 下填充被降级为闭合多段线：验证几何信息不丢失
     if not has_hatch:
@@ -211,6 +223,10 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
         check(close(t2.dxf.align_point.x, 60.0) and close(t2.dxf.align_point.y, 55.0),
               f"第二对齐点错误: {t2.dxf.align_point}")
         check(close(t2.dxf.height, 4.0), "第二条文字字高应为 4")
+        # 71 生成标志 bit2 = 水平镜像（背面文字），41 宽度因子
+        check(bool(t2.dxf.text_generation_flag & 2),
+              f"第二条文字应带水平镜像标志，实际生成标志 {t2.dxf.text_generation_flag}")
+        check(close(t2.dxf.width, 1.1), f"宽度因子应为 1.1，实际 {t2.dxf.width}")
 
     # ---- 填充（仅 R2000） ----
     hatches = modelspace.query("HATCH")

@@ -125,6 +125,17 @@ void buildSample(Document& document)
         document.addEntity(std::move(polyline));
     }
 
+    // 带宽度多段线：模拟 PCB 走线（DXF 43 恒定宽度）
+    {
+        auto track = std::make_unique<PolylineEntity>();
+        track->appendVertex(Point2D(150.0, 12.0), 0.0);
+        track->appendVertex(Point2D(150.0, 60.0), 0.0);
+        track->appendVertex(Point2D(168.0, 78.0), 0.0);
+        track->setConstantWidth(2.0);
+        track->setLayerName(QStringLiteral("轮廓"));
+        document.addEntity(std::move(track));
+    }
+
     // 点
     {
         auto point = std::make_unique<PointEntity>(Point2D(90.0, 55.0));
@@ -153,6 +164,8 @@ void buildSample(Document& document)
         centered->setHAlign(TextEntity::HAlign::Center);
         centered->setVAlign(TextEntity::VAlign::Middle);
         centered->setAlignmentPoint(Point2D(60.0, 55.0));
+        centered->setBackwards(true);          // 背面文字（DXF 71 bit2）
+        centered->setWidthFactor(1.1);         // 宽度因子（DXF 41）
         document.addEntity(std::move(centered));
     }
 

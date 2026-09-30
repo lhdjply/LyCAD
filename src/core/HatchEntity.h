@@ -26,6 +26,8 @@ public:
     explicit HatchEntity(std::vector<Point2D> boundary);
     HatchEntity(std::vector<Point2D> boundary, const QString& patternName,
                 double scale, double angleRad);
+    /// 带凸度的边界（「2 顶点 + 凸度 1」即一个整圆，是 EDA 焊盘的常见形态）
+    HatchEntity(std::vector<Point2D> boundary, std::vector<double> bulges);
 
     // ---- 边界 ----------------------------------------------------------------
     const std::vector<Point2D>& boundary() const noexcept { return m_boundary; }
@@ -35,6 +37,13 @@ public:
 
     /// 顶点很少时的 convenience：返回第 index 个顶点
     const Point2D& vertex(std::size_t index) const { return m_boundary.at(index); }
+
+    /// 边界凸度（与顶点一一对应；缺省补 0）。凸度描述「自该顶点到下一顶点」段
+    const std::vector<double>& bulges() const noexcept { return m_bulges; }
+    double vertexBulge(std::size_t index) const
+    { return index < m_bulges.size() ? m_bulges[index] : 0.0; }
+
+    void setBoundaryWithBulges(std::vector<Point2D> pts, std::vector<double> bulges);
 
     // ---- 图案 ----------------------------------------------------------------
     const QString& patternName() const noexcept { return m_patternName; }
@@ -79,6 +88,7 @@ public:
 
 private:
     std::vector<Point2D> m_boundary;        ///< 闭合多边形顶点
+    std::vector<double>  m_bulges;          ///< 与顶点一一对应的凸度（可为空 = 全直线）
     QString  m_patternName = QStringLiteral("ANSI31");
     double   m_scale = 1.0;
     double   m_angle = 0.0;                 ///< 弧度

@@ -110,6 +110,8 @@ private:
                                                     IoResult* result);
     std::vector<std::unique_ptr<Entity>> parseDimension(const std::vector<DxfGroup>& groups,
                                                         IoResult* result);
+    /// EDA 导出的 DXF 常缺图层颜色；按图层名关键词给出惯例配色（详见实现注释）
+    void applyEdaLayerColorHeuristic(Document& document, IoResult* result);
     void consumeVertexSequence();
 
     static void applyCommonProperties(const std::vector<DxfGroup>& groups, Entity& entity);

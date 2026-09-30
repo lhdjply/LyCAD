@@ -70,6 +70,14 @@ void TextEntity::setHeight(double h)
     if (h > kGeomTol) m_height = h;
 }
 
+void TextEntity::setWidthFactor(double factor)
+{
+    // 零/近零宽度因子会让文字退化成竖线，钳制到合法范围
+    const double absFactor = std::abs(factor);
+    m_widthFactor = absFactor > 0.01 ? absFactor : 1.0;
+    if (factor < 0.0) m_backwards = true;     // 负宽度因子 = 水平镜像
+}
+
 double TextEntity::estimatedWidth() const noexcept
 {
     double width = 0.0;
@@ -84,21 +92,26 @@ double TextEntity::estimatedWidth() const noexcept
         }
         width += charWidthFactor(cp);
     }
-    return width * m_height;
+    return width * m_height * m_widthFactor;
 }
 
 std::vector<Point2D> TextEntity::outlineCorners() const
 {
-    // 以「插入点 = 左下角」的局部矩形，再旋转到世界方向
+    // 以「插入点 = 左下角」的局部矩形，再旋转到世界方向。
+    // 水平镜像时文字自锚点向左延伸；垂直镜像时向下延伸。
     const double w = std::max(estimatedWidth(), m_height * 0.5);
     const double h = m_height;
+    const double x0 = m_backwards ? -w : 0.0;
+    const double x1 = m_backwards ? 0.0 : w;
+    const double y0 = m_upsideDown ? -h * 0.75 : 0.0;
+    const double y1 = m_upsideDown ? 0.0 : h * 0.75;
 
     // 局部坐标：X 沿文字方向，Y 向上；基线位于局部 y = 0
     const std::vector<Point2D> local = {
-        { 0.0, 0.0 },
-        { w,   0.0 },
-        { w,   h * 0.75 },
-        { 0.0, h * 0.75 },
+        { x0, y0 },
+        { x1, y0 },
+        { x1, y1 },
+        { x0, y1 },
     };
 
     const double cosA = std::cos(m_rotation);
@@ -125,6 +138,10 @@ std::unique_ptr<Entity> TextEntity::clone() const
     copy->m_rotation       = m_rotation;
     copy->m_hAlign         = m_hAlign;
     copy->m_vAlign         = m_vAlign;
+    copy->m_backwards      = m_backwards;
+    copy->m_upsideDown     = m_upsideDown;
+    copy->m_widthFactor    = m_widthFactor;
+    copy->m_fontStyle      = m_fontStyle;
     copyCommonPropertiesTo(*copy);
     return copy;
 }
@@ -159,6 +176,13 @@ void TextEntity::transform(const Transform2D& t)
     } else {
         // 非等比变换无法保持文字形状，退化为：按 x 方向长度缩放字高，丢弃旋转
         m_height *= t.lengthScaleAlong(Vector2D(1.0, 0.0));
+    }
+
+    // 镜像变换会翻转文字的视觉方向：水平镜像切换 backwards 标志。
+    // （垂直方向的镜像与旋转的组合在通用变换下无法用两个布尔标志精确表达，
+    // 这里取最常见的工程语义——镜像命令产生的背面文字。）
+    if (t.isMirroring()) {
+        m_backwards = !m_backwards;
     }
 }
 
@@ -205,12 +229,18 @@ QString TextEntity::geometrySummary() const
     static const char* kH[] = { "左", "居中", "右" };
     static const char* kV[] = { "基线", "底部", "中部", "顶部" };
 
-    return QStringLiteral("内容: %1\n插入点: %2\n字高: %3\n旋转: %4\n对齐: %5/%6")
+    QString flags;
+    if (m_backwards) flags += QStringLiteral("水平镜像 ");
+    if (m_upsideDown) flags += QStringLiteral("垂直镜像 ");
+
+    return QStringLiteral("内容: %1\n插入点: %2\n字高: %3\n旋转: %4\n对齐: %5/%6\n宽度因子: %7\n%8")
         .arg(displayString(),
              formatPoint(effectivePosition()),
              formatLength(m_height),
              formatAngle(m_rotation))
-        .arg(kH[static_cast<int>(m_hAlign)], kV[static_cast<int>(m_vAlign)]);
+        .arg(kH[static_cast<int>(m_hAlign)], kV[static_cast<int>(m_vAlign)])
+        .arg(m_widthFactor)
+        .arg(flags.isEmpty() ? QStringLiteral("无镜像") : flags.trimmed());
 }
 
 } // namespace lycad

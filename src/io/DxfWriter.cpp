@@ -724,6 +724,10 @@ void DxfWriter::writePolylineR12(const PolylineEntity& polyline)
     if (!polyline.isVisible()) m_out.write(60, 1);
     m_out.write(66, 1);                       // 后续跟随 VERTEX 实体
     m_out.write(70, flags);
+    if (polyline.constantWidth() > kEpsilon) {
+        m_out.write(40, polyline.constantWidth());   // 默认起点宽度
+        m_out.write(41, polyline.constantWidth());   // 默认终点宽度
+    }
     m_out.writePoint(10, Point2D(0.0, 0.0));  // R12 要求给出一个占位坐标
 
     for (const PolylineEntity::Vertex& v : polyline.vertices()) {
@@ -731,6 +735,10 @@ void DxfWriter::writePolylineR12(const PolylineEntity& polyline)
         m_out.write(8, polyline.layerName());
         m_out.writePoint(10, v.point);
         if (std::abs(v.bulge) > kEpsilon) m_out.write(42, v.bulge);
+        if (polyline.constantWidth() <= kEpsilon) {
+            if (v.startWidth > kEpsilon) m_out.write(40, v.startWidth);
+            if (v.endWidth > kEpsilon) m_out.write(41, v.endWidth);
+        }
         m_out.write(70, 0);
     }
 
@@ -748,12 +756,19 @@ void DxfWriter::writePolylineR2000(const PolylineEntity& polyline)
 
     m_out.write(90, static_cast<int>(polyline.vertexCount()));
     m_out.write(70, polyline.isClosed() ? 1 : 0);
-    m_out.write(43, 0.0);                     // 恒定宽度
+    if (polyline.constantWidth() > kEpsilon) {
+        m_out.write(43, polyline.constantWidth());   // 恒定宽度
+    }
 
     for (const PolylineEntity::Vertex& v : polyline.vertices()) {
         m_out.write(10, v.point.x);
         m_out.write(20, v.point.y);
         if (std::abs(v.bulge) > kEpsilon) m_out.write(42, v.bulge);
+        // 恒定宽度优先：设置了 43 后逐顶点宽度不再有意义
+        if (polyline.constantWidth() <= kEpsilon) {
+            if (v.startWidth > kEpsilon) m_out.write(40, v.startWidth);
+            if (v.endWidth > kEpsilon) m_out.write(41, v.endWidth);
+        }
     }
 }
 
@@ -795,6 +810,17 @@ void DxfWriter::writeText(const TextEntity& text)
         m_out.writePoint(11, text.alignmentPoint());
         m_out.write(73, static_cast<int>(text.vAlign()));
     }
+
+    // 71 生成标志：bit2 = 水平镜像（背面文字），bit4 = 垂直镜像
+    int generationFlags = 0;
+    if (text.isBackwards()) generationFlags |= 2;
+    if (text.isUpsideDown()) generationFlags |= 4;
+    if (generationFlags != 0) m_out.write(71, generationFlags);
+
+    // 41 宽度因子
+    if (std::abs(text.widthFactor() - 1.0) > kEpsilon) {
+        m_out.write(41, text.widthFactor());
+    }
 }
 
 void DxfWriter::writeHatch(const HatchEntity& hatch)
@@ -833,15 +859,24 @@ void DxfWriter::writeHatch(const HatchEntity& hatch)
     m_out.write(70, hatch.isSolid() ? 1 : 0);
     m_out.write(71, 0);                       // 非关联
 
-    // ---- 边界路径：单个外部多段线环 ----
+    // ---- 边界路径：单个外部多段线环（可含凸度） ----
+    const bool boundaryHasBulge = hatch.bulges().empty()
+        ? false
+        : std::any_of(hatch.bulges().begin(), hatch.bulges().end(),
+                      [](double b) { return std::abs(b) > kEpsilon; });
+
     m_out.write(91, 1);                       // 环数
     m_out.write(92, 5);                       // bit0 = 多段线路径, bit2 = 外部环
-    m_out.write(72, 0);                       // 边界顶点不带凸度
+    m_out.write(72, boundaryHasBulge ? 1 : 0);
     m_out.write(73, 1);                       // 闭合
     m_out.write(93, static_cast<int>(hatch.vertexCount()));
-    for (const Point2D& p : hatch.boundary()) {
+    for (std::size_t i = 0; i < hatch.vertexCount(); ++i) {
+        const Point2D& p = hatch.vertex(i);
         m_out.write(10, p.x);
         m_out.write(20, p.y);
+        if (boundaryHasBulge && std::abs(hatch.vertexBulge(i)) > kEpsilon) {
+            m_out.write(42, hatch.vertexBulge(i));
+        }
     }
     m_out.write(97, 0);                       // 种子点数
 

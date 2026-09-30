@@ -55,6 +55,25 @@ public:
     VAlign vAlign() const noexcept { return m_vAlign; }
     void setVAlign(VAlign a) noexcept { m_vAlign = a; }
 
+    // ---- 生成标志与宽度因子（DXF 71 / 41） ------------------------------------
+    //
+    // 「背面文字」（如 PCB 底面丝印）在 DXF 中以生成标志表达：
+    //   bit 2（值 2）= 水平镜像（backwards），bit 4（值 4）= 垂直镜像（upside-down）。
+    // 宽度因子为字符宽度与字高之比；负值同样表示水平镜像（读入时归一为正因子 + 镜像标志）。
+
+    bool isBackwards() const noexcept { return m_backwards; }
+    void setBackwards(bool on) noexcept { m_backwards = on; }
+
+    bool isUpsideDown() const noexcept { return m_upsideDown; }
+    void setUpsideDown(bool on) noexcept { m_upsideDown = on; }
+
+    double widthFactor() const noexcept { return m_widthFactor; }
+    void setWidthFactor(double factor);
+
+    /// DXF 文字样式名（如 "黑体"/"Arial"）。渲染时若系统存在同名字体则采用。
+    const QString& fontStyle() const noexcept { return m_fontStyle; }
+    void setFontStyle(const QString& style) { m_fontStyle = style.trimmed(); }
+
     /// 是否使用第二对齐点（非 左/基线 对齐时）
     bool usesAlignmentPoint() const noexcept
     {
@@ -67,10 +86,10 @@ public:
         return usesAlignmentPoint() ? m_alignmentPoint : m_position;
     }
 
-    /// 单位字符宽度估计（CJK 记 1.0，ASCII 记 0.55，单位为字高）
+    /// 单位字符宽度估计（CJK 记 1.0，ASCII 记 0.55，单位为字高；含宽度因子）
     double estimatedWidth() const noexcept;
 
-    /// 旋转后的文字矩形四角（未对齐到包围盒，仅几何）
+    /// 旋转后的文字矩形四角（已考虑镜像方向：backwards 时自锚点向左延伸）
     std::vector<Point2D> outlineCorners() const;
 
     // ---- Entity 接口 ---------------------------------------------------------
@@ -97,6 +116,10 @@ private:
     double    m_rotation = 0.0;                 ///< 弧度
     HAlign    m_hAlign = HAlign::Left;
     VAlign    m_vAlign = VAlign::Baseline;
+    bool      m_backwards = false;              ///< DXF 71 bit2：水平镜像
+    bool      m_upsideDown = false;             ///< DXF 71 bit4：垂直镜像
+    double    m_widthFactor = 1.0;              ///< DXF 41
+    QString   m_fontStyle;                      ///< DXF 7
 };
 
 } // namespace lycad

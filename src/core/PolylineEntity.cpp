@@ -91,36 +91,7 @@ namespace {
 
 PolylineSegment buildSegment(const PolylineVertex& a, const PolylineVertex& b)
 {
-    PolylineSegment seg;
-    seg.start = a.point;
-    seg.end = b.point;
-    seg.bulge = a.bulge;          // bulge 归属于段的起始顶点
-
-    const double chord = seg.start.distanceTo(seg.end);
-    if (std::abs(a.bulge) <= kEpsilon || chord <= kGeomTol) {
-        return seg;               // 直线段（或退化为点）
-    }
-
-    const double theta = 4.0 * std::atan(a.bulge);      // 含角，带符号
-    const double sinHalf = std::sin(std::abs(theta) * 0.5);
-    if (sinHalf <= kEpsilon) {
-        return seg;               // 数值上退化为直线
-    }
-
-    seg.radius = chord / (2.0 * sinHalf);
-
-    // 圆心到弦中点的有向距离 h = R·cos(θ/2)，沿弦的左法向度量。
-    // 已由 bulge 的符号约定保证：正 bulge（逆时针）时圆心位于弦的左侧。
-    const double h = seg.radius * std::cos(theta * 0.5);
-    const Vector2D dir = (seg.end - seg.start) / chord;
-    const Vector2D normal = dir.perpendicular();
-    const Point2D mid((seg.start.x + seg.end.x) * 0.5, (seg.start.y + seg.end.y) * 0.5);
-    seg.center = mid + normal * h;
-
-    seg.startAngle = seg.center.angleTo(seg.start);
-    seg.endAngle = seg.center.angleTo(seg.end);
-    seg.isArc = true;
-    return seg;
+    return PolylineEntity::makeSegment(a.point, b.point, a.bulge);
 }
 
 } // namespace
@@ -160,6 +131,41 @@ PolylineEntity PolylineEntity::makeRectangle(const Point2D& corner1, const Point
     return pl;
 }
 
+PolylineSegment PolylineEntity::makeSegment(const Point2D& start, const Point2D& end,
+                                            double bulge)
+{
+    PolylineSegment seg;
+    seg.start = start;
+    seg.end = end;
+    seg.bulge = bulge;            // bulge 归属于段的起始顶点
+
+    const double chord = seg.start.distanceTo(seg.end);
+    if (std::abs(bulge) <= kEpsilon || chord <= kGeomTol) {
+        return seg;               // 直线段（或退化为点）
+    }
+
+    const double theta = 4.0 * std::atan(bulge);        // 含角，带符号
+    const double sinHalf = std::sin(std::abs(theta) * 0.5);
+    if (sinHalf <= kEpsilon) {
+        return seg;               // 数值上退化为直线
+    }
+
+    seg.radius = chord / (2.0 * sinHalf);
+
+    // 圆心到弦中点的有向距离 h = R·cos(θ/2)，沿弦的左法向度量。
+    // 已由 bulge 的符号约定保证：正 bulge（逆时针）时圆心位于弦的左侧。
+    const double h = seg.radius * std::cos(theta * 0.5);
+    const Vector2D dir = (seg.end - seg.start) / chord;
+    const Vector2D normal = dir.perpendicular();
+    const Point2D mid((seg.start.x + seg.end.x) * 0.5, (seg.start.y + seg.end.y) * 0.5);
+    seg.center = mid + normal * h;
+
+    seg.startAngle = seg.center.angleTo(seg.start);
+    seg.endAngle = seg.center.angleTo(seg.end);
+    seg.isArc = true;
+    return seg;
+}
+
 void PolylineEntity::setVertices(std::vector<Vertex> vertices)
 {
     m_vertices = std::move(vertices);
@@ -192,6 +198,13 @@ void PolylineEntity::setVertexBulge(std::size_t index, double bulge)
 {
     if (index >= m_vertices.size()) return;
     m_vertices[index].bulge = bulge;
+}
+
+void PolylineEntity::setVertexWidths(std::size_t index, double startWidth, double endWidth)
+{
+    if (index >= m_vertices.size()) return;
+    m_vertices[index].startWidth = std::max(startWidth, 0.0);
+    m_vertices[index].endWidth = std::max(endWidth, 0.0);
 }
 
 void PolylineEntity::clear() noexcept
@@ -247,8 +260,46 @@ double PolylineEntity::perimeter() const
 std::unique_ptr<Entity> PolylineEntity::clone() const
 {
     auto copy = std::make_unique<PolylineEntity>(m_vertices, m_closed);
+    copy->m_constantWidth = m_constantWidth;
     copyCommonPropertiesTo(*copy);
     return copy;
+}
+
+double PolylineEntity::maxWidth() const noexcept
+{
+    double widest = m_constantWidth;
+    for (const Vertex& v : m_vertices) {
+        widest = std::max(widest, std::max(v.startWidth, v.endWidth));
+    }
+    return widest;
+}
+
+double PolylineEntity::segmentWidth(std::size_t index) const noexcept
+{
+    if (m_constantWidth > kGeomTol) return m_constantWidth;
+    if (index >= segmentCount()) return 0.0;
+
+    const Vertex& a = m_vertices[index];
+    const Vertex& b = m_vertices[(index + 1) % m_vertices.size()];
+    return std::max({a.startWidth, a.endWidth, b.startWidth, b.endWidth});
+}
+
+bool PolylineEntity::hasUniformWidth() const noexcept
+{
+    if (m_constantWidth > kGeomTol) return true;
+
+    // 逐顶点宽度均匀的严格定义：每个顶点的起止宽度相等，且全线等宽——
+    // 否则锥形走线需要逐段变宽描边，无法用单一画笔表达
+    double first = -1.0;
+    for (const Vertex& v : m_vertices) {
+        if (std::abs(v.startWidth - v.endWidth) > kGeomTol) return false;
+        if (first < 0.0) {
+            first = v.startWidth;
+        } else if (std::abs(v.startWidth - first) > kGeomTol) {
+            return false;
+        }
+    }
+    return true;
 }
 
 Box2D PolylineEntity::boundingBox() const
@@ -262,6 +313,12 @@ Box2D PolylineEntity::boundingBox() const
         if (auto s = segment(i); s && s->isArc) {
             expandBoxWithArc(box, *s);
         }
+    }
+
+    // 宽度是真实几何：包围盒必须按最大半宽外扩，否则粗线在
+    // 视图裁剪与范围缩放下会被边缘裁掉一段
+    if (const double half = maxWidth() * 0.5; half > kGeomTol) {
+        box.expand(half);
     }
     return box;
 }
@@ -277,6 +334,11 @@ double PolylineEntity::distanceTo(const Point2D& p) const
         if (auto s = segment(i)) {
             best = std::min(best, p.distanceTo(s->closestPointTo(p)));
         }
+    }
+
+    // 宽度属于几何：落在粗线内部即视为命中
+    if (const double half = maxWidth() * 0.5; half > kGeomTol) {
+        best = std::max(0.0, best - half);
     }
     return best;
 }
@@ -315,6 +377,16 @@ void PolylineEntity::transform(const Transform2D& t)
     // 否则圆弧会翻到弦的另一侧。
     if (t.isMirroring()) {
         for (Vertex& v : m_vertices) v.bulge = -v.bulge;
+    }
+
+    // 宽度是几何量：随等比缩放同步缩放。非等比变换下宽度方向歧义，
+    // 退化为按均匀缩放系数近似
+    if (const double s = t.uniformScale(); std::abs(s - 1.0) > 1e-12) {
+        m_constantWidth *= s;
+        for (Vertex& v : m_vertices) {
+            v.startWidth *= s;
+            v.endWidth *= s;
+        }
     }
 }
 
@@ -397,10 +469,14 @@ std::vector<Point2D> PolylineEntity::flatten(double sagitta) const
 
 QString PolylineEntity::describe() const
 {
-    return QStringLiteral("多段线  %1 个顶点 %2  长度 %3")
+    QString text = QStringLiteral("多段线  %1 个顶点 %2  长度 %3")
         .arg(m_vertices.size())
         .arg(m_closed ? QStringLiteral("(闭合)") : QString())
         .arg(formatLength(length()));
+    if (hasWidth()) {
+        text += QStringLiteral("  宽度 %1").arg(formatLength(maxWidth()));
+    }
+    return text;
 }
 
 QString PolylineEntity::geometrySummary() const
@@ -409,6 +485,8 @@ QString PolylineEntity::geometrySummary() const
     lines << QStringLiteral("顶点数: %1").arg(m_vertices.size());
     lines << QStringLiteral("闭合: %1").arg(m_closed ? QStringLiteral("是") : QStringLiteral("否"));
     lines << QStringLiteral("总长: %1").arg(formatLength(perimeter()));
+    lines << QStringLiteral("宽度: %1")
+                 .arg(hasWidth() ? formatLength(maxWidth()) : QStringLiteral("无"));
 
     int arcSegments = 0;
     const auto segs = segments();

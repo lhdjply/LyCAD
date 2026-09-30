@@ -24,6 +24,49 @@ namespace {
 /// 块引用递归展开的深度上限，防止自引用块造成无限递归
 constexpr int kMaxBlockDepth = 16;
 
+/// 常见 EDA（Altium / KiCad / 立创 EDA 等）图层的行业惯例配色。
+///
+/// 不少 EDA 软件导出 DXF 时**不写图层颜色**（LAYER 记录无 62 组码），
+/// 实体全部随层——在任何 CAD 中都会显示为单色，多板层叠在一起完全不可读。
+/// 此处按图层名关键词给出约定俗成的配色（与主流 EDA 工具的 2D 视图一致）：
+/// 只在图层颜色为默认值时生效，绝不覆盖显式颜色，并在导入警告中明确告知。
+struct EdaLayerColor {
+    const char* keyword;    ///< 图层名关键词（小写匹配）
+    int         aci;        ///< AutoCAD 颜色索引
+};
+
+const std::vector<EdaLayerColor>& edaLayerColorTable()
+{
+    static const std::vector<EdaLayerColor> kTable = {
+        { "top-layer",          1 },     ///< 顶层走线：红
+        { "bottom-layer",       5 },     ///< 底层走线：蓝
+        { "bottom-silkscreen",  3 },     ///< 底面丝印：绿（与顶面丝印分色，见 cmp 对比）
+        { "silkscreen",         2 },     ///< 顶面/未指明丝印：黄
+        { "solder-mask",        3 },     ///< 阻焊：绿
+        { "paste-mask",         8 },     ///< 焊膏：灰
+        { "board-outline",      6 },     ///< 板框：洋红
+        { "3d-shell-outline",   6 },
+        { "assembly",           4 },     ///< 装配层：青
+        { "multi-layer",        8 },     ///< 多层（焊盘）：灰
+        { "hole",               7 },     ///< 孔：白/黑
+        { "document",           8 },
+        { "mechanical",         8 },
+        { "drill",              8 },
+        { "ratline",            8 },
+    };
+    return kTable;
+}
+
+/// 命中 EDA 图层名时返回惯例配色；否则返回 0（未命中）
+int heuristicEdaColor(const QString& layerName)
+{
+    const QString lower = layerName.toLower();
+    for (const EdaLayerColor& entry : edaLayerColorTable()) {
+        if (lower.contains(QLatin1String(entry.keyword))) return entry.aci;
+    }
+    return 0;
+}
+
 bool findGroup(const std::vector<DxfGroup>& groups, int code, DxfGroup& out)
 {
     bool found = false;
@@ -109,6 +152,8 @@ IoResult DxfReader::read(const QString& path, Document& document)
                                      ? QStringLiteral("DXF 解析失败。")
                                      : result.error);
     }
+
+    applyEdaLayerColorHeuristic(document, &result);
 
     collectWarnings(&result);
     result.ok = true;
@@ -577,6 +622,10 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseLwPolyline(const std::vecto
 
     double x = 0.0;
     bool haveX = false;
+    // 恒定宽度（DXF 43）：设置后逐顶点宽度被忽略，但为保留原始数据仍一并读入
+    double constantWidth = 0.0;
+    double pendingStartWidth = 0.0;
+    double pendingEndWidth = 0.0;
 
     for (const DxfGroup& g : groups) {
         switch (g.code) {
@@ -586,12 +635,25 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseLwPolyline(const std::vecto
             break;
         case 20:
             if (!haveX) break;
-            vertices.push_back(PolylineEntity::Vertex{ Point2D(x, g.real), 0.0 });
+            vertices.push_back(PolylineEntity::Vertex{ Point2D(x, g.real), 0.0,
+                                                       pendingStartWidth, pendingEndWidth });
             haveX = false;
+            pendingStartWidth = 0.0;
+            pendingEndWidth = 0.0;
+            break;
+        case 40:
+            // 40/41 位于顶点坐标之后：等待下一顶点的宽度
+            pendingStartWidth = g.real;
+            break;
+        case 41:
+            pendingEndWidth = g.real;
             break;
         case 42:
             // 凸度归属于前一个顶点（即上一段的起点）
             if (!vertices.empty()) vertices.back().bulge = g.real;
+            break;
+        case 43:
+            constantWidth = g.real;
             break;
         default:
             break;
@@ -601,6 +663,7 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseLwPolyline(const std::vecto
     if (vertices.size() >= 2) {
         const bool closed = (intOf(groups, 70, 0) & 1) != 0;
         auto polyline = std::make_unique<PolylineEntity>(std::move(vertices), closed);
+        polyline->setConstantWidth(constantWidth);
         applyCommonProperties(groups, *polyline);
         out.push_back(std::move(polyline));
         return out;
@@ -645,10 +708,30 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseText(const std::vector<DxfG
     const Point2D first(doubleOf(groups, 10), doubleOf(groups, 20));
     e->setPosition(first);
 
-    // 72/73 的取值可能来自旧软件的非标准输出，钳制到合法范围
-    auto clampIndex = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    e->setHAlign(static_cast<TextEntity::HAlign>(clampIndex(intOf(groups, 72, 0), 0, 2)));
-    e->setVAlign(static_cast<TextEntity::VAlign>(clampIndex(intOf(groups, 73, 0), 0, 3)));
+    // 72/73 的取值可能来自旧软件的非标准输出，钳制到合法范围。
+    // 72 完整语义：0 左 / 1 居中 / 2 右 / 3 两点对齐 / 4 中部 / 5 两点适配——
+    // 3/5 本质是「两端点间拉伸」，此处退化为按第二对齐点左对齐；
+    // 4（中部）与居中的锚点语义一致。
+    const int rawH = intOf(groups, 72, 0);
+    const int mappedH = (rawH == 1 || rawH == 4) ? 1 : (rawH == 2 ? 2 : 0);
+    e->setHAlign(static_cast<TextEntity::HAlign>(mappedH));
+    e->setVAlign(static_cast<TextEntity::VAlign>(std::clamp(intOf(groups, 73, 0), 0, 3)));
+
+    // 71 生成标志：bit2 = 水平镜像（背面文字），bit4 = 垂直镜像
+    const int generationFlags = intOf(groups, 71, 0);
+    e->setBackwards((generationFlags & 2) != 0);
+    e->setUpsideDown((generationFlags & 4) != 0);
+
+    // 41 宽度因子（负值同样表示水平镜像，setter 内部归一）
+    if (hasGroup(groups, 41)) {
+        e->setWidthFactor(doubleOf(groups, 41, 1.0));
+    }
+
+    // 7 文字样式名：渲染时若系统存在同名字体则采用（导出暂不回写）
+    const QString styleName = stringOf(groups, 7).trimmed();
+    if (!styleName.isEmpty() && styleName.compare(QLatin1String("STANDARD"), Qt::CaseInsensitive) != 0) {
+        e->setFontStyle(styleName);
+    }
 
     // 第二对齐点只在非左/基线对齐时有意义；缺失时退回第一对齐点
     if (e->usesAlignmentPoint() && (hasGroup(groups, 11) || hasGroup(groups, 21))) {
@@ -671,26 +754,51 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseHatch(const std::vector<Dxf
 
     // 提取第一个多段线型边界环。DXF 的环可以由直线/圆弧边（92 无 bit0）
     // 或多段线（92 带 bit0）构成；后者以 10/20 顶点对直接给出，解析代价低，
-    // 也是绝大多数软件写出的形态。多环嵌套暂取第一个有效环。
+    // 也是绝大多数软件写出的形态。顶点可带凸度（42）——
+    // 「2 顶点 + 凸度 1」即一个整圆，是 EDA 焊盘的常见形态。
+    // 多环嵌套暂取第一个有效环。
     std::vector<Point2D> boundary;
+    std::vector<double> bulges;
     for (std::size_t i = 0; i < groups.size() && boundary.empty(); ++i) {
         const DxfGroup& g = groups[i];
         if (g.code != 92 || (g.integer & 1) == 0) continue;
 
+        // 沿环扫描直到 97（种子点）/ 92（下一环）/ 91：组序为
+        // [72 凸度标志][73 闭合][93 顶点数]，随后每个顶点为 10/20[/42]
+        bool closedLoop = false;
         std::size_t j = i + 1;
         while (j < groups.size()) {
             const DxfGroup& vg = groups[j];
-            if (vg.code == 97 || vg.code == 92 || vg.code == 91) break;   // 环结束
-            if (vg.code == 10 && j + 1 < groups.size() && groups[j + 1].code == 20) {
+            if (vg.code == 97 || vg.code == 92 || vg.code == 91) break;
+
+            if (vg.code == 73) {
+                closedLoop = vg.asInt() != 0;
+            } else if (vg.code == 10
+                       && j + 1 < groups.size() && groups[j + 1].code == 20) {
                 boundary.push_back(Point2D(vg.real, groups[j + 1].real));
-                ++j;                                                      // 消费成对的 20
+                bulges.push_back(0.0);
+                ++j;                                   // 消费成对的 20
+            } else if (vg.code == 42 && !bulges.empty()) {
+                // 凸度归属于当前顶点（描述自该顶点到下一顶点的段）
+                bulges.back() = vg.real;
             }
             ++j;
         }
-        if (boundary.size() < 3) boundary.clear();    // 不是有效闭合环，继续找下一个
+
+        const bool hasBulge = std::any_of(bulges.begin(), bulges.end(),
+                                          [](double b) { return std::abs(b) > kGeomTol; });
+        // 有效环：≥3 个顶点；或「2 顶点 + 凸度 + 闭合」（整圆）
+        if (boundary.size() >= 3 || (boundary.size() == 2 && hasBulge && closedLoop)) {
+            break;
+        }
+        boundary.clear();
+        bulges.clear();
     }
 
-    if (boundary.size() < 3) {
+    if (boundary.size() < 2
+        || (boundary.size() < 3
+            && std::none_of(bulges.begin(), bulges.end(),
+                            [](double b) { return std::abs(b) > kGeomTol; }))) {
         m_skippedTypes[QStringLiteral("HATCH(无可解析边界)")] =
             m_skippedTypes.value(QStringLiteral("HATCH(无可解析边界)"), 0) + 1;
         return out;
@@ -701,10 +809,10 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseHatch(const std::vector<Dxf
     const double scale = doubleOf(groups, 41, 1.0);
     const double angleDeg = doubleOf(groups, 52, 0.0);
 
-    auto e = std::make_unique<HatchEntity>(std::move(boundary),
-                                           solid ? QStringLiteral("SOLID") : patternName,
-                                           scale > kGeomTol ? scale : 1.0,
-                                           degToRad(angleDeg));
+    auto e = std::make_unique<HatchEntity>(std::move(boundary), std::move(bulges));
+    e->setPatternName(solid ? QStringLiteral("SOLID") : patternName);
+    e->setPatternScale(scale > kGeomTol ? scale : 1.0);
+    e->setPatternAngle(degToRad(angleDeg));
     applyCommonProperties(groups, *e);
     out.push_back(std::move(e));
     return out;
@@ -809,6 +917,9 @@ std::vector<std::unique_ptr<Entity>> DxfReader::readLegacyPolyline(IoResult* res
     }
 
     const bool closed = (flags & 1) != 0;
+    // 旧式 POLYLINE 的全局宽度在头部（40/41 为默认起止宽度）
+    const double globalStartWidth = doubleOf(header, 40, 0.0);
+    const double globalEndWidth = doubleOf(header, 41, 0.0);
 
     std::vector<PolylineEntity::Vertex> vertices;
     DxfGroup g;
@@ -833,6 +944,11 @@ std::vector<std::unique_ptr<Entity>> DxfReader::readLegacyPolyline(IoResult* res
         PolylineEntity::Vertex v;
         v.point = Point2D(doubleOf(vertexGroups, 10), doubleOf(vertexGroups, 20));
         v.bulge = doubleOf(vertexGroups, 42, 0.0);
+        // 顶点宽度缺省继承全局宽度
+        v.startWidth = hasGroup(vertexGroups, 40) ? doubleOf(vertexGroups, 40, 0.0)
+                                                  : globalStartWidth;
+        v.endWidth = hasGroup(vertexGroups, 41) ? doubleOf(vertexGroups, 41, 0.0)
+                                                : globalEndWidth;
         vertices.push_back(v);
     }
 
@@ -970,6 +1086,38 @@ void DxfReader::explodeBlock(const QString& blockName,
 
         const QString layer = ref.layer.isEmpty() ? insertLayer : ref.layer;
         explodeBlock(ref.targetBlock, transform * local, layer, depth + 1, out, result);
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  EDA 图层启发式配色
+// -----------------------------------------------------------------------------
+void DxfReader::applyEdaLayerColorHeuristic(Document& document, IoResult* result)
+{
+    // 判定条件从严：至少 3 个图层命中 EDA 命名，才认定这是一份
+    // 未携带颜色的 EDA 导出文件，避免对普通图纸过度干预
+    std::vector<std::pair<Layer*, int>> pending;
+    int matched = 0;
+    int colored = 0;
+
+    for (Layer& layer : document.layers().all()) {
+        if (const int aci = heuristicEdaColor(layer.name()); aci > 0) {
+            ++matched;
+            if (layer.colorIndex() != 7) {
+                ++colored;      // 已有显式颜色，不覆盖
+                continue;
+            }
+            pending.emplace_back(&layer, aci);
+        }
+    }
+
+    if (matched < 3 || pending.empty()) return;
+
+    for (auto& [layer, aci] : pending) layer->setColorIndex(aci);
+
+    if (result) {
+        result->addWarning(QStringLiteral("原文件未包含图层颜色，已按常见 EDA 图层名自动配色（%1 个图层）；可在图层面板中修改")
+                               .arg(pending.size()));
     }
 }
 

@@ -107,6 +107,17 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch
         document.addEntity(std::move(polyline));
     }
 
+    // 带宽度多段线：R2000 走 43 组码，R12 走 POLYLINE 头部的 40/41
+    {
+        auto wide = std::make_unique<PolylineEntity>();
+        wide->appendVertex(Point2D(60.0, 20.0), 0.0);
+        wide->appendVertex(Point2D(60.0, 70.0), 0.0);
+        wide->appendVertex(Point2D(90.0, 70.0), 0.0);
+        wide->setConstantWidth(2.5);
+        wide->setClosed(false);
+        document.addEntity(std::move(wide));
+    }
+
     // 点
     document.addEntity(std::make_unique<PointEntity>(Point2D(7.5, -3.25)));
 
@@ -114,7 +125,8 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch
     document.addEntity(std::make_unique<TextEntity>(QStringLiteral("LyCAD 往返测试"),
                                                     Point2D(5.0, 140.0), 5.0));
 
-    // 文字：居中/居中 对齐（走 DXF 72/73 + 11/21 通道）
+    // 文字：居中/居中 对齐 + 水平镜像（背面文字）+ 宽度因子
+    // （走 DXF 72/73 + 11/21 + 71 生成标志 + 41 通道）
     {
         auto centered = std::make_unique<TextEntity>(QStringLiteral("中心文字"),
                                                      Point2D(60.0, 60.0), 3.0);
@@ -122,6 +134,8 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch
         centered->setVAlign(TextEntity::VAlign::Middle);
         centered->setAlignmentPoint(Point2D(60.0, 60.0));
         centered->setLayerName(QStringLiteral("轮廓"));
+        centered->setBackwards(true);
+        centered->setWidthFactor(1.1);
         document.addEntity(std::move(centered));
     }
 
@@ -239,10 +253,11 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
                                         formatDxfDouble(vertex.point.y),
                                         formatDxfDouble(vertex.bulge));
             }
-            geometry = QStringLiteral("N%1;%2;%3")
+            geometry = QStringLiteral("N%1;%2;%3;W%4")
                            .arg(polyline.vertexCount())
                            .arg(polyline.isClosed() ? 1 : 0)
-                           .arg(vertexTexts.join(QLatin1Char('|')));
+                           .arg(vertexTexts.join(QLatin1Char('|')),
+                                formatDxfDouble(polyline.maxWidth()));
             break;
         }
         case EntityType::Point: {
@@ -254,14 +269,16 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
         }
         case EntityType::Text: {
             const auto& text = static_cast<const TextEntity&>(*entity);
-            geometry = QStringLiteral("T[%1];P%2;H%3;R%4;A%5/%6")
+            geometry = QStringLiteral("T[%1];P%2;H%3;R%4;A%5/%6;M%7;F%8")
                            .arg(text.displayString(),
                                 formatDxfDouble(text.position().x) + QLatin1Char(',')
                                     + formatDxfDouble(text.position().y),
                                 formatDxfDouble(text.height()),
                                 formatDxfDouble(radToDeg(text.rotation()), 6))
                            .arg(static_cast<int>(text.hAlign()))
-                           .arg(static_cast<int>(text.vAlign()));
+                           .arg(static_cast<int>(text.vAlign()))
+                           .arg(text.isBackwards() ? 1 : 0)
+                           .arg(formatDxfDouble(text.widthFactor()));
             break;
         }
         case EntityType::Hatch: {

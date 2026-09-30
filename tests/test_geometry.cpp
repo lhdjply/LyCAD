@@ -40,11 +40,13 @@ private slots:
     void polylineBulgeSemicircle();
     void polylineMirrorFlipsBulgeSign();
     void rectangleIsClosedPolyline();
+    void polylineWidthSemantics();
 
     // ---- 文字 / 填充 / 标注 ---------------------------------------------------
     void textBoundingBoxAndAlignment();
     void hatchContainmentAndArea();
     void hatchTransformMovesBoundary();
+    void hatchBulgeFormsCircle();
     void dimensionMeasurementAllTypes();
     void dimensionGeometryDerivation();
     void dimensionGripsReflowGeometry();
@@ -324,6 +326,51 @@ void TestGeometry::rectangleIsClosedPolyline()
 }
 
 // -----------------------------------------------------------------------------
+void TestGeometry::polylineWidthSemantics()
+{
+    PolylineEntity track;
+    track.appendVertex(Point2D(0.0, 0.0));
+    track.appendVertex(Point2D(10.0, 0.0));
+    track.appendVertex(Point2D(10.0, 10.0));
+
+    QVERIFY(!track.hasWidth());
+    QCOMPARE(track.distanceTo(Point2D(5.0, 0.3)), 0.3);
+
+    // 恒定宽度：拾取按宽度命中，包围盒按半宽外扩
+    track.setConstantWidth(2.0);
+    QVERIFY(track.hasWidth());
+    QVERIFY(track.hasUniformWidth());
+    QCOMPARE(track.maxWidth(), 2.0);
+    QCOMPARE(track.segmentWidth(0), 2.0);
+
+    // 线内点命中距离为 0（原中心线距离 0.3 < 半宽 1.0）
+    QCOMPARE(track.distanceTo(Point2D(5.0, 0.3)), 0.0);
+    // 线外点距离扣除半宽
+    QVERIFY(std::abs(track.distanceTo(Point2D(5.0, 3.0)) - 2.0) < 1e-9);
+
+    const Box2D box = track.boundingBox();
+    QVERIFY(std::abs(box.minX - (-1.0)) < 1e-9);
+    QVERIFY(std::abs(box.maxY - 11.0) < 1e-9);
+
+    // 等比缩放：宽度同步缩放
+    track.transform(Transform2D::scalingAround(Point2D(0.0, 0.0), 2.0, 2.0));
+    QVERIFY(std::abs(track.maxWidth() - 4.0) < 1e-9);
+
+    // 逐顶点宽度：宽度不均匀时渲染走逐段通道
+    PolylineEntity taper;
+    taper.appendVertex(Point2D(0.0, 0.0));
+    taper.appendVertex(Point2D(10.0, 0.0));
+    taper.setVertexWidths(0, 1.0, 3.0);
+    QVERIFY(taper.hasWidth());
+    QVERIFY(!taper.hasUniformWidth());
+    QCOMPARE(taper.segmentWidth(0), 3.0);
+    // 变宽段的包围盒仍按最大宽度外扩
+    const Box2D taperBox = taper.boundingBox();
+    QVERIFY(std::abs(taperBox.minY - (-1.5)) < 1e-9);
+    QVERIFY(std::abs(taperBox.maxY - 1.5) < 1e-9);
+}
+
+// -----------------------------------------------------------------------------
 void TestGeometry::textBoundingBoxAndAlignment()
 {
     const TextEntity text(QStringLiteral("测试AB"), Point2D(10.0, 20.0), 4.0);
@@ -369,6 +416,35 @@ void TestGeometry::textBoundingBoxAndAlignment()
                          * Transform2D::scalingAround(Point2D(0.0, 0.0), 2.0, 2.0));
         QVERIFY(std::abs(scaled.height() - 8.0) < 1e-9);
     }
+
+    // 水平镜像（背面文字）：文字自锚点向左延伸，包围盒随之翻转
+    {
+        TextEntity mirrored(QStringLiteral("AB"), Point2D(10.0, 20.0), 4.0);
+        const Box2D normalBox = mirrored.boundingBox();
+        QVERIFY(normalBox.minX >= 10.0 - 1e-9);          // 正常文字向右延伸
+
+        mirrored.setBackwards(true);
+        const Box2D mirroredBox = mirrored.boundingBox();
+        QVERIFY(mirroredBox.maxX <= 10.0 + 1e-9);        // 镜像文字向左延伸
+        QVERIFY(std::abs(mirroredBox.minX - (10.0 - normalBox.width())) < 1e-9);
+
+        // 镜像变换命令切换标志
+        mirrored.transform(Transform2D::mirror(Point2D(0.0, 0.0), Point2D(1.0, 1.0)));
+        QVERIFY(!mirrored.isBackwards());
+    }
+
+    // 宽度因子：估算宽度线性缩放；负值归一为镜像标志
+    {
+        TextEntity wide(QStringLiteral("AB"), Point2D(0.0, 0.0), 4.0);
+        const double base = wide.estimatedWidth();
+        wide.setWidthFactor(1.1);
+        QVERIFY(std::abs(wide.estimatedWidth() - base * 1.1) < 1e-9);
+        QVERIFY(!wide.isBackwards());
+
+        wide.setWidthFactor(-1.0);
+        QVERIFY(wide.isBackwards());
+        QCOMPARE(wide.widthFactor(), 1.0);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -409,6 +485,43 @@ void TestGeometry::hatchTransformMovesBoundary()
     QCOMPARE(hatch.vertex(2), Point2D(14.0, 23.0));
     QVERIFY(hatch.containsPoint(Point2D(12.0, 21.5)));
     QVERIFY(!hatch.containsPoint(Point2D(2.0, 1.5)));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::hatchBulgeFormsCircle()
+{
+    // 「2 顶点 + 凸度 1」= 整圆（EDA 焊盘的常见 DXF 形态）
+    // 两顶点 (0,0)→(4,0)，两个凸度 1：两段各为半圆，合为半径 2 的圆
+    HatchEntity circle({ Point2D(0.0, 0.0), Point2D(4.0, 0.0) },
+                       { 1.0, 1.0 });
+
+    QCOMPARE(circle.vertexCount(), std::size_t(2));
+
+    // 包围盒应覆盖整圆：圆心 (2,0)、半径 2，即 x ∈ [0,4]，y ∈ [-2,2]
+    const Box2D box = circle.boundingBox();
+    QVERIFY(std::abs(box.minX - 0.0) < 1e-6);
+    QVERIFY(std::abs(box.maxX - 4.0) < 1e-6);
+    QVERIFY(std::abs(box.minY - (-2.0)) < 1e-6);
+    QVERIFY(std::abs(box.maxY - 2.0) < 1e-6);
+
+    // 圆心与内部/外部判定
+    QVERIFY(circle.containsPoint(Point2D(2.0, 0.0)));
+    QVERIFY(!circle.containsPoint(Point2D(2.0, 3.0)));
+    QCOMPARE(circle.distanceTo(Point2D(2.0, 0.0)), 0.0);
+    QVERIFY(std::abs(circle.distanceTo(Point2D(2.0, 3.0)) - 1.0) < 1e-6);
+
+    // 离散化后周长 = 2πr
+    const std::vector<Point2D> flat = circle.flatten(1e-6);
+    double perimeter = 0.0;
+    for (std::size_t i = 0; i < flat.size(); ++i) {
+        perimeter += flat[i].distanceTo(flat[(i + 1) % flat.size()]);
+    }
+    QVERIFY(std::abs(perimeter - 2.0 * kPi * 2.0) < 0.01);
+
+    // 镜像：凸度符号取反，几何不变
+    circle.transform(Transform2D::mirror(Point2D(0.0, 0.0), Point2D(1.0, 0.0)));
+    QCOMPARE(circle.vertexBulge(0), -1.0);
+    QVERIFY(circle.containsPoint(Point2D(2.0, 0.0)));
 }
 
 // -----------------------------------------------------------------------------

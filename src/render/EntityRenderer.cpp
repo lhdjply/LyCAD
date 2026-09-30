@@ -13,6 +13,7 @@
 #include "core/PolylineEntity.h"
 #include "core/TextEntity.h"
 
+#include <QFontDatabase>
 #include <QFontMetricsF>
 #include <QPainter>
 
@@ -284,28 +285,101 @@ void drawPolylineEntity(QPainter& painter, const PolylineEntity& polyline,
     }
     if (polyline.isClosed()) path.closeSubpath();
 
+    // 宽度是真实几何（PCB 走线等）：以像素级线宽描边，而非发丝线
+    if (polyline.hasWidth()) {
+        const double widthPixels = polyline.maxWidth() * context.view->scale();
+        // 屏幕上不足 1.2 像素的宽度无法分辨，退回细线；上限防止巨量填充
+        if (widthPixels >= 1.2) {
+            QPen pen = painter.pen();
+            pen.setWidthF(std::min(widthPixels, 600.0));
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            painter.setPen(pen);
+        }
+        painter.drawPath(path);
+        return;
+    }
+
     painter.drawPath(path);
+}
+
+/// 逐段绘制宽度不均匀的多段线：每段取该段两端宽度的较大值
+void drawPolylineWithVaryingWidth(QPainter& painter, const PolylineEntity& polyline,
+                                  const DrawContext& context)
+{
+    const double sagitta = adaptiveSagitta(context);
+    const auto segments = polyline.segments();
+
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const PolylineSegment& seg = segments[i];
+        const double widthPixels =
+            polyline.segmentWidth(i) * context.view->scale();
+
+        QPainterPath segPath;
+        const Point2D startDevice = context.view->toDevice(seg.start);
+        segPath.moveTo(startDevice.x, startDevice.y);
+
+        if (!seg.isArc) {
+            const Point2D endDevice = context.view->toDevice(seg.end);
+            segPath.lineTo(endDevice.x, endDevice.y);
+        } else {
+            // 与 flatten 同策略：按 bulge 符号决定行进方向
+            double a0 = seg.startAngle;
+            double a1 = seg.endAngle;
+            if (seg.bulge < 0.0) std::swap(a0, a1);
+            const double span = seg.spanAngle();
+            const int steps = std::max(2, segmentCountForArc(seg.radius, span, sagitta));
+            const double step = span / steps;
+            for (int k = 1; k <= steps; ++k) {
+                const double a = a0 + step * k;
+                const Point2D world(seg.center.x + seg.radius * std::cos(a),
+                                    seg.center.y + seg.radius * std::sin(a));
+                const Point2D d = context.view->toDevice(world);
+                segPath.lineTo(d.x, d.y);
+            }
+        }
+
+        QPen pen = painter.pen();
+        pen.setWidthF(std::min(std::max(widthPixels, 1.0), 600.0));
+        painter.strokePath(segPath, pen);
+    }
 }
 
 // -----------------------------------------------------------------------------
 //  文字
 // -----------------------------------------------------------------------------
+/// DXF 的字高（组码 40）定义为**大写字母高度（cap height）**，
+/// 而 QFont 的 pixelSize 是 em 尺寸（≈ ascent + descent）。
+/// 典型字体的 cap-height ≈ 0.72 em，需按此换算才能与 AutoCAD 的字号一致。
+constexpr double kCapHeightToEmRatio = 0.72;
+
 void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext& context)
 {
     const QString content = text.displayString();
     if (content.isEmpty()) return;
 
     const Point2D anchorDevice = context.view->toDevice(text.effectivePosition());
-    const double heightPixels = text.height() * context.view->scale();
+    const double capHeightPixels = text.height() * context.view->scale();
 
     // 缩得太小时画一个点占位，保持「这里有文字」的可见性
-    if (heightPixels < 2.5) {
+    if (capHeightPixels < 2.0) {
         painter.drawPoint(QPointF(anchorDevice.x, anchorDevice.y));
         return;
     }
 
     QFont font = painter.font();
-    font.setPixelSize(std::max(2, static_cast<int>(std::lround(heightPixels))));
+    font.setPixelSize(std::max(2, static_cast<int>(std::lround(capHeightPixels
+                                                              / kCapHeightToEmRatio))));
+    // 宽度因子（DXF 41）：用字体横向拉伸实现，字形与步进同步缩放
+    if (std::abs(text.widthFactor() - 1.0) > 1e-3) {
+        font.setStretch(std::clamp(static_cast<int>(std::lround(text.widthFactor() * 100)),
+                                   1, 4000));
+    }
+    // 文字样式名（DXF 7）：系统存在同名字体家族时采用（如 "黑体"/"Arial"）
+    if (!text.fontStyle().isEmpty()
+        && QFontDatabase::hasFamily(text.fontStyle())) {
+        font.setFamily(text.fontStyle());
+    }
     painter.setFont(font);
     const QFontMetricsF metrics(font);
 
@@ -314,13 +388,24 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
     // 世界坐标逆时针为正；设备坐标 Y 轴向下，方向相反
     painter.rotate(-radToDeg(text.rotation()));
 
-    // 垂直对齐：换算为基线相对锚点的偏移
+    // 生成标志（DXF 71）：bit2 = 水平镜像（背面文字），bit4 = 垂直镜像。
+    // 镜像施加在旋转之后的文字局部坐标系内，与 AutoCAD 行为一致：
+    // 水平镜像时文字自插入点向左延伸（左对齐语义下）。
+    if (text.isBackwards() || text.isUpsideDown()) {
+        painter.scale(text.isBackwards() ? -1.0 : 1.0,
+                      text.isUpsideDown() ? -1.0 : 1.0);
+    }
+
+    // 垂直对齐：换算为基线相对锚点的偏移（设备帧内 y 向下为正）。
+    // 字形范围 = [基线 - ascent, 基线 + descent]，各对齐方式的锚点落位：
+    //   基线对齐 → 基线      底部对齐 → 范围底缘（含下伸部）
+    //   中部对齐 → 范围中点  顶部对齐 → 范围顶缘
     double baselineOffset = 0.0;
     switch (text.vAlign()) {
     case TextEntity::VAlign::Baseline: baselineOffset = 0.0; break;
-    case TextEntity::VAlign::Bottom:   baselineOffset = metrics.ascent(); break;
+    case TextEntity::VAlign::Bottom:   baselineOffset = -metrics.descent(); break;
     case TextEntity::VAlign::Middle:   baselineOffset = (metrics.ascent() - metrics.descent()) * 0.5; break;
-    case TextEntity::VAlign::Top:      baselineOffset = metrics.ascent() + metrics.descent(); break;
+    case TextEntity::VAlign::Top:      baselineOffset = metrics.ascent(); break;
     }
 
     // 水平对齐：以锚点为参考的起点偏移
@@ -341,7 +426,8 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
 // -----------------------------------------------------------------------------
 void drawHatchEntity(QPainter& painter, const HatchEntity& hatch, const DrawContext& context)
 {
-    const std::vector<Point2D>& pts = hatch.boundary();
+    // 边界可能含凸度（圆弧焊盘），统一经 flatten 离散
+    const std::vector<Point2D> pts = hatch.flatten(adaptiveSagitta(context));
     if (pts.size() < 3) return;
 
     QPainterPath path;
@@ -434,12 +520,13 @@ void drawDimensionEntity(QPainter& painter, const DimensionEntity& dim,
     painter.fillPath(arrows, color);
 
     // 测量文字
-    const double heightPixels = geo.textHeight * context.view->scale();
-    if (geo.text.isEmpty() || heightPixels < 2.5) return;
+    const double capHeightPixels = geo.textHeight * context.view->scale();
+    if (geo.text.isEmpty() || capHeightPixels < 2.0) return;
 
     const Point2D anchor = context.view->toDevice(geo.textAnchor);
     QFont font = painter.font();
-    font.setPixelSize(std::max(2, static_cast<int>(std::lround(heightPixels))));
+    font.setPixelSize(std::max(2, static_cast<int>(std::lround(capHeightPixels
+                                                              / kCapHeightToEmRatio))));
     const QFontMetricsF metrics(font);
 
     painter.save();
@@ -575,7 +662,13 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
         break;
     }
     case EntityType::Polyline: {
-        drawPolylineEntity(painter, static_cast<const PolylineEntity&>(entity), context);
+        const auto& polyline = static_cast<const PolylineEntity&>(entity);
+        if (polyline.hasWidth() && !polyline.hasUniformWidth()) {
+            // 宽度逐段变化：无法用单一画笔表达，退化为逐段描边
+            drawPolylineWithVaryingWidth(painter, polyline, context);
+        } else {
+            drawPolylineEntity(painter, polyline, context);
+        }
         break;
     }
     case EntityType::Point: {
