@@ -402,6 +402,13 @@ void ToolManager::notifyPromptChanged()
     emit promptChanged(promptText());
 }
 
+void ToolManager::requestTextEdit(lycad::EntityId id)
+{
+    // 工具层不持有对话框：编辑意图经信号交给界面层，与
+    // 「面板只发意图信号」的既有约定保持同构
+    emit textEditRequested(id);
+}
+
 // -----------------------------------------------------------------------------
 //  CanvasInputHandler
 // -----------------------------------------------------------------------------

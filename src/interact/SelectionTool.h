@@ -30,6 +30,7 @@ public:
     bool mousePress(const CanvasEvent& event) override;
     bool mouseMove(const CanvasEvent& event) override;
     bool mouseRelease(const CanvasEvent& event) override;
+    bool mouseDoubleClick(const CanvasEvent& event) override;
     bool keyPress(QKeyEvent* event) override;
 
     void paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context) override;

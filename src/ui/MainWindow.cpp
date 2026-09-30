@@ -6,6 +6,7 @@
 #include "core/Commands.h"
 #include "core/Document.h"
 #include "core/Format.h"
+#include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
 #include "render/CadCanvas.h"
@@ -610,6 +611,35 @@ void MainWindow::connectSignals()
     });
     connect(m_toolManager, &ToolManager::commandEnded, this, [this](const QString&) {
         refreshPanels();
+    });
+
+    // ---- 双击文字 -> 就地编辑 ----
+    connect(m_toolManager, &ToolManager::textEditRequested, this, [this](EntityId id) {
+        Entity* entity = m_document->entity(id);
+        if (!entity || entity->type() != EntityType::Text) return;
+        auto* text = static_cast<TextEntity*>(entity);
+
+        bool ok = false;
+        const QString input = QInputDialog::getText(
+            this, QStringLiteral("编辑文字"),
+            QStringLiteral("内容（字高/旋转等几何属性在属性面板修改）:"),
+            QLineEdit::Normal, text->content(), &ok);
+        if (!ok) return;
+
+        const QString newContent = input.trimmed();
+        if (newContent.isEmpty()) {
+            pushMessage(QStringLiteral("文字内容不能为空，编辑已取消。"));
+            return;
+        }
+        if (newContent == text->content()) return;   // 未变化不产生撤销记录
+
+        auto replacement = text->clone();
+        static_cast<TextEntity*>(replacement.get())->setContent(newContent);
+        if (m_document->replaceEntity(id, std::move(replacement),
+                                      QStringLiteral("编辑文字"))) {
+            pushMessage(QStringLiteral("已编辑文字。"));
+            refreshPanels();
+        }
     });
 
     // ---- 命令行 ----

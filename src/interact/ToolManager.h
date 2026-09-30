@@ -108,6 +108,9 @@ public:
     void postMessage(const QString& text);
     void notifyPromptChanged();
 
+    /// 选择工具双击文字时调用：转发为 textEditRequested 信号
+    void requestTextEdit(lycad::EntityId id);
+
     // ---- CanvasInputHandler --------------------------------------------------
     bool handleMousePress(const CanvasEvent& event) override;
     bool handleMouseMove(const CanvasEvent& event) override;
@@ -125,6 +128,8 @@ signals:
     void commandStarted(const QString& command);
     void commandEnded(const QString& command);
     void modeChanged();
+    /// 双击文字图元请求编辑；id 对应一个 TextEntity，由界面层弹出对话框
+    void textEditRequested(lycad::EntityId id);
 
 private:
     struct CommandEntry {

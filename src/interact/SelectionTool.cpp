@@ -185,6 +185,50 @@ bool SelectionTool::mouseRelease(const CanvasEvent& event)
     return false;
 }
 
+// -----------------------------------------------------------------------------
+//  双击：文字图元进入编辑（对话框由界面层弹出，工具层只发意图）
+// -----------------------------------------------------------------------------
+bool SelectionTool::mouseDoubleClick(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document || !ctx().canvas) return false;
+
+    const double tolerance = ctx().pickToleranceWorld();
+    const auto& order = ctx().document->drawOrder();
+
+    // 文字优先：实心填充常常盖在文字上方，按常规拾取（自上而下）会先命中
+    // 填充而不是文字，导致文字永远无法被双击。这里在全部图元中找
+    // 光标下最上层的文字图元，专门服务「双击编辑」这一意图。
+    EntityId target = kInvalidEntityId;
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        const Entity* e = ctx().document->entity(*it);
+        if (!e || e->type() != EntityType::Text) continue;
+        if (!ctx().document->isSelectable(*it)) continue;
+        if (e->distanceTo(event.worldPos) <= tolerance) {
+            target = *it;
+            break;
+        }
+    }
+
+    // 光标下没有文字时，退回常规拾取（命中文字才触发编辑）
+    if (target == kInvalidEntityId) {
+        const EntityId picked = ctx().canvas->pickEntity(event.worldPos, tolerance);
+        if (picked != kInvalidEntityId) {
+            const Entity* e = ctx().document->entity(picked);
+            if (e && e->type() == EntityType::Text) target = picked;
+        }
+    }
+
+    if (target == kInvalidEntityId || !ctx().document->isSelectable(target)) {
+        return false;
+    }
+
+    if (ctx().manager) {
+        ctx().manager->requestTextEdit(target);
+        return true;
+    }
+    return false;
+}
+
 void SelectionTool::commitGripDrag()
 {
     if (!ctx().document || m_gripEntity == kInvalidEntityId || m_gripIndex < 0) return;
