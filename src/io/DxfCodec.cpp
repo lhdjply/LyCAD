@@ -3,8 +3,7 @@
 // =============================================================================
 #include "io/DxfCodec.h"
 
-#include "io/DxfReader.h"
-#include "io/DxfWriter.h"
+#include "io/LibDxfRwAdapter.h"
 
 #include <QFile>
 #include <QFileInfo>
@@ -62,8 +61,10 @@ bool DxfCodec::probe(QIODevice& device) const
 
 IoResult DxfCodec::read(const QString& path, Document& document) const
 {
-    DxfReader reader;
-    return reader.read(path, document);
+    // 读取走内置 libdxfrw（与 DWG 同一套解析器、同一个适配层）。
+    // ASCII 与二进制 DXF 都由它自动识别；此前由自研 DxfReader 承担，
+    // 现已删除——交叉校验的基准改为 ezdxf（见 tools/ 下的校验脚本）。
+    return readDxfWithLibDxfRw(path, document);
 }
 
 IoResult DxfCodec::write(const QString& path, const Document& document,
@@ -77,20 +78,7 @@ IoResult DxfCodec::write(const QString& path, const Document& document,
         effective.version = supported.front();
     }
 
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        return IoResult::failure(QStringLiteral("无法写入文件：%1").arg(file.errorString()));
-    }
-
-    DxfWriter writer(&file, effective);
-    IoResult result = writer.write(document);
-
-    if (!file.flush()) {
-        return IoResult::failure(QStringLiteral("刷新文件缓冲失败：%1").arg(file.errorString()));
-    }
-    file.close();
-
-    return result;
+    return writeDxfWithLibDxfRw(path, document, effective);
 }
 
 } // namespace lycad

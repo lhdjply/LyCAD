@@ -8,6 +8,7 @@
 #                     任意 DXF 的摘要。它**只编入 core 与 io**，因此顺带充当
 #                     「下层不依赖界面层」的编译期契约检查——一旦 core/io 反向
 #                     依赖了渲染或界面，它会立刻因符号缺失而链接失败。
+#                     （.dwg 也在它的读取范围内：DWG 解析属于 io 层。）
 #
 #   lycad_icon_sheet  把 resources/icons 下的全部图标渲染成一张总览图，
 #                     供人工核对配色与各尺寸下的清晰度。
@@ -19,16 +20,24 @@
 add_executable(lycad_sample
     dxf_sample_generator.cpp
     ${LYCAD_CORE_IO_SOURCES}
+    ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad_sample PRIVATE "${LYCAD_SRC_ROOT}")
+# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
+# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
+target_include_directories(lycad_sample SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
 target_link_libraries(lycad_sample PRIVATE Qt6::Core Qt6::Gui LyCAD::Warnings)
 
 add_executable(lycad_icon_sheet
     icon_sheet.cpp
     ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
+    ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad_icon_sheet PRIVATE "${LYCAD_SRC_ROOT}")
+# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
+# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
+target_include_directories(lycad_icon_sheet SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
 target_link_libraries(lycad_icon_sheet PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
 set_target_properties(lycad_icon_sheet PROPERTIES AUTORCC ON)
 
@@ -40,8 +49,12 @@ if(TARGET Qt6::Test)
         ui_snapshot.cpp
         ${LYCAD_SOURCES}
         ${LYCAD_RESOURCES}
+        ${LYCAD_DXFRW_OBJECTS}
     )
     target_include_directories(lycad_ui_snapshot PRIVATE "${LYCAD_SRC_ROOT}")
+# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
+# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
+    target_include_directories(lycad_ui_snapshot SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
     target_link_libraries(lycad_ui_snapshot
         PRIVATE ${LYCAD_QT_LIBS} Qt6::Test LyCAD::Warnings)
     set_target_properties(lycad_ui_snapshot PROPERTIES AUTORCC ON)

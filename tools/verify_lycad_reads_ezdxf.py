@@ -11,7 +11,7 @@
   · 嵌套 INSERT（块中引用块）
   · 旧式 POLYLINE/VERTEX（非 LWPOLYLINE）
   · 文字 / 填充 / 尺寸标注（已建模，验证内容与测量值正确还原）
-  · 仍未支持实体的混合存在（MTEXT 应被计数跳过而非导致失败）
+  · MTEXT：不建模但会**降级**为单行文字导入（计入 TEXT，警告中如实告知）
   · 非 ASCII 图层名与文字
 """
 import sys
@@ -183,13 +183,21 @@ def main():
                  "TEXT", "HATCH", "DIMENSION"}
     # LyCAD 内部把 LWPOLYLINE 与旧式 POLYLINE 统一表示为多段线
     NORMALIZE = {"POLYLINE": "LWPOLYLINE"}
+    # 不建模、但导入时会降级为等价图元的类型（降级后计入目标类型，
+    # 且警告中仍必须如实告知降级发生）
+    DEGRADE = {"MTEXT": "TEXT"}
 
     expected_types = {}
     expected_layers = {}
     unsupported_types = set()
 
     def account(dxftype, layer):
-        if dxftype in SUPPORTED:
+        if dxftype in DEGRADE:
+            key = DEGRADE[dxftype]
+            expected_types[key] = expected_types.get(key, 0) + 1
+            expected_layers[layer] = expected_layers.get(layer, 0) + 1
+            unsupported_types.add(dxftype)
+        elif dxftype in SUPPORTED:
             key = NORMALIZE.get(dxftype, dxftype)
             expected_types[key] = expected_types.get(key, 0) + 1
             expected_layers[layer] = expected_layers.get(layer, 0) + 1

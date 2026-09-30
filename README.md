@@ -10,6 +10,9 @@
 ```bash
 # 依赖：CMake ≥ 3.21、支持 C++20 的编译器、Qt 6.5+ (Core/Gui/Widgets/Svg)
 #       Debian/Ubuntu 上 Qt 开发包为 qt6-base-dev qt6-svg-dev
+#       libdxfrw-modify（DWG/DXF 原生解析，libdxfrw 修改版）已随仓库内置，
+#       不需要单独安装；它依赖 iconv，
+#       glibc 自带、无需额外安装，macOS 等平台由 CMake 自动链接
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
@@ -24,7 +27,6 @@ ctest --test-dir build --output-on-failure   # 运行测试
 |---|---|---|
 | `LYCAD_BUILD_TESTS` | ON | 构建单元测试 |
 | `LYCAD_BUILD_TOOLS` | ON | 构建开发期辅助工具（样例生成器、界面快照） |
-| `LYCAD_WITH_LIBDXFRW` | OFF | 强制要求系统提供 libdxfrw 后端 |
 | `LYCAD_ENABLE_ASAN` | OFF | 启用 AddressSanitizer / UBSan |
 | `LYCAD_WARNINGS_AS_ERRORS` | OFF | 将编译告警视为错误 |
 
@@ -36,17 +38,33 @@ ctest --test-dir build --output-on-failure   # 运行测试
 CMakeLists.txt    构建脚本（源码清单 + 可执行程序 + 安装规则）
 src/
 ├── core/       几何模型    6,337 行  —— 基础数学、图元、图层、文档、撤销栈
-├── io/         文件解析    4,459 行  —— DXF 编解码器、DWG 后端适配、编解码器注册表
+├── io/         文件解析    3,119 行  —— DXF 编解码器、libdxfrw-modify 适配层、DWG 后端、注册表
 ├── render/     渲染显示    2,087 行  —— 视图变换、图元绘制、画布控件
 ├── interact/   用户交互    5,164 行  —— 对象捕捉、工具状态机、命令注册表、坐标解析
 └── ui/         界面装配    3,611 行  —— 主窗口、功能区、主题、图标库、面板、命令行
+third-party/
+└── libdxfrw-modify/
+              DWG/DXF 原生解析 88,996 行（libdxfrw 修改版，GPL-2.0-or-later，详见第 8 节）
+              目录内只保留参与编译的源码（src/）与 COPYING、AUTHORS
 resources/        36 枚 SVG 图标 + 资源清单
-tests/          1,846 行（自带 CMakeLists.txt）
+tests/          2,338 行（自带 CMakeLists.txt）
 tools/          1,531 行（自带 CMakeLists.txt）
 ```
 
-构建描述只有三处：根 `CMakeLists.txt`、`tools/CMakeLists.txt`、`tests/CMakeLists.txt`。
-`src/` 与 `resources/` 下只有内容，没有任何构建脚本。
+**本项目自己写的**构建描述只有三处：根 `CMakeLists.txt`、`tools/CMakeLists.txt`、
+`tests/CMakeLists.txt`；`src/` 与 `resources/` 下只有内容，没有任何构建脚本。
+
+`third-party/libdxfrw-modify/` 是 **libdxfrw 0.6.3 的永久修改版**：不再跟随上游，
+因此目录按「只保留编译所需」裁剪——上游的构建脚手架（autotools 一套与自带的
+`CMakeLists.txt`）、示例程序（`dwg2dxf/`、`dwg2text/`、`bin/`）、自带测试、Docker 与
+VS 工程、文档全部不随仓库分发，由根构建脚本把它的源码统一编入。目录里只有
+`src/`、`COPYING`（GPL 全文，分发时必须随附）与 `AUTHORS`（署名）。
+对上游源码的修改清单见第 8 节。
+
+`third-party/libdxfrw-modify` 是唯一随仓库分发的第三方源码：它编成一个**独立目标**
+（对象库，不产出 `.a`），因为第三方代码不能套用本项目的 `-Wall -Wextra`
+（它有自己的书写风格，上百条告警会把真正的问题淹没），而 CMake 的「源文件属性」
+只在同一目录内可见，`tools/` 与 `tests/` 下的目标读不到在根目录设的属性。
 
 **依赖方向严格单向，无循环：**
 
@@ -116,18 +134,27 @@ glob 带 `CONFIGURE_DEPENDS`——裸的 glob 只在配置阶段展开一次，�
   （例如「DWG 需要安装 LibreDWG 或 ODA File Converter」），而不是一句无信息量的
   「不支持的文件类型 .dwg」。
 - `DxfGroup`：组码层。支持 ASCII 与**二进制 DXF** 两种物理形态，并处理 `\U+XXXX` 转义，
-  使中文图层名/文字在任意代码页下都能正确往返。
-- `DxfReader`：R12 ~ 2018 全版本读取；支持 `POINT/LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE(含宽度)/SOLID/TRACE/
-  TEXT/HATCH(单环边界,含凸度)/DIMENSION(线性/对齐/半径/直径)`；
-  解析 `BLOCKS` 区并在 `INSERT` 处**按插入点/比例/旋转角展开为独立图元**，
+  使中文图层名/文字在任意代码页下都能正确往返。曾尝试让 R2000 直接写 UTF-8 并声明
+  `$DWGCODEPAGE = UTF-8`，实测不可行——libdxfrw 不按该声明切换解码器，而是沿用默认
+  代码页把 UTF-8 字节又解了一遍，中文全成乱码。转义形式只需在读方补偿一处已知偏差，
+  是更可靠的选择。
+- `LibDxfRwAdapter`：libdxfrw-modify 的适配层，把它的数据结构翻译成 LyCAD 实体模型，
+  **DXF 与 DWG 的读取都走这里**（`DxfCodec::read` → `readDxfWithLibDxfRw`）。
+  libdxfrw-modify 的头文件只在这个 `.cpp` 里出现，不外溢到项目其它部分。
+  适配层内含两处**用实测定标出来的**处理，删改前请先读注释：
+  文字旋转在 DXF 与 DWG 两条路径下单位不同（度 / 弧度）；以及它会把
+  `\U+XXXX` 转义的前导反斜杠解成 `¥`，导致中文退化成可见转义文本。
+  读取时把 `INSERT` **按插入点/比例/旋转角展开为独立图元**（本软件不建块定义），
   遵循「块内 0 层图元继承 INSERT 图层」的标准语义，支持嵌套块（含环引用保护）。
   标注的匿名几何块（`*Dnn`）仅作显示用途，读入后忽略——几何由定义点重推导。
+  未建模的实体（RAY/XLINE/3DFACE/ELLIPSE/SPLINE…）按类型汇总计数后跳过，
+  **不静默丢弃**；MTEXT 降级为单行文字导入并在警告中明确告知。
   **EDA 导出的 DXF 常缺图层颜色**：当 ≥3 个图层命中常见 EDA 命名（Top-Layer/Bottom-Layer/
   Silkscreen/Board-Outline…）且颜色为默认值时，按行业惯例自动配色并在警告中明确告知。
-  未建模的实体（MTEXT/SPLINE/ELLIPSE…）按类型汇总计数后跳过，**不静默丢弃**。
-- `DxfWriter`：支持 `AC1009 (R12)` 与 `AC1015 (R2000)` 两个目标版本。
-  文字/填充/标注按规范写出（`TEXT` / `HATCH` / `DIMENSION` + 匿名几何块，
-  使不具备标注重绘能力的旧软件也能显示）；R12 无 `HATCH` 实体，填充降级为闭合多段线并明确告知。
+- `writeDxfWithLibDxfRw`（DXF 写出，同一适配层）：支持 `AC1009 (R12)` 与
+  `AC1015 (R2000)` 两个目标版本。文字/填充/标注按规范写出（`TEXT` / `HATCH` /
+  `DIMENSION` + 匿名几何块，使不具备标注重绘能力的旧软件也能显示）；
+  R12 无 `HATCH` 实体，填充降级为闭合多段线并明确告知；中文按 GBK 写出。
 - `DwgCodec`：见第 5 节。
 
 **render —— 渲染显示**
@@ -224,7 +251,7 @@ Fusion 在深色下漏掉的唯一一处（拖动停靠面板的分隔条以 Win
 
 **命令行**：命令补全、历史回溯、坐标与算式输入、`Esc` 取消、空格重复上一命令、`F1` 命令列表。
 
-**文件**：DXF 导入导出（R12 / R2000，ASCII 与二进制读取）、拖放打开、DXF 目标版本可选。
+**文件**：DXF 导入导出（R12 / R2000，ASCII 与二进制读取）、**DWG 导入**（内置 libdxfrw 原生解析，R14 ~ 2018）、拖放打开、DXF 目标版本可选。
 文字/填充/尺寸标注在导出时按规范写出（TEXT / HATCH / DIMENSION + 匿名几何块）；
 R12 无 HATCH 实体，填充自动降级为闭合多段线并明确告知。
 
@@ -234,18 +261,25 @@ R12 无 HATCH 实体，填充自动降级为闭合多段线并明确告知。
 
 验证分三层，均已在当前环境实测通过。
 
-### 4.1 单元测试（4 个测试程序，全部通过）
+### 4.1 单元测试（6 个测试程序，全部通过）
 
 | 测试 | 覆盖内容 |
 |---|---|
 | `test_geometry` | 变换复合次序与求逆、镜像自逆、包围盒、点到线段距离、八类图元的几何与夹点、圆弧三点定弧与镜像方向反转、凸度多段线的圆心/弧长/包围盒/镜像符号、文字宽度估算与对齐消解、填充的包含判定/面积/变换、标注四类测量值与几何推导/夹点重排、坐标解析与算式求值 |
 | `test_document` | id 稳定性、增删与绘制次序的撤销还原、变换撤销、夹点替换、图层重命名/删除的图元归属联动、选择集剪除、锁定的可选性、范围统计排除隐藏图层、批量装载不污染撤销栈 |
 | `test_dxf_roundtrip` | R12 与 R2000 的写出→读回逐图元比对（类型/图层/颜色/可见性/几何，含文字/填充/标注）、二进制 DXF 解析、未支持实体的计数上报、DWG 版本签名识别 |
-| `test_dwg_backend` | DWG 版本签名表、内容探测、无后端时的可执行指引、外部转换器的完整读写链路、转换器失败的上报 |
+| `test_dwg_backend` | DWG 版本签名表、内容探测、二进制内容预检（挡住伪装文件）、无后端时的可执行指引、外部转换器的完整读写链路、转换器失败的上报 |
+| `test_libdxfrw` | 内置 libdxfrw-modify 适配层：全部已建模图元的读取、**圆弧角度的单位换算**、**文字旋转在 DXF 路径下按度读出后转弧度**（这是两条读取路径唯一的差异点）、多段线凸度符号、标注定义点 |
+| `test_libdxfrw_codec` | libdxfrw-modify 的文本解码器：**其行为只取决于当前文件的版本，不受同进程中此前读过的文件影响**（守住修改版关键行为的回归测试，见第 8 节） |
 
 ```
-100% tests passed, 0 tests failed out of 4
+100% tests passed, 0 tests failed out of 6
 ```
+
+其中 `test_libdxfrw` 的重点不在「能读」，而在**单位与坐标的换算是否正确**：
+这类错误不会让程序崩溃，只会让图形悄悄错位——正是最需要测试盯住的地方。
+`test_libdxfrw_codec` 反过来盯的是**乱码**：一段中文读成乱码同样不会报错，
+只会让人以为图纸本身就是那样。
 
 ### 4.2 DXF 互操作性交叉校验（用 ezdxf 独立实现）
 
@@ -323,7 +357,21 @@ R12 无 HATCH 实体，填充自动降级为闭合多段线并明确告知。
 QT_QPA_PLATFORM=offscreen build/bin/lycad_icon_sheet icon_sheet.png
 ```
 
-### 4.4 复现验证
+### 4.4 DWG 实样验证
+
+DWG 解析的可用性无法用自造文件证明，因此拿本机安装的 GstarCAD 附带的
+**720 个真实 DWG**（AutoCAD 2004 / 2007 / 2010 / 2013 各版本齐全）做了实测：
+
+| 项目 | 结果 |
+|---|---|
+| 读取成功 | 671 / 720（93%） |
+| 失败原因 | 均为 R12（AC1009）或更早——超出 libdxfrw 支持范围，且会明确报出识别到的版本号 |
+| 角度单位定标 | 29018 个弧角度样本，用于确认「DWG 路径下是弧度」 |
+| 抽样复核 | 60 个文件全部读取正常，几何合理（例如一个接地符号读出 1 弧 + 4 直线，弧包角 194.5°） |
+
+这些文件是第三方图纸，**未收入仓库**，仅在本地用于验证。
+
+### 4.5 复现验证
 
 ```bash
 cmake --build build -j && ctest --test-dir build --output-on-failure
@@ -337,38 +385,73 @@ QT_QPA_PLATFORM=offscreen build/bin/lycad_ui_snapshot /tmp/out/lycad_sample_2000
 
 ---
 
-## 5. 关于 DWG 支持
+## 5. DWG 支持
 
-DWG 是 Autodesk 的闭源二进制格式：位压缩编码、分节映射、对象级 CRC 校验，
-且各版本编码方式差异显著。从零实现一个可靠的 DWG 解析器属于独立工程，
-本项目不这样做——**硬做出来的半成品会静默损坏用户图纸，这比不支持更糟**。
+### 导入：内置 libdxfrw 原生解析
 
-采用业界通行的**后端适配器**方案：`DwgCodec` 负责版本识别与流程编排，
-实际转换交给外部工具，转换后的 DXF 再交由本项目自带、已经过交叉验证的 DXF 编解码器处理。
+`third-party/libdxfrw-modify`（基于 libdxfrw 0.6.3）随项目一起编译，
+DWG 与 DXF 的解析都在进程内完成：
 
-后端按优先级自动探测：
+- **支持 R14 ~ 2018**（AC1012 ~ AC1032）
+- 不依赖任何外部程序，不产生中间文件
+- 内置解析失败时（例如文件是 R12、或内容损坏）自动回退到外部转换器，
+  并把两边的失败原因都如实告知——若某文件恰是转换器能处理而我们读不了的，
+  用户应当知道真相
+
+适配层在 `io/LibDxfRwAdapter.cpp`。libdxfrw-modify 的头文件只在该文件中出现，
+不外溢到项目其它部分，因此将来更换或升级解析实现时改动面被限制在一个文件内。
+
+### 关于角度单位（这里是实测定标的结果）
+
+libdxfrw 在「读 DXF」与「读 DWG」两条路径下，对同一字段的单位处理**并不一致**。
+这一点无法从它的接口看出，只能逐个字段核对源码并实测确认：
+
+| 字段 | DXF 路径 | DWG 路径 | 适配器的处理 |
+|---|---|---|---|
+| 圆弧起止角 | 弧度 | 弧度 | 直接用 |
+| INSERT 旋转 | 弧度 | 弧度 | 直接用 |
+| **文字 / 多行文字旋转** | **度** | **弧度** | **按来源分别换算** |
+| 标注角度 | 度 | 度 | 转为弧度 |
+
+实测依据是 720 个真实 DWG、共 29018 个弧角度样本：出现次数最多的取值依次是
+`3.141593`(π) ×1234、`4.712389`(3π/2) ×1069、`1.570796`(π/2) ×1003，
+而「接近整数度」的样本数为 **0**。文字旋转在 DWG 中恰为 π/2、在 DXF 中则是 90.0。
+适配器据此按来源分支——删掉这一处会让 DWG 里的文字旋转整体错 57 倍，
+而 DXF 一切正常，这类缺陷在使用中极难归因。
+
+### 文本编码：两套存放方式，各管一个年代
+
+DWG 里的文字有两种存放方式，与版本相关，读错就是满屏乱码：
+
+| 版本 | 文字的存放 | 读出依据 |
+|---|---|---|
+| R12 ~ 2004（AC1009 ~ AC1018） | 单/双字节代码页（简中为 GBK） | 文件头 `$DWGCODEPAGE`，走内置代码页表 |
+| 2007 及以后（AC1021 ~ AC1032） | UTF-16 | 无需查表，直接转 UTF-8 |
+
+这条规则本身很简单，麻烦在于上游**选择解码器的那处逻辑带了一个进程级的状态**：
+同一个进程里先打开一个老版本文件，后面打开的 2007+ 文件就会被按老代码页去解，
+中文全成乱码。720 个真实 DWG 中，173 个 2007+ 文件里有 59 个会被这个状态带偏；
+libdxfrw-modify 已改为只看当前文件的版本，并有回归测试盯着（见第 8 节）。
+
+### 导出：仍需要外部转换器
+
+**libdxfrw 只读 DWG，不提供写出能力**，因此 DWG 导出交由外部工具完成：
 
 1. **自定义转换命令**（设置项 `dwg/converterCommand`，含 `%IN%` / `%OUT%` 占位符）
 2. **LibreDWG** —— `dwg2dxf` / `dxf2dwg`
 3. **ODA File Converter** —— Autodesk 官方免费工具（目录进目录出式 CLI）
 
-当前构建环境未安装任何转换器，因此 DWG 路径退化为**明确的能力提示**而非静默失败：
+一个都找不到时，界面给出可执行的安装指引而非静默失败。
+这条链路有测试覆盖：`test_dwg_backend` 注册一个行为确定的替代转换器脚本，
+走完真实的进程调用、临时目录编排与失败分支。
 
-```
-当前系统未检测到可用的 DWG 转换后端，因此 DWG 导入导出不可用。
-DWG 为闭源二进制格式，本软件通过外部转换器完成读写，请任选其一安装：
-  · LibreDWG  —— 提供 dwg2dxf / dxf2dwg 命令
-  · ODA File Converter —— Autodesk 官方免费转换工具
-  · 或在 设置 → DWG 转换命令 中填写自定义转换命令模板（含 %IN% 与 %OUT% 占位符）
-在未安装前，DXF 的导入导出完全可用。
-```
+### 一道廉价的内容预检
 
-这条链路本身是被测试覆盖的：`test_dwg_backend` 注册一个行为确定的替代转换器脚本，
-走完**真实的进程调用、真实的临时目录编排、真实的失败分支**，验证读取、写出与错误上报。
-
-> 若需要进程内 DWG 解析，`.gitignore` 外的接入点已经就绪：CMake 会自动探测 libdxfrw
-> （`LYCAD_LIBDXFRW_FOUND`），根 `CMakeLists.txt` 会定义 `LYCAD_HAVE_LIBDXFRW`，
-> 只需实现一个 `DwgCodec::Backend` 即可，接口层无需改动。
+DWG 是二进制格式，而有些文件会把 DXF 内容套上 DWG 签名——转换器失败留下的残件、
+被误改扩展名的 DXF 都属此类。这类文件交给解析器会让它长时间空转：
+实测一份伪装文件耗掉 **108 秒**，界面会整个卡住。现在读取前先做一次 512 字节的
+可打印字符统计，把这类文件挡在解析之外（实测降到 **99 毫秒**），真 DWG 不受影响。
+60 个真实 DWG 样本在该检查下全部照常读取。
 
 ---
 
@@ -385,7 +468,7 @@ DWG 为闭源二进制格式，本软件通过外部转换器完成读写，请�
 | 填充为单环边界 | 支持直线与凸度圆弧混合的单个外部环（含「2 顶点 + 凸度 1」整圆焊盘）；多环嵌套与样条边界取第一个可解析环。 |
 | EDA 图层配色为启发式 | 文件自带颜色时严格按文件显示；仅当 EDA 导出的 DXF 缺失图层颜色时，才按图层名关键词套用行业惯例配色（顶/底丝印分色：顶黄/底绿，与常见 EDA 2D 视图一致），可在图层面板修改，导出时随图层表写出。 |
 | 线型为内置标准集 | 支持 CONTINUOUS / DASHED / DASHDOT / DASHDOTDOT / DOT / HIDDEN / CENTER / PHANTOM / BORDER；文件中引用的自定义线型会回退为 CONTINUOUS。 |
-| 单图纸空间 | 无布局/视口体系，仅在模型空间工作。 |
+| 单图纸空间 | 无布局/视口体系，仅在模型空间工作；图纸空间里的实体也会被一并导入到模型空间。 |
 | 不支持对象编组与属性块 | — |
 | 功能区宽度靠滚动而非折叠 | 面板排开的总宽度大于窗口，窗口偏窄时出现横向滚动条。AutoCAD 的做法是把放不下的面板折叠成一个按钮，本项目未实现该机制——滚动不会隐藏任何功能，只是需要多一次拖动。 |
 | 图标为自绘，非 AutoCAD 原图标 | 形态按 AutoCAD 的表达习惯绘制（夹点、箭头、虚线辅助线），但不复制其美术资源。 |
@@ -410,6 +493,46 @@ DWG 为闭源二进制格式，本软件通过外部转换器完成读写，请�
 
 ## 8. 许可与致谢
 
-本项目代码为原创实现。DXF 格式依据 Autodesk 公开发布的 *DXF Reference* 实现；
-互操作性验证使用 [ezdxf](https://ezdxf.mozman.at/)（MIT 许可）。
-DWG 支持依赖可选的第三方转换器，它们的许可与分发条款由各自项目决定，本项目不打包分发。
+### 本项目
+
+本项目代码为原创实现。DXF 格式依据 Autodesk 公开发布的 *DXF Reference* 实现。
+
+### 第三方组件
+
+| 组件 | 版本 | 许可 | 用途 |
+|---|---|---|---|
+| [libdxfrw](https://github.com/LibreCAD/libdxfrw) 0.6.3 的修改版（`third-party/libdxfrw-modify`） | 基于 0.6.3 | **GPL-2.0-or-later** | DWG / DXF 原生解析 |
+
+`third-party/libdxfrw-modify` 是 libdxfrw 0.6.3 的**永久修改版**，不再跟随上游。
+采用 GPL-2.0-or-later 且已随本项目一起编译链接，这意味着 `lycad` 二进制的分发
+整体受 GPL 约束：分发二进制时需一并提供对应源码（本仓库即是）。许可全文见
+`third-party/libdxfrw-modify/COPYING`。
+
+> 早期版本的 README 曾把 libdxfrw 的许可写作 LGPL-2.1，那是**错误的**。
+> 核对 `COPYING`（GPL 第 2 版全文）与其源码文件头的声明后已更正。
+
+它不是「可选的运行时依赖」：源码在编译期编入，不存在「不装就没有」的情形。
+若需以非 GPL 方式分发，必须移除 `third-party/libdxfrw-modify`、`io/LibDxfRwAdapter.*`
+与根 `CMakeLists.txt` 的第 8 节——届时 DWG 导入会退回外部转换器方案。
+
+### 对上游源码的修改（libdxfrw-modify）
+
+全部集中在四处，均带有说明注释，并有回归测试：
+
+| 位置 | 修改 | 原因 |
+|---|---|---|
+| `intern/drw_textcodec.cpp` | 解码器只看当前文件的版本 | 上游用函数内 `static` 记录「进程见过的最低版本」来选解码器：先读老版本文件，之后 2007+ 文件的文本全被按老代码页解码。实测 173 个 2007+ DWG 中 59 个中招，汉字总数 156 → 20 |
+| `drw_entities.cpp` | DXF 的 60 组码按规范取反；DWG 的 invisibleFlag 赋给 visible | 上游 DXF 路径把 60=1（不可见）当 visible 用、DWG 路径读出标志后丢弃，隐藏图元一律被读成可见 |
+| `intern/dxfreader.cpp` | 二进制 DXF 组码按规范 1 字节读取（255 为转义符） | 上游按 2 字节读组码，任何合法二进制 DXF 都解析失败（最小样例读出 0 个图元） |
+| `drw_interface.h` / `libdxfrw.cpp` | 新增 `addUnknownEntity` 回调 | 上游对不认识的实体类型（MLINE、MESH 等）静默跳过，应用层无从计数上报 |
+| `libdxfrw.cpp` | 写出侧补齐：隐藏图元的 60 组码、填充的多段线路径边界、R12 的 DIMENSION 实体 | 上游写出路径分别是空实现/缺失，导致隐藏图元重现、多段线边界填充丢失、R12 标注被静默丢弃 |
+| `drw_entities.h` / `libdxfrw.cpp` | DIMENSION 支持 42 组码（实测值） | 上游不写该组码，不具备标注重绘能力的旧软件无法显示测量值 |
+
+回归测试是 `tests/test_libdxfrw_codec.cpp`（解码器不变量）与 `test_dxf_roundtrip`
+的隐藏图元往返用例——这些行为一旦回退，测试会失败。
+
+### 互操作性验证
+
+- [ezdxf](https://ezdxf.mozman.at/)（MIT 许可）：DXF 的双向交叉校验
+- 本机安装的 GstarCAD 附带的 720 个 DWG 文件：用于本地验证 DWG 解析与角度单位定标，
+  未收入仓库（第三方图纸，且体积较大）

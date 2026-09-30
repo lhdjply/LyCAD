@@ -242,7 +242,14 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
             paths = list(h.paths)
             check(len(paths) == 1, f"边界环数应为 1，实际 {len(paths)}")
             if paths and hasattr(paths[0], "vertices"):
-                verts = [(float(v.x), float(v.y)) for v in paths[0].vertices]
+                # ezdxf 对边界顶点有两代表示：早期返回带 x/y 属性的对象，
+                # 新版返回 (x, y) 元组。两种都要能读，否则换个 ezdxf 版本就报错。
+                def vertex_xy(v):
+                    if isinstance(v, (tuple, list)):
+                        return float(v[0]), float(v[1])
+                    return float(v.x), float(v.y)
+
+                verts = [vertex_xy(v) for v in paths[0].vertices]
                 got = {(round(x, 6), round(y, 6)) for x, y in verts}
                 expected = {(100.0, 15.0), (130.0, 15.0), (140.0, 38.0),
                             (115.0, 52.0), (92.0, 38.0)}

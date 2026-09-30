@@ -42,7 +42,6 @@ set(LYCAD_SRC_ROOT "${PROJECT_SOURCE_DIR}/src")
 # =============================================================================
 option(LYCAD_BUILD_TESTS   "构建单元测试与自检程序"            ON)
 option(LYCAD_BUILD_TOOLS   "构建开发期辅助工具（样例生成器等）"   ON)
-option(LYCAD_WITH_LIBDXFRW "强制启用 libdxfrw 后端（支持原生 DWG 读写）" OFF)
 option(LYCAD_ENABLE_ASAN   "启用 AddressSanitizer / UBSan（仅 Debug 有效）" OFF)
 option(LYCAD_WARNINGS_AS_ERRORS "将编译告警视为错误"            OFF)
 
@@ -87,63 +86,15 @@ target_compile_options(lycad_warnings INTERFACE
     $<$<CXX_COMPILER_ID:MSVC>:/W3>)
 
 # =============================================================================
-#  5. libdxfrw 探测
+#  5. 外部 DWG 转换器探测
 #
-#  libdxfrw 是 LGPL-2.1 授权的 DXF/DWG 底层库，是目前少数可用的开源 DWG
-#  读取实现。LyCAD 不内置该库（避免把第三方二进制/源码混入本仓库），
-#  仅在系统已安装时自动接入。
+#  DWG 的**读取**由内置的 libdxfrw 完成（见第 8 节），不需要任何外部程序。
+#  但 libdxfrw 不具备 DWG 写出能力，因此**导出**仍依赖外部转换器：
+#  LibreDWG（dwg2dxf / dxf2dwg）、ODA File Converter，或用户自定义命令。
 #
-#  探测顺序：pkg-config -> find_path/find_library 手工组合
+#  这里只做探测，真正的调用在 io/DwgCodec.cpp。一个都找不到时，DWG 导出会在
+#  界面上说明原因与安装方法，而不是静默失败。
 # =============================================================================
-set(LYCAD_LIBDXFRW_FOUND FALSE)
-set(LYCAD_LIBDXFRW_TARGET "")
-
-if(LYCAD_WITH_LIBDXFRW OR NOT DEFINED LYCAD_AUTO_DETECT_DXFRW)
-    set(LYCAD_AUTO_DETECT_DXFRW TRUE)
-endif()
-
-if(LYCAD_AUTO_DETECT_DXFRW OR LYCAD_WITH_LIBDXFRW)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(PC_LIBDXFRW QUIET libdxfrw)
-    endif()
-
-    if(PC_LIBDXFRW_FOUND)
-        add_library(lycad_dxfrw UNKNOWN IMPORTED)
-        set_target_properties(lycad_dxfrw PROPERTIES
-            IMPORTED_LOCATION "${PC_LIBDXFRW_LINK_LIBRARIES}"
-            INTERFACE_INCLUDE_DIRECTORIES "${PC_LIBDXFRW_INCLUDE_DIRS}")
-        set(LYCAD_LIBDXFRW_FOUND TRUE)
-        set(LYCAD_LIBDXFRW_TARGET lycad_dxfrw)
-    else()
-        find_path(LIBDXFRW_INCLUDE_DIR NAMES libdxfrw.h
-                  PATHS /usr/include /usr/local/include /opt/local/include)
-        find_library(LIBDXFRW_LIBRARY NAMES dxfrw libdxfrw
-                     PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)
-        if(LIBDXFRW_INCLUDE_DIR AND LIBDXFRW_LIBRARY)
-            add_library(lycad_dxfrw UNKNOWN IMPORTED)
-            set_target_properties(lycad_dxfrw PROPERTIES
-                IMPORTED_LOCATION "${LIBDXFRW_LIBRARY}"
-                INTERFACE_INCLUDE_DIRECTORIES "${LIBDXFRW_INCLUDE_DIR}")
-            set(LYCAD_LIBDXFRW_FOUND TRUE)
-            set(LYCAD_LIBDXFRW_TARGET lycad_dxfrw)
-        endif()
-    endif()
-
-    if(LYCAD_WITH_LIBDXFRW AND NOT LYCAD_LIBDXFRW_FOUND)
-        message(WARNING
-            "LYCAD_WITH_LIBDXFRW=ON 但未找到 libdxfrw。DWG 将退化为外部转换器/报错模式。"
-            "Debian/Ubuntu 可尝试: apt install libdxfrw-dev")
-    endif()
-endif()
-
-# 找到 libdxfrw 时让 io 模块启用原生后端分支
-if(LYCAD_LIBDXFRW_FOUND)
-    add_compile_definitions(LYCAD_HAVE_LIBDXFRW=1)
-endif()
-
-# 外部 DWG 转换器探测（ODA File Converter / LibreDWG）：
-# 用于在没有 libdxfrw 时仍能提供 DWG 导入导出能力。
 find_program(LYCAD_ODA_CONVERTER NAMES ODAFileConverter)
 find_program(LYCAD_LIBREDWG_DWG2DXF NAMES dwg2dxf)
 find_program(LYCAD_LIBREDWG_DXF2DWG NAMES dxf2dwg)
@@ -200,11 +151,72 @@ set(LYCAD_CORE_IO_SOURCES ${LYCAD_SOURCES})
 list(FILTER LYCAD_CORE_IO_SOURCES EXCLUDE REGEX "/(render|interact|ui)/")
 
 # =============================================================================
-#  8. 可执行程序
+#  8. third-party/libdxfrw-modify —— DWG / DXF 原生解析（libdxfrw 修改版）
+#
+#  职责：DWG（R14 ~ 2018）与 DXF 的读取与 DXF 写出。io/LibDxfRwAdapter 是
+#        它与 LyCAD 模型之间的适配层；DWG 写出由外部转换器承担（库无此能力）。
+#
+#  这是 libdxfrw 0.6.3 的**永久修改版**（已裁剪为只含源码，不再跟随上游），
+#  相对上游的修改：
+#    · 文本解码器只看当前文件的版本——上游用进程级状态选择解码器，
+#      先读老版本文件会让 2007+ 文件的中文全部乱码；
+#    · 可见性按规范还原——上游 DXF 路径把 60 组码语义取反、DWG 路径丢弃标志；
+#    · 二进制 DXF 组码按规范 1 字节读取——上游按 2 字节读，合法文件全部解析失败；
+#    · 未知实体类型经 addUnknownEntity 回调上报计数——上游静默跳过。
+#  对应回归测试：tests/test_libdxfrw_codec.cpp，详见 README 第 8 节。
+#
+#  许可证：GPL-2.0-or-later（修改版同样适用，且必须以同等许可分发）。
+#          它随本项目一起分发时，整个二进制的分发受 GPL 约束，
+#          详见 third-party/libdxfrw-modify/COPYING 与 README 的「第三方组件」一节。
+#
+#  为什么单独建一个目标，而不是像 src/ 那样把源码拼进各可执行文件：
+#
+#    1. 编译选项必须隔离。第三方代码不能套用本项目的 -Wall -Wextra——它有自己的
+#       书写风格，上百条告警会把真正的问题淹没；而它也不该被要求遵守本项目的规范。
+#       CMake 的「源文件属性」（set_source_files_properties）只在同一目录内可见，
+#       tools/ 与 tests/ 下的目标读不到在根目录设的属性，所以必须由独立目标承载。
+#    2. 它被全部可执行文件用到（凡含 io 源码者皆然）。对象库只编译一次、
+#       多个目标复用，避免同一份第三方代码被编译 8 遍。
+#
+#  这里用 OBJECT 而不是 STATIC：对象库不产出 .a / .so，
+#  与「构建过程只产出可执行文件」的约定一致。
+# =============================================================================
+file(GLOB_RECURSE LYCAD_LIBDXFRW_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src/*.cpp")
+
+add_library(lycad_dxfrw OBJECT ${LYCAD_LIBDXFRW_SOURCES})
+
+target_include_directories(lycad_dxfrw PRIVATE
+    "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src"
+    "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src/intern")
+
+# 第三方代码：关闭告警。它不按本项目的规范书写，也不该因此挡住构建输出。
+target_compile_options(lycad_dxfrw PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w>
+    $<$<CXX_COMPILER_ID:MSVC>:/w>)
+
+# libdxfrw 的字符编码转换依赖 iconv。glibc 自带（无需额外链接），
+# macOS / 部分 Windows 工具链需要显式链接。
+find_package(Iconv QUIET)
+if(Iconv_FOUND)
+    target_link_libraries(lycad_dxfrw PRIVATE Iconv::Iconv)
+endif()
+
+# 它的目标文件与头文件目录：凡是编入了 io 源码的目标都要带上
+set(LYCAD_DXFRW_OBJECTS "$<TARGET_OBJECTS:lycad_dxfrw>")
+set(LYCAD_DXFRW_INCLUDES
+    "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src"
+    "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src/intern")
+
+# =============================================================================
+#  9. 可执行程序
 #
 #  这里只定义随软件发布的主程序；开发期工具在 tools/ 下。
 #  它们都用全部源码，因此 Qt 依赖取最高一层需要的：Widgets（画布与界面）
 #  与 Svg（图标栅格化）。
+#
+#  凡是编入了 io 源码的目标，都要一并带上 libdxfrw 的对象文件与头文件目录——
+#  io 的 DWG 解析依赖它。
 # =============================================================================
 set(LYCAD_QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg)
 
@@ -213,9 +225,13 @@ add_executable(lycad
     src/main.cpp
     ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
+    ${LYCAD_DXFRW_OBJECTS}
 )
 
 target_include_directories(lycad PRIVATE "${LYCAD_SRC_ROOT}")
+# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
+# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
+target_include_directories(lycad SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
 target_link_libraries(lycad PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
 
 # .qrc 要交给 rcc 处理
@@ -227,7 +243,7 @@ set_target_properties(lycad PROPERTIES
 )
 
 # =============================================================================
-#  9. 安装规则
+#  10. 安装规则
 # =============================================================================
 include(GNUInstallDirs)
 install(TARGETS lycad
@@ -236,7 +252,7 @@ install(TARGETS lycad
 )
 
 # =============================================================================
-#  10. 开发工具与单元测试
+#  11. 开发工具与单元测试
 #
 #  这两类目标各自带一个 CMakeLists.txt：它们组合源码的方式与主程序不同
 #  （用到的模块范围不一样），放在自己目录里更贴近内容。
@@ -251,7 +267,7 @@ if(LYCAD_BUILD_TESTS)
 endif()
 
 # =============================================================================
-#  11. 构建摘要
+#  12. 构建摘要
 # =============================================================================
 message(STATUS "")
 message(STATUS "==================== LyCAD 构建配置 ====================")
@@ -262,7 +278,7 @@ message(STATUS "  编译器          : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMP
 message(STATUS "  Qt 版本         : ${Qt6_VERSION}")
 message(STATUS "  构建单元测试    : ${LYCAD_BUILD_TESTS}")
 message(STATUS "  构建开发工具    : ${LYCAD_BUILD_TOOLS}")
-message(STATUS "  libdxfrw 后端   : ${LYCAD_LIBDXFRW_FOUND}")
+message(STATUS "  DWG 原生解析    : libdxfrw（内置源码，编译期编入）")
 message(STATUS "  可执行文件      : ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/lycad")
 message(STATUS "========================================================")
 message(STATUS "")

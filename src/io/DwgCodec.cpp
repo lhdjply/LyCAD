@@ -5,6 +5,7 @@
 
 #include "core/Document.h"
 #include "io/DxfCodec.h"
+#include "io/LibDxfRwAdapter.h"
 
 #include <QDir>
 #include <QFile>
@@ -25,6 +26,32 @@ constexpr int kSignatureLength = 6;
 
 /// 转换器调用的超时上限（毫秒）。大型图纸的转换可能耗时较长。
 constexpr int kConverterTimeoutMs = 10 * 60 * 1000;
+
+/// DWG 是二进制格式：文件头之后很快就会出现不可打印字节。
+///
+/// 这个检查用来挡住「套着 DWG 签名的文本文件」——转换器失败留下的残件、
+/// 被误改扩展名的 DXF 都属于这一类。把它们直接交给解析器，会让它在不合法
+/// 数据上长时间空转（实测一份伪装文件耗掉了近两分钟，界面会整个卡住）。
+/// 这里只用读 512 字节的代价，把它们挡在解析之前。
+bool looksLikeBinaryDwg(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return false;
+
+    const QByteArray head = file.read(512);
+    if (head.size() <= 32) return false;
+
+    int odd = 0;
+    for (int i = kSignatureLength; i < head.size(); ++i) {
+        const uchar c = static_cast<uchar>(head.at(i));
+        const bool printable =
+            (c >= 0x20 && c <= 0x7E) || c == '\r' || c == '\n' || c == '\t';
+        if (!printable) ++odd;
+    }
+
+    // 真 DWG 的头部以二进制数据为主；文本伪装文件则几乎全是可打印字符
+    return odd * 100 >= (head.size() - kSignatureLength) * 10;
+}
 
 /// 版本签名 -> 可读名称
 const std::vector<std::pair<QString, QString>>& versionTable()
@@ -238,6 +265,8 @@ QStringList DwgCodec::availableBackendNames() const
     detectBackends();
 
     QStringList out;
+    // 内置解析器排在最前：它是进程内的，不需要任何外部程序
+    if (libDxfRwAvailable()) out << QStringLiteral("内置 libdxfrw（原生读取）");
     for (const Backend& b : m_backends) {
         if (b.found) out << b.displayName;
     }
@@ -264,7 +293,8 @@ const DwgCodec::Backend* DwgCodec::backendForWrite() const
 
 bool DwgCodec::canRead() const
 {
-    return backendForRead() != nullptr;
+    // 内置 libdxfrw 已随程序编入，因此读取能力不依赖任何外部程序
+    return libDxfRwAvailable() || backendForRead() != nullptr;
 }
 
 bool DwgCodec::canWrite() const
@@ -276,14 +306,27 @@ QString DwgCodec::capabilityNote() const
 {
     detectBackends();
 
-    const QStringList names = availableBackendNames();
-    if (!names.isEmpty()) {
-        return QStringLiteral("DWG 通过以下后端读写：%1").arg(names.join(QStringLiteral("、")));
+    if (libDxfRwAvailable() && canWrite()) {
+        return QStringLiteral(
+                   "DWG 读取：内置 libdxfrw 原生解析，无需外部程序。\n"
+                   "DWG 写出：经 %1 转换为 DXF 后再输出——libdxfrw 只读 DWG，不提供写出能力。")
+            .arg(availableBackendNames().join(QStringLiteral("、")));
+    }
+
+    if (libDxfRwAvailable()) {
+        return QStringLiteral(
+            "DWG 导入可直接使用：内置 libdxfrw 原生解析，不需要外部程序。\n"
+            "DWG 导出需要一个外部转换器（libdxfrw 只读 DWG，本身不具备写出能力）。"
+            "请任选其一安装：\n"
+            "  · LibreDWG  —— 提供 dwg2dxf / dxf2dwg 命令\n"
+            "  · ODA File Converter —— Autodesk 官方免费转换工具\n"
+            "  · 或在 设置 → DWG 转换命令 中填写自定义转换命令模板（含 %IN% 与 %OUT% 占位符）\n"
+            "在安装之前，DXF 的导入导出完全可用。");
     }
 
     return QStringLiteral(
-        "当前系统未检测到可用的 DWG 转换后端，因此 DWG 导入导出不可用。"
-        "DWG 为闭源二进制格式，本软件通过外部转换器完成读写，请任选其一安装：\n"
+        "当前既没有内置 libdxfrw，也没有可用的 DWG 转换后端，因此 DWG 导入导出均不可用。\n"
+        "请任选其一安装：\n"
         "  · LibreDWG  —— 提供 dwg2dxf / dxf2dwg 命令\n"
         "  · ODA File Converter —— Autodesk 官方免费转换工具\n"
         "  · 或在 设置 → DWG 转换命令 中填写自定义转换命令模板（含 %IN% 与 %OUT% 占位符）\n"
@@ -300,18 +343,50 @@ IoResult DwgCodec::read(const QString& path, Document& document) const
         return IoResult::failure(QStringLiteral("该文件不具备 DWG 的文件头签名，可能不是 DWG 文件。"));
     }
 
+    const QString versionNote =
+        version.recognized
+            ? QStringLiteral("源文件版本：%1 [%2]").arg(version.displayName, version.code)
+            : QStringLiteral("源文件版本未能识别（签名 %1）").arg(version.code);
+
+    // ---- 首选：内置 libdxfrw 原生解析 ----------------------------------------
+    // 进程内完成，不依赖外部程序、不产生中间文件，也不受某个转换器版本支持范围的限制。
+    // 但要先过一道内容检查：不是真的二进制内容就不必交给解析器（见 looksLikeBinaryDwg）。
+    if (libDxfRwAvailable() && looksLikeBinaryDwg(path)) {
+        IoResult native = readDwgWithLibDxfRw(path, document);
+        if (native.ok) {
+            native.addWarning(versionNote);
+            return native;
+        }
+
+        // ---- 回退：外部转换器 -------------------------------------------------
+        // 保留原生解析的失败原因。若该文件恰好是转换器能处理而我们读不了的，
+        // 用户应当知道真相，而不是只看到一句「转换失败」。
+        const Backend* fallback = backendForRead();
+        if (!fallback) return native;
+
+        const QString nativeError = native.error;
+        // readViaDxf 会重新装载文档，原生解析留下的半份内容不会残留
+        IoResult converted = readViaDxf(path, document, *fallback);
+        if (converted.ok) {
+            converted.addWarning(
+                QStringLiteral("内置解析器未能读取该文件（%1），已改用 %2 转换为 DXF 后导入。")
+                    .arg(nativeError, fallback->displayName));
+        }
+        converted.addWarning(versionNote);
+        return converted;
+    }
+
+    // ---- 未编入内置解析器：只能走外部转换器 -----------------------------------
     const Backend* backend = backendForRead();
     if (!backend) {
         IoResult result = IoResult::failure(capabilityNote());
-        result.addWarning(QStringLiteral("文件版本：%1").arg(version.displayName));
+        result.addWarning(versionNote);
         return result;
     }
 
     IoResult result = readViaDxf(path, document, *backend);
-    // 同时给出可读名称与原始签名码：前者便于理解，后者便于排查
-    // 转换器版本不匹配一类的问题。
-    result.addWarning(QStringLiteral("源文件版本：%1 [%2]，经 %3 转换为 DXF 后导入")
-                          .arg(version.displayName, version.code, backend->displayName));
+    result.addWarning(QStringLiteral("%1，经 %2 转换为 DXF 后导入")
+                          .arg(versionNote, backend->displayName));
     return result;
 }
 
