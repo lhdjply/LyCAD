@@ -33,16 +33,20 @@ ctest --test-dir build --output-on-failure   # 运行测试
 ## 2. 模块结构
 
 ```
+CMakeLists.txt    构建脚本（源码清单 + 可执行程序 + 安装规则）
 src/
 ├── core/       几何模型    6,337 行  —— 基础数学、图元、图层、文档、撤销栈
 ├── io/         文件解析    4,459 行  —— DXF 编解码器、DWG 后端适配、编解码器注册表
 ├── render/     渲染显示    2,087 行  —— 视图变换、图元绘制、画布控件
 ├── interact/   用户交互    5,164 行  —— 对象捕捉、工具状态机、命令注册表、坐标解析
-└── ui/         界面装配    3,612 行  —— 主窗口、功能区、主题、图标库、面板、命令行
+└── ui/         界面装配    3,611 行  —— 主窗口、功能区、主题、图标库、面板、命令行
 resources/        36 枚 SVG 图标 + 资源清单
-tests/          1,846 行
-tools/          1,508 行
+tests/          1,846 行（自带 CMakeLists.txt）
+tools/          1,531 行（自带 CMakeLists.txt）
 ```
+
+构建描述只有三处：根 `CMakeLists.txt`、`tools/CMakeLists.txt`、`tests/CMakeLists.txt`。
+`src/` 与 `resources/` 下只有内容，没有任何构建脚本。
 
 **依赖方向严格单向，无循环：**
 
@@ -52,9 +56,29 @@ ui ──> interact ──> render ──> core
           └──> io ─────┴─────────┘
 ```
 
-每个模块编译为独立静态库（`LyCAD::Core` / `Io` / `Render` / `Interact` / `Ui`）。
-`tools/lycad_sample` 只链接 `core` 与 `io`，因此在每次构建时充当
-「下层模块不得反向依赖界面层」的编译期契约检查。
+模块不再编译成独立的库，构建过程里也没有任何 `.a` / `.so` 中间产物：五个模块的源文件用
+**一段 `file(GLOB_RECURSE)`** 一次收齐，直接编进各个可执行文件。模块划分体现在目录上，
+新增 `.h` / `.cpp` 放进对应目录即可，不必改构建脚本。
+
+glob 带 `CONFIGURE_DEPENDS`——裸的 glob 只在配置阶段展开一次，之后新增的文件不会被编译，
+**而且不报错**，这类遗漏往往只在别人机器上才暴露。带上它之后，构建系统每次构建都会检查
+目录内容，有变化就自动重新配置（代价是每次多一次目录扫描，这个规模可以忽略）。
+
+不需要完整功能的可执行文件，从同一份清单里**过滤**出子集：
+
+| 可执行文件 | 编入的源码 |
+|---|---|
+| `lycad` / `lycad_icon_sheet` / `lycad_ui_snapshot` | 全部五层 |
+| 4 个单元测试 | core + io + render + interact（不含 ui） |
+| `lycad_sample` | **core + io** |
+
+最后一行是刻意的：`tools/lycad_sample` 只编入最底下两层，因此一旦 core / io 反向依赖了
+渲染或界面层，它会立刻因符号缺失而链接失败——每次构建都做一次依赖方向的契约检查。
+
+代价要说清楚：同一个源文件会被每个用到它的可执行文件各编译一次。实测从零构建约 112 秒
+（16 核），若改成五个模块各编一次、多个目标共用对象文件，约 34 秒。换来的是构建脚本里
+没有目标图、没有对象文件的传递规则，一眼能看明白。哪天编译时间成了瓶颈，把源码清单改回
+对象库即可，其余部分不用动。
 
 ### 各模块职责与关键设计
 
@@ -343,7 +367,7 @@ DWG 为闭源二进制格式，本软件通过外部转换器完成读写，请�
 走完**真实的进程调用、真实的临时目录编排、真实的失败分支**，验证读取、写出与错误上报。
 
 > 若需要进程内 DWG 解析，`.gitignore` 外的接入点已经就绪：CMake 会自动探测 libdxfrw
-> （`LYCAD_LIBDXFRW_FOUND`），`io/CMakeLists.txt` 会定义 `LYCAD_HAVE_LIBDXFRW`，
+> （`LYCAD_LIBDXFRW_FOUND`），根 `CMakeLists.txt` 会定义 `LYCAD_HAVE_LIBDXFRW`，
 > 只需实现一个 `DwgCodec::Backend` 即可，接口层无需改动。
 
 ---
