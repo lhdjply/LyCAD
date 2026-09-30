@@ -40,7 +40,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # ---------------------------------------------------------------- Qt6
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
+#  Svg 用于把界面图标（resources/icons/*.svg）栅格化：图标要在 16 / 24 像素
+#  下都清晰，矢量源 + 按需渲染比预置多套 PNG 更简单，也更省资源。
+#  Debian/Ubuntu 上对应包名为 qt6-svg-dev。
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg)
 qt_standard_project_setup()
 
 # ---------------------------------------------------------------- 统一编译告警

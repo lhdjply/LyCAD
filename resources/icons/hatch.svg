@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<!-- 斜线按边框手工裁剪：Qt 的 SVG 渲染器不支持 clipPath -->
+<g stroke="#8a94a6" stroke-width="1.15">
+<path d="M16.40 5.40L19.40 8.40"/>
+<path d="M13.40 5.40L19.40 11.40"/>
+<path d="M10.40 5.40L19.40 14.40"/>
+<path d="M7.40 5.40L19.40 17.40"/>
+<path d="M4.60 5.60L17.60 18.60"/>
+<path d="M4.60 8.60L14.60 18.60"/>
+<path d="M4.60 11.60L11.60 18.60"/>
+<path d="M4.60 14.60L8.60 18.60"/>
+<path d="M4.60 17.60L5.60 18.60"/>
+</g>
+<rect x="3.6" y="4.4" width="16.8" height="15.2" stroke="#3b78c3" stroke-width="1.8"/>
+</svg>

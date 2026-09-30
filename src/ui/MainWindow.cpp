@@ -5,18 +5,25 @@
 
 #include "core/Commands.h"
 #include "core/Document.h"
+#include "core/Entity.h"
 #include "core/Format.h"
+#include "core/Layer.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
 #include "render/CadCanvas.h"
 #include "ui/CommandLineEdit.h"
 #include "ui/LayerPanel.h"
+#include "ui/PropertyChoices.h"
 #include "ui/PropertyPanel.h"
+#include "ui/RibbonBar.h"
+#include "ui/Theme.h"
 
+#include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDir>
@@ -35,7 +42,10 @@
 #include <QMimeData>
 #include <QPlainTextEdit>
 #include <QSettings>
+#include <QScrollArea>
+#include <QSignalBlocker>
 #include <QStatusBar>
+#include <QStyle>
 #include <QToolBar>
 #include <QToolButton>
 #include <QUndoStack>
@@ -57,6 +67,18 @@ constexpr int kMaxMessageLog = 500;
 QStringList droppableExtensions()
 {
     return CodecRegistry::instance().knownReadExtensions();
+}
+
+/// 让两个开关按钮共享同一份状态。
+///
+/// 功能区和状态栏上有同名的开关（栅格、正交、捕捉、线宽）——它们表达的是
+/// 同一个设置，必须双向同步：只做单向的话，从功能区打开栅格后状态栏仍显示
+/// 未按下，用户会以为没生效，然后去状态栏再点一次，反而把它关掉。
+void linkToggles(QAbstractButton* first, QAbstractButton* second)
+{
+    QObject::connect(first, &QAbstractButton::toggled, second, &QAbstractButton::setChecked);
+    QObject::connect(second, &QAbstractButton::toggled, first, &QAbstractButton::setChecked);
+    first->setChecked(second->isChecked());
 }
 
 } // namespace
@@ -87,8 +109,16 @@ MainWindow::MainWindow(QWidget* parent)
     m_lastDirectory = settings.value(QStringLiteral("path/lastDirectory"),
                                      QDir::homePath()).toString();
 
-    const bool darkTheme = settings.value(QStringLiteral("ui/darkCanvas"), false).toBool();
-    m_canvas->applyTheme(darkTheme);
+    // 深色主题覆盖界面与画布两部分，统一由一个设置决定。
+    // 旧版本只持久化了画布，因此这里回退读取旧键名，升级后维持原有外观。
+    const bool darkTheme = settings.value(QStringLiteral("ui/darkTheme"),
+                                          settings.value(QStringLiteral("ui/darkCanvas"), false))
+                               .toBool();
+    // 调色板必须在创建控件之前落定：Qt 的换肤是「事件通知 + 重绘」，
+    // 对构造时就要按主题取色的控件（功能区的样式表、图标配色）来说，
+    // 事后补救会留下一次不必要的重绘，还容易漏掉某个自绘控件。
+    theme::apply(darkTheme);
+
     m_canvas->display().showGrid = settings.value(QStringLiteral("ui/showGrid"), true).toBool();
 
     if (m_canvas->document()) {
@@ -96,18 +126,21 @@ MainWindow::MainWindow(QWidget* parent)
     }
 
     // ---- 界面 ----
+    // 功能区排在状态栏之后构建：其中的视图开关要与状态栏上的同名按钮
+    // 互相绑定，需要那些按钮已经存在。
     createActions();
     createMenus();
-    createToolBars();
     createCentralWidget();
     createDockPanels();
     createStatusBar();
+    createRibbon();
     connectSignals();
 
     updateWindowTitle();
     updateStatusModes();
     updateSelectionDependent();
     refreshPanels();
+    setDarkInterface(darkTheme);
 
     m_canvas->setFocus();
 }
@@ -292,14 +325,12 @@ void MainWindow::createMenus()
         m_canvas->update();
     });
 
-    QAction* darkAction = viewMenu->addAction(QStringLiteral("深色画布(&D)"));
-    darkAction->setCheckable(true);
-    darkAction->setChecked(m_canvas->display().themeIsDark);
-    connect(darkAction, &QAction::toggled, this, [this](bool on) {
-        m_canvas->applyTheme(on);
-        QSettings()
-            .setValue(QStringLiteral("ui/darkCanvas"), on);
-    });
+    // 「深色主题」同时切换功能区外观与画布底色，取代原先只管画布的
+    // 「深色画布」——两个各自为政的深色开关只会让人猜哪个该按。
+    m_darkThemeAction = viewMenu->addAction(QStringLiteral("深色主题(&D)"));
+    m_darkThemeAction->setCheckable(true);
+    m_darkThemeAction->setChecked(m_canvas->display().themeIsDark);
+    connect(m_darkThemeAction, &QAction::toggled, this, &MainWindow::setDarkInterface);
 
     // ---- 图层 ----
     QMenu* layerMenu = menuBar()->addMenu(QStringLiteral("图层(&L)"));
@@ -363,63 +394,257 @@ void MainWindow::createMenus()
     });
 }
 
-void MainWindow::createToolBars()
+void MainWindow::createRibbon()
 {
-    QToolBar* fileBar = addToolBar(QStringLiteral("常用"));
-    fileBar->setObjectName(QStringLiteral("toolbar.file"));
-    fileBar->setMovable(false);
+    // 宿主 QToolBar 只是个容器。只有放进工具栏区域，功能区才能横跨整个窗口
+    // 宽度（包括左右停靠面板之上），这正是 AutoCAD 的布局；若放进中央控件，
+    // 左右两侧会被停靠面板切掉。容器自身的边框、间距、拖动手柄全部去掉，
+    // 免得在功能区外面再套一层可见框架。
+    auto* host = new QToolBar(QStringLiteral("功能区"), this);
+    host->setObjectName(QStringLiteral("toolbar.ribbon"));
+    host->setMovable(false);
+    host->setFloatable(false);
+    host->setIconSize(QSize(RibbonPanel::kLargeIcon, RibbonPanel::kLargeIcon));
+    // 容器只负责摆放，不留自己的边框与间距——它里面就是功能区本身。
+    // 这里用边距设置而不是样式表：给容器挂样式表会让整棵子树改用
+    // QStyleSheetStyle，那会破坏调色板的继承（见 Theme 模块的说明）。
+    if (host->layout()) {
+        host->layout()->setContentsMargins(0, 0, 0, 0);
+        host->layout()->setSpacing(0);
+    }
+    host->setContentsMargins(0, 0, 0, 0);
 
-    fileBar->addAction(QStringLiteral("新建"), this, [this] { newDocument(); });
-    fileBar->addAction(QStringLiteral("打开"), this, [this] { openDocument(); });
-    fileBar->addAction(QStringLiteral("保存"), this, [this] { saveDocument(); });
-    fileBar->addSeparator();
-    fileBar->addAction(m_undoAction);
-    fileBar->addAction(m_redoAction);
-    fileBar->addSeparator();
+    // 面板排开的总宽度明显大于窗口。若把 RibbonBar 直接放进工具栏区域，
+    // 它会把窗口的最小宽度顶到一千八百多像素——用户就再也无法把窗口调窄，
+    // 窄窗口下按钮上的文字还会被挤成省略号。因此用一层横向滚动区包住：
+    // 窗口够宽时看不出区别，变窄时出现横向滚动条，面板本身保持完整。
+    auto* viewport = new QScrollArea(host);
+    viewport->setObjectName(QStringLiteral("ribbonViewport"));
+    viewport->setFrameShape(QFrame::NoFrame);
+    viewport->setWidgetResizable(true);
+    viewport->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    viewport->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    viewport->setFocusPolicy(Qt::NoFocus);
+    // 视口自身不填背景，露出滚动区的底色（由主题设置，见 setDarkInterface）
+    viewport->viewport()->setAutoFillBackground(false);
+    m_ribbonViewport = viewport;
 
-    QToolBar* drawBar = addToolBar(QStringLiteral("绘图与修改"));
-    drawBar->setObjectName(QStringLiteral("toolbar.draw"));
-    drawBar->setMovable(false);
+    m_ribbon = new RibbonBar(viewport);
+    viewport->setWidget(m_ribbon);
+    host->addWidget(viewport);
+    addToolBar(Qt::TopToolBarArea, host);
 
-    struct Entry { const char* label; const char* command; const char* tip; };
-    static const Entry kEntries[] = {
-        { "直线",   "LINE",      "直线 (LINE / L)" },
-        { "多段线", "PLINE",     "多段线 (PLINE / PL)" },
-        { "圆",     "CIRCLE",    "圆 (CIRCLE / C)" },
-        { "圆弧",   "ARC",       "圆弧 (ARC / A)" },
-        { "矩形",   "RECTANGLE", "矩形 (RECTANGLE / REC)" },
-        { "点",     "POINT",     "点 (POINT / PO)" },
-        { "|",      "",          "" },
-        { "文字",   "TEXT",      "文字 (TEXT / DT)" },
-        { "填充",   "HATCH",     "填充 (HATCH / H)" },
-        { "对齐标注", "DIMALIGNED", "对齐标注 (DIMALIGNED / DAL)" },
-        { "线性标注", "DIMLINEAR",  "线性标注 (DIMLINEAR / DLI)" },
-        { "半径标注", "DIMRADIUS",  "半径标注 (DIMRADIUS / DRA)" },
-        { "直径标注", "DIMDIAMETER","直径标注 (DIMDIAMETER / DDI)" },
-        { "|",      "",          "" },
-        { "移动",   "MOVE",      "移动 (MOVE / M)" },
-        { "复制",   "COPY",      "复制 (COPY / CO)" },
-        { "旋转",   "ROTATE",    "旋转 (ROTATE / RO)" },
-        { "缩放",   "SCALE",     "缩放 (SCALE / SC)" },
-        { "镜像",   "MIRROR",    "镜像 (MIRROR / MI)" },
-        { "删除",   "ERASE",     "删除 (ERASE / E)" },
-    };
+    // 面板里所有命令型按钮都汇到这一个信号，接到命令行执行上——
+    // 相当于功能区只是命令行的一个图形外壳，二者行为必然一致。
+    connect(m_ribbon, &RibbonBar::commandTriggered, this, &MainWindow::runCommand);
 
-    for (const Entry& entry : kEntries) {
-        const QString label = QString::fromUtf8(entry.label);
-        if (label == QLatin1String("|")) {
-            drawBar->addSeparator();
-            continue;
-        }
-        QAction* action = drawBar->addAction(label);
-        action->setToolTip(QString::fromUtf8(entry.tip));
-        const QString command = QString::fromLatin1(entry.command);
-        connect(action, &QAction::triggered, this, [this, command] { runCommand(command); });
+    // ---- 文件 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("文件"));
+        connect(panel->addLarge(QStringLiteral("new"), QStringLiteral("新建"),
+                                QStringLiteral("新建图形 (Ctrl+N)")),
+                &QToolButton::clicked, this, &MainWindow::newDocument);
+        connect(panel->addLarge(QStringLiteral("open"), QStringLiteral("打开"),
+                                QStringLiteral("打开图形 (Ctrl+O)")),
+                &QToolButton::clicked, this, &MainWindow::openDocument);
+        connect(panel->addLarge(QStringLiteral("save"), QStringLiteral("保存"),
+                                QStringLiteral("保存图形 (Ctrl+S)")),
+                &QToolButton::clicked, this, &MainWindow::saveDocument);
+
+        // 撤销 / 重做接到 QAction 上而不是自己实现：快捷键、菜单项、
+        // 可用状态三处从此只有一份来源。
+        QToolButton* undoButton = panel->addSmall(QStringLiteral("undo"), QStringLiteral("撤销"),
+                                                  QStringLiteral("撤销 (Ctrl+Z)"));
+        connect(undoButton, &QToolButton::clicked, m_undoAction, &QAction::trigger);
+        connect(m_undoAction, &QAction::enabledChanged, undoButton, &QWidget::setEnabled);
+
+        QToolButton* redoButton = panel->addSmall(QStringLiteral("redo"), QStringLiteral("重做"),
+                                                  QStringLiteral("重做 (Ctrl+Y)"));
+        connect(redoButton, &QToolButton::clicked, m_redoAction, &QAction::trigger);
+        connect(m_redoAction, &QAction::enabledChanged, redoButton, &QWidget::setEnabled);
     }
 
-    drawBar->addSeparator();
-    drawBar->addAction(QStringLiteral("缩放范围"), m_canvas, &CadCanvas::zoomExtents);
-    drawBar->addAction(QStringLiteral("缩放选择集"), m_canvas, &CadCanvas::zoomToSelection);
+    // ---- 绘图 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("绘图"));
+        panel->addLargeCommand(QStringLiteral("line"), QStringLiteral("直线"),
+                               QStringLiteral("LINE"), QStringLiteral("直线 (LINE / L)"));
+        panel->addLargeCommand(QStringLiteral("polyline"), QStringLiteral("多段线"),
+                               QStringLiteral("PLINE"), QStringLiteral("多段线 (PLINE / PL)"));
+        panel->addLargeCommand(QStringLiteral("circle"), QStringLiteral("圆"),
+                               QStringLiteral("CIRCLE"), QStringLiteral("圆 (CIRCLE / C)"));
+        panel->addLargeCommand(QStringLiteral("arc"), QStringLiteral("圆弧"),
+                               QStringLiteral("ARC"), QStringLiteral("圆弧 (ARC / A)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("rectangle"), QStringLiteral("矩形"),
+                               QStringLiteral("RECTANGLE"), QStringLiteral("矩形 (RECTANGLE / REC)"));
+        panel->addSmallCommand(QStringLiteral("point"), QStringLiteral("点"),
+                               QStringLiteral("POINT"), QStringLiteral("点 (POINT / PO)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("hatch"), QStringLiteral("填充"),
+                               QStringLiteral("HATCH"), QStringLiteral("图案填充 (HATCH / H)"));
+    }
+
+    // ---- 修改 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("修改"));
+        panel->addLargeCommand(QStringLiteral("move"), QStringLiteral("移动"),
+                               QStringLiteral("MOVE"), QStringLiteral("移动 (MOVE / M)"));
+        panel->addLargeCommand(QStringLiteral("copy"), QStringLiteral("复制"),
+                               QStringLiteral("COPY"), QStringLiteral("复制 (COPY / CO)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("rotate"), QStringLiteral("旋转"),
+                               QStringLiteral("ROTATE"), QStringLiteral("旋转 (ROTATE / RO)"));
+        panel->addSmallCommand(QStringLiteral("scale"), QStringLiteral("缩放"),
+                               QStringLiteral("SCALE"), QStringLiteral("缩放 (SCALE / SC)"));
+        panel->addSmallCommand(QStringLiteral("mirror"), QStringLiteral("镜像"),
+                               QStringLiteral("MIRROR"), QStringLiteral("镜像 (MIRROR / MI)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("erase"), QStringLiteral("删除"),
+                               QStringLiteral("ERASE"), QStringLiteral("删除 (ERASE / E)"));
+        panel->addSmallCommand(QStringLiteral("select-all"), QStringLiteral("全选"),
+                               QStringLiteral("SELECT"), QStringLiteral("选择全部对象 (SELECT)"));
+    }
+
+    // ---- 注释 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("注释"));
+        panel->addLargeCommand(QStringLiteral("text"), QStringLiteral("文字"),
+                               QStringLiteral("TEXT"), QStringLiteral("单行文字 (TEXT / DT)"));
+        panel->addLargeCommand(QStringLiteral("dim-linear"), QStringLiteral("线性标注"),
+                               QStringLiteral("DIMLINEAR"),
+                               QStringLiteral("线性标注 (DIMLINEAR / DLI)"));
+        panel->addLargeCommand(QStringLiteral("dim-aligned"), QStringLiteral("对齐标注"),
+                               QStringLiteral("DIMALIGNED"),
+                               QStringLiteral("对齐标注 (DIMALIGNED / DAL)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("dim-radius"), QStringLiteral("半径标注"),
+                               QStringLiteral("DIMRADIUS"),
+                               QStringLiteral("半径标注 (DIMRADIUS / DRA)"));
+        panel->addSmallCommand(QStringLiteral("dim-diameter"), QStringLiteral("直径标注"),
+                               QStringLiteral("DIMDIAMETER"),
+                               QStringLiteral("直径标注 (DIMDIAMETER / DDI)"));
+    }
+
+    // ---- 图层 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("图层"));
+        m_layerCombo = new QComboBox(panel);
+        m_layerCombo->setMinimumWidth(170);
+        m_layerCombo->setToolTip(QStringLiteral("当前图层——新建的图元归属于它"));
+        // 用 activated 而不是 currentIndexChanged：后者在程序同步选择时也会发出，
+        // 会把「刷新界面」误当成用户改图层。
+        connect(m_layerCombo, &QComboBox::activated, this, [this](int index) {
+            if (index < 0) return;
+            const QString name = m_layerCombo->itemText(index);
+            if (m_document->setCurrentLayer(name)) {
+                pushMessage(QStringLiteral("当前图层：%1").arg(name));
+            }
+        });
+        panel->addWidget(m_layerCombo);
+    }
+
+    // ---- 特性 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("特性"));
+
+        m_colorCombo = new QComboBox(panel);
+        for (int aci : propertyChoices::colors()) {
+            // 注意 Qt 的带图标重载是「图标在前、文字在后」
+            m_colorCombo->addItem(propertyChoices::colorSwatch(aci),
+                                  propertyChoices::colorText(aci), QVariant(aci));
+        }
+        m_colorCombo->setMinimumWidth(104);
+        m_colorCombo->setToolTip(QStringLiteral("把选中对象的颜色改为指定值"));
+        connect(m_colorCombo, &QComboBox::activated, this, [this](int index) {
+            if (index < 0 || m_document->selection().isEmpty()) return;
+            const int aci = m_colorCombo->itemData(index).toInt();
+            const std::vector<EntityId> ids = m_document->selection().ids();
+            if (m_document->setEntitiesColor(ids, aci)) {
+                pushMessage(QStringLiteral("已将 %1 个对象的颜色改为 %2。")
+                                .arg(ids.size())
+                                .arg(propertyChoices::colorText(aci)));
+            }
+        });
+        panel->addWidget(m_colorCombo);
+
+        m_lineweightCombo = new QComboBox(panel);
+        for (int value : propertyChoices::lineweights()) {
+            m_lineweightCombo->addItem(propertyChoices::lineweightText(value), value);
+        }
+        m_lineweightCombo->setMinimumWidth(104);
+        m_lineweightCombo->setToolTip(QStringLiteral("把选中对象的线宽改为指定值"));
+        connect(m_lineweightCombo, &QComboBox::activated, this, [this](int index) {
+            if (index < 0 || m_document->selection().isEmpty()) return;
+            const int value = m_lineweightCombo->itemData(index).toInt();
+            const std::vector<EntityId> ids = m_document->selection().ids();
+            if (m_document->setEntitiesLineweight(ids, value)) {
+                pushMessage(QStringLiteral("已将 %1 个对象的线宽改为 %2。")
+                                .arg(ids.size())
+                                .arg(propertyChoices::lineweightText(value)));
+            }
+        });
+        panel->addWidget(m_lineweightCombo);
+    }
+
+    // ---- 视图 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("视图"));
+        connect(panel->addLarge(QStringLiteral("zoom-extents"), QStringLiteral("缩放范围"),
+                                QStringLiteral("缩放到图形范围")),
+                &QToolButton::clicked, m_canvas, &CadCanvas::zoomExtents);
+        connect(panel->addLarge(QStringLiteral("zoom-selection"), QStringLiteral("缩放选择集"),
+                                QStringLiteral("缩放到当前选择集")),
+                &QToolButton::clicked, m_canvas, &CadCanvas::zoomToSelection);
+        panel->addSeparator();
+
+        // 与状态栏上的同名开关共享状态，见 linkToggles 的说明
+        struct ToggleEntry {
+            const char* icon;
+            const char* label;
+            const char* tip;
+            QToolButton* statusBarButton;
+        };
+        const ToggleEntry toggles[] = {
+            { "grid",       "栅格", "栅格吸附 (F9)",       m_gridButton },
+            { "ortho",      "正交", "正交模式 (F8)",       m_orthoButton },
+            { "snap",       "捕捉", "对象捕捉 (F3)",       m_snapButton },
+            { "lineweight", "线宽", "按真实线宽显示",       m_lineweightButton },
+        };
+        for (const ToggleEntry& entry : toggles) {
+            QToolButton* button = panel->addSmall(QString::fromLatin1(entry.icon),
+                                                  QString::fromUtf8(entry.label),
+                                                  QString::fromUtf8(entry.tip));
+            button->setCheckable(true);
+            if (entry.statusBarButton) linkToggles(button, entry.statusBarButton);
+        }
+
+        QToolButton* themeButton = panel->addSmall(QStringLiteral("theme-dark"),
+                                                   QStringLiteral("深色主题"),
+                                                   QStringLiteral("切换深色 / 浅色界面"));
+        themeButton->setCheckable(true);
+        connect(themeButton, &QToolButton::toggled, this, &MainWindow::setDarkInterface);
+        m_darkThemeButton = themeButton;
+    }
+
+    // ---- 帮助 ----
+    {
+        RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("帮助"));
+        connect(panel->addLarge(QStringLiteral("help"), QStringLiteral("命令列表"),
+                                QStringLiteral("查看全部可用命令与快捷键 (F1)")),
+                &QToolButton::clicked, this, &MainWindow::showCommandHelp);
+    }
+
+    // 滚动条一旦出现就会占用十几像素高度，而这部分 sizeHint 是算不出来的
+    // （按需显示的滚动条在布局时还不存在）。不计入的话，滚动条会从功能区内部
+    // 「吃掉」这段高度，把最下面的面板标题裁掉。这里显式补上——注意必须等
+    // 面板全部建完再算，否则量到的是空功能区的尺寸。
+    const int scrollbarExtent = viewport->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+    viewport->setFixedHeight(m_ribbon->sizeHint().height() + scrollbarExtent);
+
+    // 撤销/重做的可用状态由 updateSelectionDependent 维护，
+    // 这里补一次初始同步，免得刚启动时两个按钮看起来是可点的。
+    updateSelectionDependent();
 }
 
 void MainWindow::createCentralWidget()
@@ -927,6 +1152,8 @@ void MainWindow::updateSelectionDependent()
     if (m_redoAction) {
         m_redoAction->setEnabled(m_document->undoStack()->canRedo());
     }
+
+    refreshRibbonProperties();
 }
 
 void MainWindow::refreshPanels()
@@ -937,7 +1164,112 @@ void MainWindow::refreshPanels()
     if (m_propertyPanel) {
         m_propertyPanel->refresh(m_document);
     }
+    refreshRibbonLayers();
     updateSelectionDependent();
+}
+
+void MainWindow::refreshRibbonLayers()
+{
+    if (!m_layerCombo) return;
+
+    // 重建列表本身不是用户操作，屏蔽信号以免误触发「切换当前图层」
+    QSignalBlocker blocker(m_layerCombo);
+
+    const QString current = m_document->layers().currentLayerName();
+    m_layerCombo->clear();
+    for (const Layer& layer : m_document->layers().all()) {
+        m_layerCombo->addItem(propertyChoices::colorSwatch(layer.colorIndex()), layer.name());
+    }
+
+    const int index = m_layerCombo->findText(current);
+    if (index >= 0) m_layerCombo->setCurrentIndex(index);
+}
+
+void MainWindow::refreshRibbonProperties()
+{
+    if (!m_colorCombo || !m_lineweightCombo) return;
+
+    const std::vector<EntityId> ids = m_document->selection().ids();
+    const bool hasSelection = !ids.empty();
+
+    QSignalBlocker colorBlocker(m_colorCombo);
+    QSignalBlocker lineweightBlocker(m_lineweightCombo);
+
+    // 没有选择集时这两项无从作用，直接置灰比留在可点状态更诚实
+    m_colorCombo->setEnabled(hasSelection);
+    m_lineweightCombo->setEnabled(hasSelection);
+
+    if (!hasSelection) {
+        m_colorCombo->setCurrentIndex(0);
+        m_lineweightCombo->setCurrentIndex(0);
+        return;
+    }
+
+    // 多选时只显示公共值，取值不一致就把下拉框留空——与属性面板同一约定
+    bool seenColor = false;
+    bool mixedColor = false;
+    int color = 0;
+    bool seenLineweight = false;
+    bool mixedLineweight = false;
+    int lineweight = 0;
+
+    for (EntityId id : ids) {
+        const Entity* entity = m_document->entity(id);
+        if (!entity) continue;
+
+        if (!seenColor) {
+            color = entity->colorIndex();
+            seenColor = true;
+        } else if (color != entity->colorIndex()) {
+            mixedColor = true;
+        }
+
+        if (!seenLineweight) {
+            lineweight = entity->lineweightDxf();
+            seenLineweight = true;
+        } else if (lineweight != entity->lineweightDxf()) {
+            mixedLineweight = true;
+        }
+    }
+
+    m_colorCombo->setCurrentIndex(mixedColor ? -1 : m_colorCombo->findData(color));
+    m_lineweightCombo->setCurrentIndex(mixedLineweight ? -1
+                                                       : m_lineweightCombo->findData(lineweight));
+}
+
+void MainWindow::setDarkInterface(bool dark)
+{
+    // 顺序有讲究：先换应用调色板（菜单、停靠面板、状态栏、表格等由它统一接管），
+    // 再让两个自绘部分跟上——功能区的外观与图标配色、画布的底色。
+    theme::apply(dark);
+    if (m_ribbon) m_ribbon->setDarkTheme(dark);
+
+    // 功能区的滚动容器也要跟着换色：它比功能区多出滚动条那一条，
+    // 颜色不一致就会在功能区下方露出一道异色边。
+    if (m_ribbonViewport) {
+        const theme::Palette& c = theme::palette(dark);
+        // 只改底色，不碰滚动条本身：Fusion 原生的滚动条带两端箭头，
+        // 且深浅两个主题下都清楚（滑块比底色亮三十多级）。一旦在这里用
+        // 样式表重画，箭头会被规则里的 `width: 0` 抹掉，配色也要跟着维护一份，
+        // 反而是自找麻烦。
+        m_ribbonViewport->setStyleSheet(
+            QStringLiteral("QScrollArea#ribbonViewport { background: %1; border: 0; }")
+                .arg(c.ribbonBackground.name()));
+    }
+
+    m_canvas->applyTheme(dark);
+    QSettings().setValue(QStringLiteral("ui/darkTheme"), dark);
+
+    // 菜单项与功能区按钮是同一状态的两个入口，这里统一回写两者的勾选状态；
+    // 屏蔽信号，免得两边互相触发绕成环。
+    if (m_darkThemeAction) {
+        QSignalBlocker blocker(m_darkThemeAction);
+        m_darkThemeAction->setChecked(dark);
+    }
+    if (m_darkThemeButton) {
+        QSignalBlocker blocker(m_darkThemeButton);
+        m_darkThemeButton->setChecked(dark);
+    }
 }
 
 void MainWindow::pushMessage(const QString& text)

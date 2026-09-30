@@ -3,10 +3,10 @@
 // =============================================================================
 #include "ui/PropertyPanel.h"
 
-#include "core/AciPalette.h"
 #include "core/Document.h"
 #include "core/Entity.h"
 #include "core/Format.h"
+#include "ui/PropertyChoices.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -20,37 +20,6 @@
 
 namespace lycad {
 
-namespace {
-
-/// 颜色下拉框可选值：随层 + 标准九色 + 常用灰阶
-const QVector<int>& colorChoices()
-{
-    static const QVector<int> kChoices = { -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 250, 252, 254, 255 };
-    return kChoices;
-}
-
-const QVector<int>& lineweightChoices()
-{
-    static const QVector<int> kChoices = {
-        -1, -3, 0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120
-    };
-    return kChoices;
-}
-
-QString colorDisplayText(int aci)
-{
-    if (aci < 0) return QStringLiteral("随层 (ByLayer)");
-    return aci::toName(aci);
-}
-
-QString lineweightDisplayText(int value)
-{
-    if (value == -1) return QStringLiteral("随层");
-    return lineweight::toDisplayString(value);
-}
-
-} // namespace
-
 PropertyPanel::PropertyPanel(QWidget* parent)
     : QWidget(parent)
 {
@@ -63,19 +32,15 @@ PropertyPanel::PropertyPanel(QWidget* parent)
     m_layerCombo->setToolTip(QStringLiteral("把选中对象移动到其它图层"));
 
     m_colorCombo = new QComboBox(this);
-    for (int aci : colorChoices()) {
-        m_colorCombo->addItem(colorDisplayText(aci), aci);
-        if (aci > 0) {
-            QPixmap swatch(14, 14);
-            swatch.fill(aci::toColor(aci));
-            m_colorCombo->setItemIcon(m_colorCombo->count() - 1, QIcon(swatch));
-        }
+    for (int aci : propertyChoices::colors()) {
+        m_colorCombo->addItem(propertyChoices::colorSwatch(aci),
+                              propertyChoices::colorText(aci), QVariant(aci));
     }
     m_colorCombo->setToolTip(QStringLiteral("图元颜色；选择「随层」时继承所属图层"));
 
     m_lineweightCombo = new QComboBox(this);
-    for (int value : lineweightChoices()) {
-        m_lineweightCombo->addItem(lineweightDisplayText(value), value);
+    for (int value : propertyChoices::lineweights()) {
+        m_lineweightCombo->addItem(propertyChoices::lineweightText(value), value);
     }
     m_lineweightCombo->setToolTip(QStringLiteral("图元线宽（打印与线宽显示模式下生效）"));
 

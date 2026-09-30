@@ -20,13 +20,20 @@
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
 #include "render/CadCanvas.h"
+#include "ui/IconLibrary.h"
 #include "ui/MainWindow.h"
+#include "ui/RibbonBar.h"
 
 #include <QApplication>
+#include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QInputDialog>
+#include <QPalette>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QToolButton>
 #include <QUndoStack>
 #include <QTest>
 #include <QTextStream>
@@ -250,6 +257,140 @@ int main(int argc, char* argv[])
             }
             doc->selection().clear();
             QObject::disconnect(tools, &ToolManager::textEditRequested, nullptr, nullptr);
+        }
+
+        // ---- 快照 5：功能区自检 + 深色主题 ----
+        auto* ribbon = window.findChild<RibbonBar*>();
+        if (!ribbon) {
+            out() << QStringLiteral("找不到功能区控件。") << Qt::endl;
+            return 3;
+        }
+
+        // 逐个数一遍按钮：既确认面板真的建起来了，也顺带兜住图标名写错的情况
+        // —— IconLibrary 对缺失的图标只会返回空 QIcon 并留一条警告，
+        // 界面上表现为「按钮没有图案」，靠肉眼很容易漏掉。
+        int iconMissing = 0;
+        int largeButtons = 0;
+        int smallButtons = 0;
+        int toggleButtons = 0;
+        const QList<QToolButton*> ribbonButtons = ribbon->findChildren<QToolButton*>();
+        for (QToolButton* button : ribbonButtons) {
+            if (button->text().isEmpty()) continue;
+
+            const bool large = (button->toolButtonStyle() == Qt::ToolButtonTextUnderIcon);
+            large ? ++largeButtons : ++smallButtons;
+            if (button->isCheckable()) ++toggleButtons;
+            if (button->icon().isNull()) {
+                ++iconMissing;
+                out() << QStringLiteral("  图标缺失：按钮 \"%1\"").arg(button->text()) << Qt::endl;
+            }
+        }
+
+        const int comboCount = ribbon->findChildren<QComboBox*>().size();
+        out() << QStringLiteral("  功能区：大按钮 %1，小按钮 %2，开关 %3，下拉框 %4，图标缺失 %5")
+                     .arg(largeButtons)
+                     .arg(smallButtons)
+                     .arg(toggleButtons)
+                     .arg(comboCount)
+                     .arg(iconMissing)
+              << Qt::endl;
+        if (iconMissing > 0) ++failures;
+        if (largeButtons == 0 || smallButtons == 0 || comboCount < 3) {
+            out() << QStringLiteral("  功能区内容不完整。") << Qt::endl;
+            ++failures;
+        }
+
+        // 通过功能区上的真实按钮切换深色主题，顺带验证：
+        // 按钮 → MainWindow → RibbonBar + IconLibrary + 画布 这条链路。
+        QToolButton* themeButton = nullptr;
+        for (QToolButton* button : ribbonButtons) {
+            if (button->text() == QStringLiteral("深色主题")) {
+                themeButton = button;
+                break;
+            }
+        }
+        if (!themeButton) {
+            out() << QStringLiteral("  功能区上找不到「深色主题」按钮。") << Qt::endl;
+            ++failures;
+        } else {
+            themeButton->click();
+            settle(application, 250);
+
+            const bool ribbonDark = ribbon->isDarkTheme();
+            const bool iconsDark = IconLibrary::instance().isDarkTheme();
+            const bool canvasDark = canvas->display().themeIsDark;
+
+            // 调色板核对。深色主题最常见的失败方式是「QApplication::setPalette
+            // 被某个环节重置」，而它不会报任何错，只表现为部分控件仍是浅色。
+            // 抽查一个位于停靠面板里的下拉框：功能区里的下拉框有自己的样式表
+            // 兜底，反而看不出调色板是否生效。
+            if (auto* combo = window.findChild<QComboBox*>()) {
+                const QColor base = combo->palette().color(QPalette::Base);
+                const QColor appWindow = QApplication::palette().color(QPalette::Window);
+                const bool ok = base.lightness() < 128 && appWindow.lightness() < 128;
+                out() << QStringLiteral("  调色板：应用 Window=%1，停靠面板下拉框 Base=%2 → %3")
+                             .arg(appWindow.name(), base.name(),
+                                  ok ? QStringLiteral("深色已生效")
+                                     : QStringLiteral("仍为浅色"))
+                      << Qt::endl;
+                if (!ok) ++failures;
+            }
+            out() << QStringLiteral("  深色主题：功能区 %1，图标 %2，画布 %3")
+                         .arg(ribbonDark ? QStringLiteral("已切换")
+                                         : QStringLiteral("未切换"),
+                              iconsDark ? QStringLiteral("已换色")
+                                        : QStringLiteral("未换色"),
+                              canvasDark ? QStringLiteral("已切换")
+                                         : QStringLiteral("未切换"))
+                  << Qt::endl;
+            if (!ribbonDark || !iconsDark || !canvasDark) ++failures;
+
+            if (!capture(application, window, dir.filePath(QStringLiteral("ui_theme_dark.png")))) {
+                ++failures;
+            }
+
+            // 把窗口调小，逼出滚动条：功能区要横向滚动、图层列表要纵向滚动。
+            // 默认尺寸下内容刚好放得下，滚动条根本不出现，而「深色底上的深色
+            // 滑块」恰恰是深色主题最容易漏掉的一处。
+            window.resize(1060, 620);
+            settle(application, 350);
+
+            int visibleBars = 0;
+            for (QScrollBar* bar : ribbon->window()->findChildren<QScrollBar*>()) {
+                if (bar->isVisible() && bar->maximum() > bar->minimum()) ++visibleBars;
+            }
+            out() << QStringLiteral("  深色小窗口：可见滚动条 %1 条").arg(visibleBars) << Qt::endl;
+            if (visibleBars == 0) {
+                out() << QStringLiteral("  未能逼出滚动条，无法核对滚动条配色。") << Qt::endl;
+                ++failures;
+            }
+            if (!capture(application, window,
+                         dir.filePath(QStringLiteral("ui_compact_dark.png")))) {
+                ++failures;
+            }
+
+            window.resize(1500, 950);
+            settle(application, 250);
+
+            themeButton->click();     // 切回浅色，避免影响后续用例
+            settle(application, 200);
+        }
+
+        // ---- 快照 6：图层与特性下拉框就近取景 ----
+        // 这两个下拉框在窄窗口下位于功能区的右端，需要滚动才能看到，
+        // 因此单独抓一张「滚动到末端」的图，方便核对它们的外观。
+        if (auto* scroller =
+                window.findChild<QScrollArea*>(QStringLiteral("ribbonViewport"))) {
+            scroller->horizontalScrollBar()->setValue(
+                scroller->horizontalScrollBar()->maximum());
+            if (!capture(application, window,
+                         dir.filePath(QStringLiteral("ui_ribbon_tail.png")))) {
+                ++failures;
+            }
+            scroller->horizontalScrollBar()->setValue(0);
+        } else {
+            out() << QStringLiteral("  找不到功能区的滚动容器。") << Qt::endl;
+            ++failures;
         }
     }
 

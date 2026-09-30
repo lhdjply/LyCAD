@@ -10,11 +10,21 @@
 #
 #   lycad_ui_snapshot 在进程内渲染主窗口为 PNG，并用真实鼠标事件驱动交互链路。
 #                    它按定义必须链接 ui，故不会削弱上面那个契约检查。
+#
+#   lycad_icon_sheet 把 resources/icons 下的全部图标渲染成一张总览图，
+#                    供人工核对配色与各尺寸下的清晰度。
 # =============================================================================
 add_executable(lycad_sample dxf_sample_generator.cpp)
 target_include_directories(lycad_sample PRIVATE "${LYCAD_SRC_ROOT}")
 target_link_libraries(lycad_sample
     PRIVATE LyCAD::Core LyCAD::Io Qt6::Core Qt6::Gui LyCAD::Warnings
+)
+
+# 图标总览需要一个能创建 QApplication 的图形环境；offscreen 平台即可
+add_executable(lycad_icon_sheet icon_sheet.cpp)
+target_include_directories(lycad_icon_sheet PRIVATE "${LYCAD_SRC_ROOT}")
+target_link_libraries(lycad_icon_sheet
+    PRIVATE LyCAD::Ui LyCAD::Warnings
 )
 
 # 界面快照需要 QTest 来注入鼠标事件
