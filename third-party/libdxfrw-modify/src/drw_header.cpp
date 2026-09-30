@@ -914,8 +914,10 @@ void DRW_Header::write(dxfWriter *writer, DRW::Version ver){
             writer->writeInt16(70, 1);
     }
     writer->writeString(9, "$HANDSEED");
-    //RLZ        dxfHex(5, 0xFFFF);
-    writer->writeString(5, "20000");
+    // 句柄种子必须**大于**文件中实际用到的所有句柄（AutoCAD 的硬性要求）。
+    // 上游写死 0x20000；这里放宽到 0xFFFFFF，给句柄分配留足余量，
+    // 不必关心 dxfRW::writeEntity 的 ++entCount 最终涨到多少。
+    writer->writeString(5, "FFFFFF");
     writer->writeString(9, "$SURFTAB1");
     if (getInt("$SURFTAB1", &varInt)) {
         writer->writeInt16(70, varInt);

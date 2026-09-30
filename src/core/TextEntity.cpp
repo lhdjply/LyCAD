@@ -62,10 +62,20 @@ TextEntity::TextEntity(const QString& content, const Point2D& position,
 
 QString TextEntity::displayString() const
 {
+    // 保留 \n：MTEXT 降级带来的多行文字靠它分段（渲染器按行绘制）。
+    // \r 无意义，仍剥除。
     QString out = m_content;
-    out.remove(QLatin1Char('\n'));
     out.remove(QLatin1Char('\r'));
     return out;
+}
+
+int TextEntity::lineCount() const noexcept
+{
+    int n = 1;
+    for (const QChar ch : m_content) {
+        if (ch == QLatin1Char('\n')) ++n;
+    }
+    return n;
 }
 
 void TextEntity::setHeight(double h)
@@ -83,8 +93,15 @@ void TextEntity::setWidthFactor(double factor)
 
 double TextEntity::estimatedWidth() const noexcept
 {
+    // 多行文字：宽度取各行中的最大值
     double width = 0.0;
+    double line = 0.0;
     for (const QChar ch : m_content) {
+        if (ch == QLatin1Char('\n')) {
+            width = std::max(width, line);
+            line = 0.0;
+            continue;
+        }
         // QString 是 UTF-16：增补平面字符按代理对出现，此处跳过低代理项
         const ushort code = ch.unicode();
         if (code >= 0xDC00 && code <= 0xDFFF) continue;
@@ -93,8 +110,9 @@ double TextEntity::estimatedWidth() const noexcept
             // 高代理项：与后续低代理项合成码点（估算宽度按 CJK 处理即可）
             cp = isWideChar(code) ? 0x4E00 : code;
         }
-        width += charWidthFactor(cp);
+        line += charWidthFactor(cp);
     }
+    width = std::max(width, line);
     return width * m_height * m_widthFactor;
 }
 
@@ -105,10 +123,13 @@ double TextEntity::baselineOffsetWorld() const noexcept
     //   底部对齐 → 字形下缘贴锚点，基线上移 kDescentRatio·h
     //   中部对齐 → 字形范围中点在锚点
     //   顶部对齐 → 字形上缘贴锚点，基线下移 kAscentRatio·h
+    // 多行块：返回**首行**基线。行距取 1.66 倍字高（与典型字体的
+    // QFont::lineSpacing 接近；包围盒只求覆盖，渲染器用真实行距绘制）。
+    const double span = static_cast<double>(lineCount() - 1) * kLineSpacingFactor * m_height;
     switch (m_vAlign) {
     case VAlign::Baseline: return 0.0;
-    case VAlign::Bottom:   return kDescentRatio * m_height;
-    case VAlign::Middle:   return -(kAscentRatio - kDescentRatio) * 0.5 * m_height;
+    case VAlign::Bottom:   return kDescentRatio * m_height + span;
+    case VAlign::Middle:   return (kDescentRatio - kAscentRatio) * 0.5 * m_height + span * 0.5;
     case VAlign::Top:      return -kAscentRatio * m_height;
     }
     return 0.0;
@@ -123,15 +144,31 @@ std::vector<Point2D> TextEntity::outlineCorners() const
     //   · 垂直镜像时上下翻转
     const double w = std::max(estimatedWidth(), m_height * 0.5);
     const double b = baselineOffsetWorld();
-    double y0 = b - kInkBelowBaseline * m_height;
+    const double span = static_cast<double>(lineCount() - 1) * kLineSpacingFactor * m_height;
+    double y0 = b - span - kInkBelowBaseline * m_height;
     double y1 = b + kInkAboveBaseline * m_height;
     if (m_upsideDown) {
         y0 = -y1;
         y1 = -y0;
     }
 
-    const double x0 = m_backwards ? -w : 0.0;
-    const double x1 = m_backwards ? 0.0 : w;
+    // 水平范围必须与渲染器的对齐方式一致：渲染器把文字相对锚点居中/右对齐，
+    // 选择框若仍固定为「锚点向右 w」，居中文字的框会整体右偏半个框宽
+    //（实测 MTEXT 降级文字全是 MiddleCenter，框看起来向右多出一倍）。
+    double x0 = 0.0;
+    double x1 = w;
+    switch (m_hAlign) {
+    case HAlign::Center: x0 = -w * 0.5; x1 = w * 0.5; break;
+    case HAlign::Right:  x0 = -w;       x1 = 0.0;     break;
+    case HAlign::Left:   x0 = 0.0;      x1 = w;       break;
+    }
+    if (m_backwards) {
+        // 水平镜像：文字自锚点向左延伸，与未镜像时互为翻折
+        const double flipped0 = -x1;
+        const double flipped1 = -x0;
+        x0 = flipped0;
+        x1 = flipped1;
+    }
 
     const std::vector<Point2D> local = {
         { x0, y0 },

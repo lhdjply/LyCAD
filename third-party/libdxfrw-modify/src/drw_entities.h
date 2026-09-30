@@ -718,6 +718,9 @@ public:
         BottomRight
     };
 
+    /// 11 组码是否携带 X 轴方向向量（此时 secPoint 是方向而非对齐点）
+    bool hasXAxisDirection() const { return haveXAxis; }
+
     DRW_MText() {
         eType = DRW::MTEXT;
         interlin = 1;

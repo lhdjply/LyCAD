@@ -38,12 +38,14 @@
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
 #include "core/Layer.h"
 #include "core/Linetype.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/SplineEntity.h"
 #include "core/TextEntity.h"
 #include "core/Types.h"
 
@@ -208,10 +210,10 @@ public:
     void addXline(const DRW_Xline&) override { skip(QStringLiteral("XLINE")); }
     void addArc(const DRW_Arc& data) override;
     void addCircle(const DRW_Circle& data) override;
-    void addEllipse(const DRW_Ellipse&) override { skip(QStringLiteral("ELLIPSE")); }
+    void addEllipse(const DRW_Ellipse& data) override;
     void addLWPolyline(const DRW_LWPolyline& data) override;
     void addPolyline(const DRW_Polyline& data) override;
-    void addSpline(const DRW_Spline*) override { skip(QStringLiteral("SPLINE")); }
+    void addSpline(const DRW_Spline* data) override;
     void addKnot(const DRW_Entity&) override {}
     void addInsert(const DRW_Insert& data) override;
     void addTrace(const DRW_Trace& data) override;
@@ -606,6 +608,39 @@ void Builder::addTrace(const DRW_Trace& data)
 // -----------------------------------------------------------------------------
 //  文字
 // -----------------------------------------------------------------------------
+/// 清理 MTEXT 的内联格式码：\P（段落）→ 空格；{…} 分组括号剥除；
+/// \W/\H/\A/\C/\c/\f/\F/\T/\Q/\S…; 这类「到分号为止」的控制串整段剥除；
+/// \\ 与 \{、\} 是转义字面量，还原后保留。
+QString stripMTextCodes(const QString& raw)
+{
+    QString out;
+    out.reserve(raw.size());
+    for (int i = 0; i < raw.size(); ++i) {
+        const QChar ch = raw.at(i);
+        if (ch != QLatin1Char('\\')) {
+            if (ch != QLatin1Char('{') && ch != QLatin1Char('}')) out.append(ch);
+            continue;
+        }
+        if (i + 1 >= raw.size()) break;
+        const QChar next = raw.at(i + 1);
+        if (next == QLatin1Char('\\')) { out.append(QLatin1Char('\\')); ++i; continue; }
+        if (next == QLatin1Char('{') || next == QLatin1Char('}')) {
+            out.append(next); ++i; continue;
+        }
+        if (next == QLatin1Char('~')) {
+            out.append(QLatin1Char(' ')); ++i; continue;    // 不换行空格
+        }
+        if (next == QLatin1Char('P')) {
+            out.append(QLatin1Char('\n')); ++i; continue;   // 段落换行
+        }
+        int j = i + 1;
+        while (j < raw.size() && raw.at(j) != QLatin1Char(';')) ++j;
+        if (j < raw.size()) { i = j; continue; }   // 到分号为止整段剥除
+        out.append(ch);                            // 没有分号：按字面保留
+    }
+    return out;
+}
+
 std::unique_ptr<TextEntity> Builder::makeText(const DRW_Text& data)
 {
     // 单位换算：DXF 路径下 libdxfrw 原样返回 50 组码（度），DWG 路径下是弧度。
@@ -664,6 +699,46 @@ std::unique_ptr<TextEntity> Builder::makeText(const DRW_Text& data)
     return entity;
 }
 
+// -----------------------------------------------------------------------------
+//  椭圆 / 样条
+// -----------------------------------------------------------------------------
+void Builder::addEllipse(const DRW_Ellipse& data)
+{
+    // 11 组码是「主轴端点相对中心」的向量；参数以主轴方向为零点（弧度）
+    auto entity = std::make_unique<EllipseEntity>(
+        toPoint(data.basePoint), Point2D(data.secPoint.x, data.secPoint.y),
+        data.ratio, data.staparam, data.endparam);
+    applyCommon(*entity, data);
+    place(std::move(entity));
+}
+
+void Builder::addSpline(const DRW_Spline* data)
+{
+    if (!data) return;
+
+    auto entity = std::make_unique<SplineEntity>();
+    entity->setDegree(data->degree);
+    entity->setClosed((data->flags & 1) != 0);    // bit1 = 闭合
+
+    std::vector<Point2D> control;
+    control.reserve(data->controllist.size());
+    for (const DRW_Coord* c : data->controllist) {
+        if (c) control.push_back(toPoint(*c));
+    }
+    entity->setControlPoints(std::move(control));
+    entity->setKnots(data->knotslist);
+
+    std::vector<Point2D> fits;
+    fits.reserve(data->fitlist.size());
+    for (const DRW_Coord* c : data->fitlist) {
+        if (c) fits.push_back(toPoint(*c));
+    }
+    entity->setFitPoints(std::move(fits));
+
+    applyCommon(*entity, *data);
+    place(std::move(entity));
+}
+
 void Builder::addText(const DRW_Text& data)
 {
     auto entity = makeText(data);
@@ -675,7 +750,43 @@ void Builder::addMText(const DRW_MText& data)
 {
     // 多行文字未建模，但内容仍值得保留：取其中的文字并按单行导入。
     // 这里如实计数，让用户知道它被降级处理过。
-    auto entity = makeText(data);
+    // MTEXT 的内联格式码（\P 段落、{\W1;…} 宽度、\H/\A/\C/\f 等）
+    // 若原样带出会以反斜杠乱码出现在图面上，先做一次尽力清理。
+    //
+    // 更关键的是 MTEXT 与 TEXT 的组码语义差异——直接复用 DRW_Text 的字段
+    // 会把位置和大小全带偏（实测本文件：文字散落到 x=-5，整图视野失效）：
+    //   · 71 组码在 MTEXT 里是**附着点**（1~9），被库读进了 textgen；
+    //   · 72/73 是流向与行距，被读进了 alignH/alignV；
+    //   · 11 组码是**X 轴方向向量**，被读进了 secPoint（对齐点）；
+    //   · 41 组码是**栏宽**，被读进了 widthscale。
+    // 降级时按 MTEXT 语义重新映射：旋转取自 X 轴方向（度，makeText 会再转弧度），
+    // 对齐由附着点换算，对齐点 = 插入点，宽度因子固定 1。
+    DRW_Text plain;
+    plain.text = stripMTextCodes(toQString(data.text)).toStdString();
+    plain.basePoint = data.basePoint;
+    plain.height = data.height;
+    if (data.hasXAxisDirection()
+        && std::hypot(data.secPoint.x, data.secPoint.y) > kGeomTol) {
+        plain.angle = radToDeg(std::atan2(data.secPoint.y, data.secPoint.x));
+    } else {
+        plain.angle = data.angle;             // 少数生成器直接写 50 组码（度）
+    }
+    const int attachment = std::clamp(data.textgen, 1, 9);
+    switch (attachment) {                     // 列：0 左 1 中 2 右
+    case 2: case 5: case 8: plain.alignH = DRW_Text::HCenter; break;
+    case 3: case 6: case 9: plain.alignH = DRW_Text::HRight;  break;
+    default:                plain.alignH = DRW_Text::HLeft;   break;
+    }
+    switch (attachment) {                     // 行：0 上 1 中 2 下
+    case 4: case 5: case 6: plain.alignV = DRW_Text::VMiddle; break;
+    case 7: case 8: case 9: plain.alignV = DRW_Text::VBottom; break;
+    default:                plain.alignV = DRW_Text::VTop;    break;
+    }
+    plain.secPoint = data.basePoint;          // 对齐点 = 插入点
+    plain.textgen = 0;
+    plain.widthscale = 1.0;
+    plain.style = data.style;
+    auto entity = makeText(plain);
     if (entity) {
         applyCommon(*entity, data);
         place(std::move(entity));
@@ -1187,6 +1298,8 @@ public:
     }
 
     int hatchDowngrades() const noexcept { return m_hatchDowngrades; }
+    int splineDowngrades() const noexcept { return m_splineDowngrades; }
+    int ellipseDowngrades() const noexcept { return m_ellipseDowngrades; }
 
     // ---- 读侧接口（导出不使用） ----------------------------------------------
     void addHeader(const DRW_Header*) override {}
@@ -1357,6 +1470,8 @@ public:
             case EntityType::Text:      writeText(*static_cast<const TextEntity*>(entity)); break;
             case EntityType::Hatch:     writeHatch(*static_cast<const HatchEntity*>(entity)); break;
             case EntityType::Dimension: writeDimension(*static_cast<const DimensionEntity*>(entity)); break;
+            case EntityType::Spline:    writeSplineCurve(*static_cast<const SplineEntity*>(entity)); break;
+            case EntityType::Ellipse:   writeEllipseCurve(*static_cast<const EllipseEntity*>(entity)); break;
             default: break;
             }
         }
@@ -1496,17 +1611,63 @@ private:
         }
     }
 
+    /// 多行文字的 MTEXT 附着点（1~9）：行 Top=1 / Middle=4 / Bottom=7，
+    /// 列 Left=+0 / Center=+1 / Right=+2。与读侧 addMText 的映射互逆。
+    static int mtextAttachment(const TextEntity& text)
+    {
+        const int row = text.vAlign() == TextEntity::VAlign::Top    ? 1
+                        : text.vAlign() == TextEntity::VAlign::Middle ? 4
+                                                                      : 7;
+        const int col = text.hAlign() == TextEntity::HAlign::Center ? 1
+                        : text.hAlign() == TextEntity::HAlign::Right  ? 2
+                                                                      : 0;
+        return row + col;
+    }
+
     void writeText(const TextEntity& text)
     {
-        if (text.displayString().isEmpty()) {
+        const QString content = text.displayString();
+        if (content.isEmpty()) {
             // 空文字不是合法的 DXF 实体，跳过而非产出坏文件
             return;
         }
+
+        // 多行文字（读侧 MTEXT 降级留下的 \n）写回为**真正的 MTEXT**：
+        // DXF 的一个组码值不能跨行，把含 \n 的字符串写进 TEXT 的 1 组码
+        // 会产出非法文件（实测 AutoCAD 直接拒绝打开，ezdxf 也报
+        // "Invalid group code"）——这正是 MTEXT 用 \P 表示段落的原因。
+        // R12 无 MTEXT，走下方 TEXT 分支并折叠换行。
+        if (m_r2000 && content.contains(QLatin1Char('\n'))) {
+            DRW_MText record;
+            applyCommonWrite(record, text);
+            applyCoord(record.basePoint, text.effectivePosition());
+            record.text = QString(content)
+                              .replace(QLatin1Char('\r'), QString())
+                              .replace(QLatin1Char('\n'), QStringLiteral("\\P"))
+                              .toStdString();
+            record.height = text.height();
+            record.textgen = mtextAttachment(text);
+            // MTEXT 的 72/73 与 TEXT 的对齐枚举不同义：72 是流向
+            // （1=从左到右），73 是行距风格（1=至少）。按 MTEXT 规范写。
+            record.alignH = static_cast<DRW_Text::HAlign>(1);
+            record.alignV = static_cast<DRW_Text::VAlign>(1);
+            record.interlin = 1.0;
+            record.widthscale = 0.0;           // 41=0：不按栏宽折行
+            record.angle = text.rotation() * kRadToDeg;
+            record.style = "Standard";
+            m_rw->writeMText(&record);
+            return;
+        }
+
         DRW_Text record;
         applyCommonWrite(record, text);
         applyCoord(record.basePoint, text.position());
         record.secPoint = record.basePoint;
-        record.text = text.displayString().toStdString();
+        // TEXT 的值必须是单行：残留的换行折叠为空格（合法性与 R12 路径兜底）
+        record.text = QString(content)
+                          .replace(QLatin1Char('\r'), QString())
+                          .replace(QLatin1Char('\n'), QLatin1Char(' '))
+                          .toStdString();
         record.height = text.height();
         record.angle = text.rotation() * kRadToDeg;
         record.widthscale = text.widthFactor();
@@ -1563,6 +1724,69 @@ private:
         loop->objlist.push_back(boundary);
         record.appendLoop(loop);
         m_rw->writeHatch(&record);
+    }
+
+    /// 样条：R2000 按原生 SPLINE 写出；R12 无此实体，降级为多段线并计数
+    void writeSplineCurve(const SplineEntity& spline)
+    {
+        if (m_r2000) {
+            DRW_Spline record;
+            applyCommonWrite(record, spline);
+            record.degree = spline.degree();
+            record.flags = spline.isClosed() ? 1 : 0;
+            record.normalVec = DRW_Coord(0.0, 0.0, 1.0);
+            record.knotslist = spline.knots();
+            for (const Point2D& p : spline.controlPoints()) {
+                record.controllist.push_back(new DRW_Coord(p.x, p.y, 0.0));
+            }
+            record.nknots = static_cast<int>(record.knotslist.size());
+            record.ncontrol = static_cast<int>(record.controllist.size());
+            record.nfit = 0;
+            m_rw->writeSpline(&record);
+            return;
+        }
+
+        const std::vector<Point2D> pts = spline.flatten(0.01);
+        if (pts.size() >= 2) {
+            DRW_Polyline record;
+            applyCommonWrite(record, spline);
+            record.flags = spline.isClosed() ? 1 : 0;
+            for (const Point2D& p : pts) {
+                record.vertlist.push_back(new DRW_Vertex(p.x, p.y, 0.0, 0.0));
+            }
+            m_rw->writePolyline(&record);
+        }
+        ++m_splineDowngrades;
+    }
+
+    /// 椭圆：R2000 按原生 ELLIPSE 写出；R12 无此实体，降级为多段线并计数。
+    ///（库自带的 R12 分支不拷贝图层/颜色等属性，故这里自行降级。）
+    void writeEllipseCurve(const EllipseEntity& ellipse)
+    {
+        if (m_r2000) {
+            DRW_Ellipse record;
+            applyCommonWrite(record, ellipse);
+            applyCoord(record.basePoint, ellipse.center());
+            const Point2D& axis = ellipse.majorAxisEnd();
+            record.secPoint = DRW_Coord(axis.x, axis.y, 0.0);
+            record.ratio = ellipse.ratio();
+            record.staparam = ellipse.startParam();
+            record.endparam = ellipse.endParam();
+            m_rw->writeEllipse(&record);
+            return;
+        }
+
+        const std::vector<Point2D> pts = ellipse.flatten(0.01);
+        if (pts.size() >= 2) {
+            DRW_Polyline record;
+            applyCommonWrite(record, ellipse);
+            record.flags = ellipse.isClosed() ? 1 : 0;
+            for (const Point2D& p : pts) {
+                record.vertlist.push_back(new DRW_Vertex(p.x, p.y, 0.0, 0.0));
+            }
+            m_rw->writePolyline(&record);
+        }
+        ++m_ellipseDowngrades;
     }
 
     void writeDimension(const DimensionEntity& dim)
@@ -1625,6 +1849,8 @@ private:
     bool m_r2000 = false;
     std::map<EntityId, std::string> m_dimBlocks;
     int m_hatchDowngrades = 0;
+    int m_splineDowngrades = 0;
+    int m_ellipseDowngrades = 0;
 };
 
 } // namespace
@@ -1652,6 +1878,14 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
     IoResult result = IoResult::success(document.entityCount());
     if (const int downgrades = exporter.hatchDowngrades(); downgrades > 0) {
         result.addWarning(QStringLiteral("%1 个填充图元在 R12 中降级为闭合多段线（R12 不支持 HATCH 实体）")
+                              .arg(downgrades));
+    }
+    if (const int downgrades = exporter.splineDowngrades(); downgrades > 0) {
+        result.addWarning(QStringLiteral("%1 个样条曲线在 R12 中降级为多段线（R12 不支持 SPLINE 实体）")
+                              .arg(downgrades));
+    }
+    if (const int downgrades = exporter.ellipseDowngrades(); downgrades > 0) {
+        result.addWarning(QStringLiteral("%1 个椭圆在 R12 中降级为多段线（R12 不支持 ELLIPSE 实体）")
                               .arg(downgrades));
     }
     return result;

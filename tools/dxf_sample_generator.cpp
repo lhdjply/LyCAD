@@ -21,6 +21,7 @@
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/Format.h"
 #include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
@@ -28,6 +29,7 @@
 #include "core/PolylineEntity.h"
 #include "core/TextEntity.h"
 #include "io/CadFile.h"
+#include "io/LibDxfRwAdapter.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -260,6 +262,17 @@ int inspect(const QString& path)
     out() << QStringLiteral("图元数: ") << document.entityCount() << Qt::endl;
     out() << QStringLiteral("图层数: ") << document.layers().count() << Qt::endl;
 
+    const Box2D extents = document.extents();
+    out() << QStringLiteral("范围: ")
+          << (extents.isValid()
+                  ? QStringLiteral("x[%1, %2] y[%3, %4]")
+                        .arg(formatLength(extents.minCorner().x, 2),
+                             formatLength(extents.maxCorner().x, 2),
+                             formatLength(extents.minCorner().y, 2),
+                             formatLength(extents.maxCorner().y, 2))
+                  : QStringLiteral("无效（无可显示图元或包围盒异常）"))
+          << Qt::endl;
+
     out() << QStringLiteral("图层: ") << Qt::endl;
     for (const Layer& layer : document.layers().all()) {
         out() << QStringLiteral("  - %1  color=%2  linetype=%3  visible=%4")
@@ -317,6 +330,28 @@ int main(int argc, char* argv[])
 
     if (arguments.size() >= 3 && arguments.at(1) == QLatin1String("--inspect")) {
         return inspect(arguments.at(2));
+    }
+    if (arguments.size() >= 4 && arguments.at(1) == QLatin1String("--convert")) {
+        Document document;
+        const IoResult loaded = CadFile::load(arguments.at(2), document);
+        if (!loaded.ok) {
+            out() << QStringLiteral("读取失败: %1").arg(loaded.error) << Qt::endl;
+            return 1;
+        }
+        const QString version = (arguments.size() > 4) ? arguments.at(4)
+                                                       : QStringLiteral("AC1015");
+        WriteOptions options;
+        options.version = version;
+        const IoResult written = writeDxfWithLibDxfRw(arguments.at(3), document, options);
+        out() << QStringLiteral("转换 %1 → %2 (%3)：图元 %4，%5")
+                     .arg(arguments.at(2), arguments.at(3), version)
+                     .arg(document.entityCount())
+                     .arg(written.ok ? QStringLiteral("成功") : QStringLiteral("失败"))
+              << Qt::endl;
+        for (const QString& w : written.warnings) {
+            out() << QStringLiteral("  · %1").arg(w) << Qt::endl;
+        }
+        return written.ok ? 0 : 1;
     }
 
     const QString outputDir = (arguments.size() > 1) ? arguments.at(1) : QStringLiteral(".");

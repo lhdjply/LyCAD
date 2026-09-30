@@ -6,11 +6,13 @@
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
+#include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/SplineEntity.h"
 #include "core/TextEntity.h"
 
 #include <QFontDatabase>
@@ -208,7 +210,11 @@ bool visibleInViewport(const Entity& entity, const ViewTransform& view, const QR
 
     const QRectF rect(QPointF(std::min(a.x, b.x), std::min(a.y, b.y)),
                       QPointF(std::max(a.x, b.x), std::max(a.y, b.y)));
-    return viewport.intersects(rect);
+    // 点状/线状图元（竖直的线、样条）包围盒宽或高为 0，而 QRectF::intersects
+    // 把零宽高一律判为不相交——竖直线会被整体剔除（实测一幅端子图里全部
+    // 竖直样条因此消失）。膨胀半个像素的余量再判。
+    const QRectF padded = rect.adjusted(-0.5, -0.5, 0.5, 0.5);
+    return viewport.intersects(padded);
 }
 
 void drawCircleEntity(QPainter& painter, const CircleEntity& circle, const DrawContext& context,
@@ -262,6 +268,28 @@ void drawArcEntity(QPainter& painter, const ArcEntity& arc, const DrawContext& c
 
     drawAsTangentLine(painter, centerDevice, radiusPixels, window,
                       true, startRad, spanRad, context.viewport);
+}
+
+/// 用离散点序列画一条开放/闭合曲线（样条、椭圆等 flatten 后统一走这里）
+void drawFlattenedCurve(QPainter& painter, const std::vector<Point2D>& points,
+                        bool closed, const DrawContext& context)
+{
+    if (points.empty()) return;
+    if (points.size() == 1) {
+        const Point2D d = context.view->toDevice(points.front());
+        drawPointMarker(painter, d, painter.pen().color(), 3.0);
+        return;
+    }
+
+    QPainterPath path;
+    const Point2D first = context.view->toDevice(points.front());
+    path.moveTo(first.x, first.y);
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        const Point2D d = context.view->toDevice(points[i]);
+        path.lineTo(d.x, d.y);
+    }
+    if (closed) path.closeSubpath();
+    painter.drawPath(path);
 }
 
 void drawPolylineEntity(QPainter& painter, const PolylineEntity& polyline,
@@ -396,28 +424,37 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
                       text.isUpsideDown() ? -1.0 : 1.0);
     }
 
-    // 垂直对齐：换算为基线相对锚点的偏移（设备帧内 y 向下为正）。
-    // 字形范围 = [基线 - ascent, 基线 + descent]，各对齐方式的锚点落位：
-    //   基线对齐 → 基线      底部对齐 → 范围底缘（含下伸部）
-    //   中部对齐 → 范围中点  顶部对齐 → 范围顶缘
+    // 多行（MTEXT 降级，\n 分段）：整块参与对齐，逐行绘制
+    const QStringList lines = content.split(QLatin1Char('\n'));
+    const double blockSpan =
+        static_cast<double>(lines.size() - 1) * metrics.lineSpacing();
+
+    // 垂直对齐：换算为**首行**基线相对锚点的偏移（设备帧内 y 向下为正）。
+    // 单行时与原行为完全一致；多行时块的扩展方向：
+    //   顶部对齐 → 块向下长    底部对齐 → 块向上长    中部对齐 → 两头伸
     double baselineOffset = 0.0;
     switch (text.vAlign()) {
     case TextEntity::VAlign::Baseline: baselineOffset = 0.0; break;
-    case TextEntity::VAlign::Bottom:   baselineOffset = -metrics.descent(); break;
-    case TextEntity::VAlign::Middle:   baselineOffset = (metrics.ascent() - metrics.descent()) * 0.5; break;
+    case TextEntity::VAlign::Bottom:   baselineOffset = -metrics.descent() - blockSpan; break;
+    case TextEntity::VAlign::Middle:   baselineOffset = (metrics.ascent() - metrics.descent() - blockSpan) * 0.5; break;
     case TextEntity::VAlign::Top:      baselineOffset = metrics.ascent(); break;
     }
 
-    // 水平对齐：以锚点为参考的起点偏移
-    double x = 0.0;
-    const double advance = metrics.horizontalAdvance(content);
-    switch (text.hAlign()) {
-    case TextEntity::HAlign::Left:   x = 0.0; break;
-    case TextEntity::HAlign::Center: x = -advance * 0.5; break;
-    case TextEntity::HAlign::Right:  x = -advance; break;
+    // 水平对齐按**各行**的宽度计算（多行时每行起点不同）
+    double y = baselineOffset;
+    for (const QString& line : lines) {
+        if (!line.isEmpty()) {
+            const double advance = metrics.horizontalAdvance(line);
+            double x = 0.0;
+            switch (text.hAlign()) {
+            case TextEntity::HAlign::Left:   x = 0.0; break;
+            case TextEntity::HAlign::Center: x = -advance * 0.5; break;
+            case TextEntity::HAlign::Right:  x = -advance; break;
+            }
+            painter.drawText(QPointF(x, y), line);
+        }
+        y += metrics.lineSpacing();
     }
-
-    painter.drawText(QPointF(x, baselineOffset), content);
     painter.restore();
 }
 
@@ -687,6 +724,18 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
     }
     case EntityType::Dimension: {
         drawDimensionEntity(painter, static_cast<const DimensionEntity&>(entity), context);
+        break;
+    }
+    case EntityType::Spline: {
+        const auto& spline = static_cast<const SplineEntity&>(entity);
+        drawFlattenedCurve(painter, spline.flatten(adaptiveSagitta(context)),
+                           spline.isClosed(), context);
+        break;
+    }
+    case EntityType::Ellipse: {
+        const auto& ellipse = static_cast<const EllipseEntity&>(entity);
+        drawFlattenedCurve(painter, ellipse.flatten(adaptiveSagitta(context)),
+                           ellipse.isClosed(), context);
         break;
     }
     }

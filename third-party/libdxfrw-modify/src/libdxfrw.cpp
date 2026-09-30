@@ -39,6 +39,7 @@ dxfRW::dxfRW(const char* name){
     writer = NULL;
     applyExt = false;
     elParts = 128; //parts munber when convert ellipse to polyline
+    ownerHandle = 0x1F; // 默认 *Model_Space 的 BLOCK_RECORD
 }
 dxfRW::~dxfRW(){
     if (reader != NULL)
@@ -143,6 +144,7 @@ bool dxfRW::write(DRW_Interface *interface_, DRW::Version ver, bool bin){
 
     writer->writeString(0, "SECTION");
     writer->writeString(2, "ENTITIES");
+    ownerHandle = 0x1F;             // ENTITIES 区的实体都属于模型空间
     iface->writeEntities();
     writer->writeString(0, "ENDSEC");
 
@@ -187,6 +189,13 @@ bool dxfRW::writeEntity(DRW_Entity *ent) {
     // （R12 与 R2000 都接受该组码，不设版本门。）
     if (!ent->visible) {
         writer->writeInt16(60, 1);
+    }
+    if (version > DRW::AC1014) {
+        // 330 组码：实体所属 BLOCK_RECORD 的软指针。AutoCAD / GstarCAD 靠它
+        // 把实体挂到模型空间或块上——缺失时实体成为"孤儿"，实测 GstarCAD
+        // 打开文件后整个图形空白。模型空间实体由 write() 设 0x1F，
+        // 块内实体由 writeBlock 设为该块的 BLOCK_RECORD 句柄。
+        writer->writeString(330, toHexStr(ownerHandle));
     }
     return true;
 }
@@ -1394,6 +1403,7 @@ bool dxfRW::writeBlock(DRW_Block *bk){
     writer->writeString(0, "BLOCK");
     if (version > DRW::AC1009) {
         currHandle = (*(blockMap.find(bk->name))).second;
+        ownerHandle = currHandle;   // 块内实体的属主 = 该块的 BLOCK_RECORD
         writer->writeString(5, toHexStr(currHandle+1));
         if (version > DRW::AC1014) {
             writer->writeString(330, toHexStr(currHandle));

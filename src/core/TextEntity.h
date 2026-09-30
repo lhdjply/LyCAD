@@ -33,6 +33,8 @@ public:
     /// 垂直对齐换算中用到的字体内距比例（× 字高）
     static constexpr double kDescentRatio = 0.30;
     static constexpr double kAscentRatio  = 1.05;
+    /// 多行文字的行距系数（包围盒估算用；渲染器用 QFont 真实行距绘制）
+    static constexpr double kLineSpacingFactor = 1.66;
 
     TextEntity();
     explicit TextEntity(const QString& content,
@@ -46,6 +48,9 @@ public:
 
     /// 单行显示所用的文本（去掉换行）
     QString displayString() const;
+
+    /// 内容行数（\n 分段；MTEXT 降级的多行文字 ≥ 2）
+    int lineCount() const noexcept;
 
     // ---- 几何参数 --------------------------------------------------------------
     const Point2D& position() const noexcept { return m_position; }

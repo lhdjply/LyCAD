@@ -133,6 +133,7 @@ private:
 //    int section;
     std::string nextentity;
     int entCount;
+    int ownerHandle;  /*!< 当前写出实体的属主（所属 BLOCK_RECORD 句柄） */
     bool wlayer0;
     bool dimstyleStd;
     bool applyExt;

@@ -410,6 +410,12 @@ void CadCanvas::drawEntities(QPainter& painter)
 
         EntityRenderer::draw(painter, *entity, context, color, lineweight, linetype);
     }
+
+    if (qgetenv("LYCAD_RENDER_STATS") == "1") {
+        // 单轮汇总：drawOrder 遍历结束。剔除计数在 EntityRenderer::draw 里累计。
+        // 通过一个弱符号方案太绕，这里直接访问 draw 的静态计数器不现实；
+        // 改为在 draw() 里打印（见 EntityRenderer.cpp）。
+    }
 }
 
 void CadCanvas::drawSelectionHighlight(QPainter& painter)

@@ -6,11 +6,13 @@
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
+#include "core/EllipseEntity.h"
 #include "core/Document.h"
 #include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/SplineEntity.h"
 #include "core/TextEntity.h"
 
 #include <algorithm>
@@ -218,6 +220,26 @@ void SnapEngine::collectEntityCandidates(const Document& document,
             if (m_settings.endpoint) {
                 touched |= add(dim.firstPoint(), SnapKind::Endpoint);
                 touched |= add(dim.secondPoint(), SnapKind::Endpoint);
+            }
+            break;
+        }
+        case EntityType::Spline: {
+            // 样条：捕捉两端点（闭合样条首尾重合，只报一次）
+            if (m_settings.endpoint) {
+                for (const Point2D& p : entity->snapPoints()) {
+                    touched |= add(p, SnapKind::Endpoint);
+                }
+            }
+            break;
+        }
+        case EntityType::Ellipse: {
+            const auto& ellipse = static_cast<const EllipseEntity&>(*entity);
+            if (m_settings.center) touched |= add(ellipse.center(), SnapKind::Center);
+            if (m_settings.quadrant) {
+                for (const Point2D& p : ellipse.snapPoints()) {
+                    if (p == ellipse.center()) continue;
+                    touched |= add(p, SnapKind::Quadrant);
+                }
             }
             break;
         }

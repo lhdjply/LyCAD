@@ -190,12 +190,16 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch
     std::vector<EntityId> arcIds;
     std::vector<EntityId> polylineIds;
     std::vector<EntityId> pointIds;
+    std::vector<EntityId> splineIds;
+    std::vector<EntityId> ellipseIds;
     for (EntityId id : document.drawOrder()) {
         switch (document.entity(id)->type()) {
         case EntityType::Circle:   circleIds.push_back(id); break;
         case EntityType::Arc:      arcIds.push_back(id); break;
         case EntityType::Polyline: polylineIds.push_back(id); break;
         case EntityType::Point:    pointIds.push_back(id); break;
+        case EntityType::Spline:   splineIds.push_back(id); break;
+        case EntityType::Ellipse:  ellipseIds.push_back(id); break;
         default: break;
         }
     }
@@ -296,6 +300,8 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
                            .arg(formatDxfDouble(radToDeg(hatch.patternAngle()), 6));
             break;
         }
+        case EntityType::Spline:   break;
+        case EntityType::Ellipse:  break;
         case EntityType::Dimension: {
             const auto& dim = static_cast<const DimensionEntity&>(*entity);
             geometry = QStringLiteral("D%1;F%2;S%3;L%4;R%5;TX[%6]")
