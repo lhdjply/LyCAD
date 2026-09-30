@@ -14,6 +14,9 @@ add_library(lycad_core STATIC
     CircleEntity.h          CircleEntity.cpp
     ArcEntity.h             ArcEntity.cpp
     PolylineEntity.h        PolylineEntity.cpp
+    TextEntity.h            TextEntity.cpp
+    HatchEntity.h           HatchEntity.cpp
+    DimensionEntity.h       DimensionEntity.cpp
     Layer.h                 Layer.cpp
     Linetype.h              Linetype.cpp
     Selection.h             Selection.cpp

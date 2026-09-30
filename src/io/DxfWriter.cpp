@@ -5,14 +5,19 @@
 
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 
 #include <QIODevice>
 #include <QSet>
+
+#include <cmath>
 
 namespace lycad {
 
@@ -64,6 +69,22 @@ QString DxfWriter::nextHandle()
     return handleText(m_handleSeed++);
 }
 
+void DxfWriter::prescanDimensionBlocks()
+{
+    m_dimBlocks.clear();
+    int index = 0;
+    for (EntityId id : m_document->drawOrder()) {
+        const Entity* entity = m_document->entity(id);
+        if (!entity || entity->type() != EntityType::Dimension) continue;
+
+        DimensionBlockInfo info;
+        info.name = QStringLiteral("*D%1").arg(++index);
+        info.recordHandle = nextHandle();       // R2000 的 BLOCK_RECORD 句柄
+        info.dim = static_cast<const DimensionEntity*>(entity);
+        m_dimBlocks.push_back(std::move(info));
+    }
+}
+
 void DxfWriter::openSection(const char* name)
 {
     m_out.write(0, QStringLiteral("SECTION"));
@@ -87,12 +108,19 @@ IoResult DxfWriter::write(const Document& document)
 
     m_document = &document;
     m_handleSeed = 0x30;
+    m_hatchDowngrades = 0;
+
+    // 预扫描尺寸标注：BLOCK_RECORD 表与 BLOCKS 区都需要提前知道
+    // 每个标注对应的匿名块名，因此必须先于 TABLES 区完成
+    prescanDimensionBlocks();
 
     m_out.writeComment(QStringLiteral("LyCAD 生成的 DXF 文件 (目标版本 %1)").arg(dxfVersion()));
 
     writeHeader();
     writeTables();
-    if (isR2000()) writeBlocks();
+    // 两个版本都写出 BLOCKS 区：R2000 结构上必需；R12 虽可省略，
+    // 但尺寸标注的匿名几何块在 R12 下同样需要载体
+    writeBlocks();
     writeEntities();
     if (isR2000()) writeObjects();
 
@@ -104,6 +132,10 @@ IoResult DxfWriter::write(const Document& document)
 
     IoResult result = IoResult::success(document.entityCount());
     result.addWarning(QStringLiteral("目标版本 %1").arg(dxfVersion()));
+    if (m_hatchDowngrades > 0) {
+        result.addWarning(QStringLiteral("%1 个填充图元在 R12 中降级为闭合多段线（R12 不支持 HATCH 实体）")
+                              .arg(m_hatchDowngrades));
+    }
     return result;
 }
 
@@ -380,7 +412,7 @@ void DxfWriter::writeBlockRecordTable()
     m_out.write(5, handleText(kHandleBlockRecordTable));
     m_out.write(330, QStringLiteral("0"));
     m_out.write(100, QStringLiteral("AcDbSymbolTable"));
-    m_out.write(70, 2);
+    m_out.write(70, static_cast<int>(2 + m_dimBlocks.size()));
 
     // 图纸空间与模型空间两个必需的块记录
     m_out.write(0, QStringLiteral("BLOCK_RECORD"));
@@ -400,51 +432,139 @@ void DxfWriter::writeBlockRecordTable()
     m_out.write(2, QStringLiteral("*Paper_Space"));
     m_out.write(70, 0);
 
+    // 尺寸标注的匿名几何块记录
+    for (const DimensionBlockInfo& info : m_dimBlocks) {
+        m_out.write(0, QStringLiteral("BLOCK_RECORD"));
+        m_out.write(5, info.recordHandle);
+        m_out.write(330, handleText(kHandleBlockRecordTable));
+        m_out.write(100, QStringLiteral("AcDbSymbolTableRecord"));
+        m_out.write(100, QStringLiteral("AcDbBlockTableRecord"));
+        m_out.write(2, info.name);
+        m_out.write(70, 0);
+    }
+
     m_out.write(0, QStringLiteral("ENDTAB"));
+}
+
+void DxfWriter::writeSpaceBlock(const QString& name, const QString& ownerRecordHandle)
+{
+    m_out.write(0, QStringLiteral("BLOCK"));
+    if (isR2000()) {
+        m_out.write(5, nextHandle());
+        m_out.write(330, ownerRecordHandle);
+        m_out.write(100, QStringLiteral("AcDbEntity"));
+    }
+    m_out.write(8, QStringLiteral("0"));
+    if (isR2000()) {
+        m_out.write(100, QStringLiteral("AcDbBlockBegin"));
+    }
+    m_out.write(2, name);
+    m_out.write(70, 0);
+    m_out.writePoint(10, Point2D(0.0, 0.0));
+    m_out.write(3, name);
+    m_out.write(1, QString());
+    m_out.write(0, QStringLiteral("ENDBLK"));
+    if (isR2000()) {
+        m_out.write(5, nextHandle());
+        m_out.write(330, ownerRecordHandle);
+        m_out.write(100, QStringLiteral("AcDbEntity"));
+        m_out.write(8, QStringLiteral("0"));
+        m_out.write(100, QStringLiteral("AcDbBlockEnd"));
+    }
 }
 
 void DxfWriter::writeBlocks()
 {
     openSection("BLOCKS");
 
-    // *Model_Space 块定义：R2000 要求存在，实体本身写在 ENTITIES 区
-    m_out.write(0, QStringLiteral("BLOCK"));
-    m_out.write(5, nextHandle());
-    m_out.write(330, handleText(kHandleModelSpaceRecord));
-    m_out.write(100, QStringLiteral("AcDbEntity"));
-    m_out.write(8, QStringLiteral("0"));
-    m_out.write(100, QStringLiteral("AcDbBlockBegin"));
-    m_out.write(2, QStringLiteral("*Model_Space"));
-    m_out.write(70, 0);
-    m_out.writePoint(10, Point2D(0.0, 0.0));
-    m_out.write(3, QStringLiteral("*Model_Space"));
-    m_out.write(1, QString());
-    m_out.write(0, QStringLiteral("ENDBLK"));
-    m_out.write(5, nextHandle());
-    m_out.write(330, handleText(kHandleModelSpaceRecord));
-    m_out.write(100, QStringLiteral("AcDbEntity"));
-    m_out.write(8, QStringLiteral("0"));
-    m_out.write(100, QStringLiteral("AcDbBlockEnd"));
+    // *Model_Space / *Paper_Space 块定义：实体本身写在 ENTITIES 区
+    writeSpaceBlock(QStringLiteral("*Model_Space"), handleText(kHandleModelSpaceRecord));
+    writeSpaceBlock(QStringLiteral("*Paper_Space"), m_paperSpaceRecordHandle);
 
-    m_out.write(0, QStringLiteral("BLOCK"));
-    m_out.write(5, nextHandle());
-    m_out.write(330, m_paperSpaceRecordHandle);
-    m_out.write(100, QStringLiteral("AcDbEntity"));
-    m_out.write(8, QStringLiteral("0"));
-    m_out.write(100, QStringLiteral("AcDbBlockBegin"));
-    m_out.write(2, QStringLiteral("*Paper_Space"));
-    m_out.write(70, 0);
-    m_out.writePoint(10, Point2D(0.0, 0.0));
-    m_out.write(3, QStringLiteral("*Paper_Space"));
-    m_out.write(1, QString());
-    m_out.write(0, QStringLiteral("ENDBLK"));
-    m_out.write(5, nextHandle());
-    m_out.write(330, m_paperSpaceRecordHandle);
-    m_out.write(100, QStringLiteral("AcDbEntity"));
-    m_out.write(8, QStringLiteral("0"));
-    m_out.write(100, QStringLiteral("AcDbBlockEnd"));
+    // 尺寸标注的匿名几何块
+    for (const DimensionBlockInfo& info : m_dimBlocks) {
+        writeDimensionBlock(info);
+    }
 
     closeSection();
+}
+
+void DxfWriter::writeDimensionBlock(const DimensionBlockInfo& info)
+{
+    const DimensionEntity& dim = *info.dim;
+    const DimensionEntity::Geometry geo = dim.geometry();
+
+    // ---- 块头 ----
+    m_out.write(0, QStringLiteral("BLOCK"));
+    if (isR2000()) {
+        m_out.write(5, nextHandle());
+        m_out.write(330, info.recordHandle);
+        m_out.write(100, QStringLiteral("AcDbEntity"));
+    }
+    m_out.write(8, QStringLiteral("0"));
+    if (isR2000()) {
+        m_out.write(100, QStringLiteral("AcDbBlockBegin"));
+    }
+    m_out.write(2, info.name);
+    m_out.write(70, 1);                       // bit 1 = 匿名块
+    m_out.writePoint(10, Point2D(0.0, 0.0));  // 块基点即世界原点
+    m_out.write(3, info.name);
+    m_out.write(1, QString());
+
+    // ---- 块内容（约定：图层 0 + 颜色 ByBlock，随 DIMENSION 实体着色） ----
+    auto beginBlockEntity = [this, &info](const char* subclassMarker) {
+        m_out.write(0, QStringLiteral("%1").arg(QLatin1String(subclassMarker)));
+        if (isR2000()) {
+            m_out.write(5, nextHandle());
+            m_out.write(330, info.recordHandle);
+            m_out.write(100, QStringLiteral("AcDbEntity"));
+        }
+        m_out.write(8, QStringLiteral("0"));
+        m_out.write(62, 0);                   // ByBlock
+        if (isR2000()) {
+            m_out.write(100, QString::fromLatin1(subclassMarker));
+        }
+    };
+
+    for (const auto& seg : geo.segments) {
+        beginBlockEntity("LINE");
+        if (isR2000()) m_out.write(100, QStringLiteral("AcDbLine"));
+        m_out.writePoint(10, seg.first);
+        m_out.writePoint(11, seg.second);
+    }
+
+    for (const DimensionEntity::Arrow& arrow : geo.arrows) {
+        beginBlockEntity("SOLID");
+        if (isR2000()) m_out.write(100, QStringLiteral("AcDbTrace"));
+        // SOLID 的顶点顺序有历史怪癖：第 3、4 个顶点相互对调。
+        // 三角形以「重复第 3 点」的方式补成四点，顺序问题随之消解。
+        m_out.writePoint(10, arrow.tip);
+        m_out.writePoint(11, arrow.base1);
+        m_out.writePoint(12, arrow.base2);
+        m_out.writePoint(13, arrow.base2);
+    }
+
+    if (!geo.text.isEmpty()) {
+        beginBlockEntity("TEXT");
+        if (isR2000()) m_out.write(100, QStringLiteral("AcDbText"));
+        m_out.write(1, dim.displayText(/*dxfStyle=*/true));
+        m_out.writePoint(10, geo.textAnchor);
+        m_out.write(40, geo.textHeight);
+        m_out.write(50, radToDeg(geo.textAngle));
+        m_out.write(72, 1);                   // 水平居中
+        m_out.writePoint(11, geo.textAnchor);
+        m_out.write(73, 2);                   // 垂直居中
+    }
+
+    // ---- 块尾 ----
+    m_out.write(0, QStringLiteral("ENDBLK"));
+    if (isR2000()) {
+        m_out.write(5, nextHandle());
+        m_out.write(330, info.recordHandle);
+        m_out.write(100, QStringLiteral("AcDbEntity"));
+        m_out.write(8, QStringLiteral("0"));
+        m_out.write(100, QStringLiteral("AcDbBlockEnd"));
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -509,6 +629,15 @@ void DxfWriter::writeEntity(const Entity& entity)
         break;
     case EntityType::Point:
         writePoint(static_cast<const PointEntity&>(entity));
+        break;
+    case EntityType::Text:
+        writeText(static_cast<const TextEntity&>(entity));
+        break;
+    case EntityType::Hatch:
+        writeHatch(static_cast<const HatchEntity&>(entity));
+        break;
+    case EntityType::Dimension:
+        writeDimension(static_cast<const DimensionEntity&>(entity));
         break;
     }
 }
@@ -638,6 +767,184 @@ void DxfWriter::writePoint(const PointEntity& point)
     }
     writeCommonEntityFields(point, "AcDbPoint");
     m_out.writePoint(10, point.position());
+}
+
+void DxfWriter::writeText(const TextEntity& text)
+{
+    if (text.displayString().isEmpty()) {
+        // 空文字不是合法的 DXF 实体，跳过而非产出坏文件
+        return;
+    }
+
+    m_out.write(0, QStringLiteral("TEXT"));
+    if (isR2000()) {
+        m_out.write(5, nextHandle());
+        m_out.write(330, handleText(kHandleModelSpaceRecord));
+        m_out.write(100, QStringLiteral("AcDbEntity"));
+    }
+    writeCommonEntityFields(text, "AcDbText");
+
+    m_out.write(1, text.displayString());
+    m_out.writePoint(10, text.position());
+    m_out.write(40, text.height());
+    m_out.write(50, radToDeg(text.rotation()));
+
+    if (text.usesAlignmentPoint()) {
+        // 非左/基线对齐时，DXF 以 72/73 + 第二对齐点（11/21）定位
+        m_out.write(72, static_cast<int>(text.hAlign()));
+        m_out.writePoint(11, text.alignmentPoint());
+        m_out.write(73, static_cast<int>(text.vAlign()));
+    }
+}
+
+void DxfWriter::writeHatch(const HatchEntity& hatch)
+{
+    // HATCH 实体为 R14 引入，R12 没有对应的表达方式；
+    // 降级写出边界多段线以保证几何信息不丢失
+    if (!isR2000()) {
+        if (hatch.vertexCount() >= 2) {
+            PolylineEntity boundary(hatch.boundary(), true);
+            boundary.setLayerName(hatch.layerName());
+            boundary.setColorIndex(hatch.colorIndex());
+            boundary.setLineweightDxf(hatch.lineweightDxf());
+            boundary.setVisible(hatch.isVisible());
+            writePolylineR12(boundary);
+        }
+        m_hatchDowngrades += 1;
+        return;
+    }
+
+    if (hatch.vertexCount() < 3) return;      // 无法构成闭合边界
+
+    m_out.write(0, QStringLiteral("HATCH"));
+    m_out.write(5, nextHandle());
+    m_out.write(330, handleText(kHandleModelSpaceRecord));
+    m_out.write(100, QStringLiteral("AcDbEntity"));
+    writeCommonEntityFields(hatch, "AcDbHatch");
+
+    // 定义点（标高）
+    m_out.writePoint(10, Point2D(0.0, 0.0));
+    m_out.write(210, 0.0);
+    m_out.write(220, 0.0);
+    m_out.write(230, 1.0);
+
+    m_out.write(2, hatch.patternName().isEmpty() ? QStringLiteral("SOLID")
+                                                 : hatch.patternName());
+    m_out.write(70, hatch.isSolid() ? 1 : 0);
+    m_out.write(71, 0);                       // 非关联
+
+    // ---- 边界路径：单个外部多段线环 ----
+    m_out.write(91, 1);                       // 环数
+    m_out.write(92, 5);                       // bit0 = 多段线路径, bit2 = 外部环
+    m_out.write(72, 0);                       // 边界顶点不带凸度
+    m_out.write(73, 1);                       // 闭合
+    m_out.write(93, static_cast<int>(hatch.vertexCount()));
+    for (const Point2D& p : hatch.boundary()) {
+        m_out.write(10, p.x);
+        m_out.write(20, p.y);
+    }
+    m_out.write(97, 0);                       // 种子点数
+
+    // ---- 图案定义 ----
+    if (!hatch.isSolid()) {
+        m_out.write(75, 0);                   // 边界样式
+        m_out.write(76, 1);                   // 图案类型：预定义
+        m_out.write(52, radToDeg(hatch.patternAngle()));
+        m_out.write(41, hatch.patternScale());
+
+        // 一条图案定义线：方向 45°（ANSI31 基准），间距随比例缩放
+        const double spacing = hatch.patternSpacing();
+        const double theta = HatchEntity::kAnsi31BaseAngle;
+        m_out.write(78, 1);                   // 图案定义线数
+        m_out.write(53, radToDeg(theta));     // 该线与 X 轴夹角
+        m_out.write(43, 0.0);
+        m_out.write(44, 0.0);
+        m_out.write(45, -spacing * std::sin(theta));   // 相邻线偏移向量
+        m_out.write(46,  spacing * std::cos(theta));
+        m_out.write(79, 0);                   // 无虚线段（连续实线）
+    }
+}
+
+void DxfWriter::writeDimension(const DimensionEntity& dim)
+{
+    // 匿名块名在 prescanDimensionBlocks 中按文档顺序分配
+    const QString blockName = [this, id = dim.id()]() -> QString {
+        for (const DimensionBlockInfo& info : m_dimBlocks) {
+            if (info.dim->id() == id) return info.name;
+        }
+        return QString();
+    }();
+
+    m_out.write(0, QStringLiteral("DIMENSION"));
+    if (isR2000()) {
+        m_out.write(5, nextHandle());
+        m_out.write(330, handleText(kHandleModelSpaceRecord));
+        m_out.write(100, QStringLiteral("AcDbEntity"));
+    }
+    writeCommonEntityFields(dim, "AcDbDimension");
+
+    const DimensionEntity::Geometry geo = dim.geometry();
+
+    // ---- AcDbDimension 子类的公共数据 ----
+    if (!blockName.isEmpty()) m_out.write(2, blockName);
+
+    switch (dim.dimType()) {
+    case DimensionEntity::DimType::Linear:
+    case DimensionEntity::DimType::Aligned:
+        m_out.writePoint(10, dim.dimLinePoint());       // 尺寸线位置
+        break;
+    case DimensionEntity::DimType::Radial:
+        m_out.writePoint(10, dim.firstPoint());         // 圆心
+        break;
+    case DimensionEntity::DimType::Diametric:
+        m_out.writePoint(10, dim.firstPoint());         // 圆上点之一
+        break;
+    }
+    m_out.writePoint(11, geo.textAnchor);               // 文字中点
+
+    // bit 32 表示「几何块引用已在文件中」，读取端无需自行重绘
+    m_out.write(70, static_cast<int>(dim.dimType()) | 32);
+
+    if (!dim.textOverride().isEmpty() && dim.textOverride() != QLatin1String("<>")) {
+        m_out.write(1, dim.textOverride());
+    }
+    m_out.write(3, QStringLiteral("Standard"));         // 标注样式名
+    m_out.write(42, dim.measurement());                 // 实测值（只读字段）
+
+    // ---- 类型专属子类数据 ----
+    if (isR2000()) {
+        if (dim.dimType() == DimensionEntity::DimType::Radial) {
+            m_out.write(100, QStringLiteral("AcDbRadialDimension"));
+            m_out.writePoint(15, dim.secondPoint());    // 圆上定义点
+        } else if (dim.dimType() == DimensionEntity::DimType::Diametric) {
+            m_out.write(100, QStringLiteral("AcDbDiametricDimension"));
+            m_out.writePoint(15, dim.secondPoint());    // 对径点
+        } else {
+            m_out.write(100, QStringLiteral("AcDbAlignedDimension"));
+            m_out.writePoint(13, dim.firstPoint());     // 第一界线原点
+            m_out.writePoint(14, dim.secondPoint());    // 第二界线原点
+            if (dim.dimType() == DimensionEntity::DimType::Linear) {
+                m_out.write(100, QStringLiteral("AcDbRotatedDimension"));
+                m_out.write(50, radToDeg(dim.rotation()));
+            }
+        }
+    } else {
+        // R12 无子类标记，组码顺序不敏感；按常见惯例紧随其后写出
+        switch (dim.dimType()) {
+        case DimensionEntity::DimType::Linear:
+        case DimensionEntity::DimType::Aligned:
+            m_out.writePoint(13, dim.firstPoint());
+            m_out.writePoint(14, dim.secondPoint());
+            if (dim.dimType() == DimensionEntity::DimType::Linear) {
+                m_out.write(50, radToDeg(dim.rotation()));
+            }
+            break;
+        case DimensionEntity::DimType::Radial:
+        case DimensionEntity::DimType::Diametric:
+            m_out.writePoint(15, dim.secondPoint());
+            break;
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

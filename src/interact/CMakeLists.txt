@@ -11,6 +11,7 @@ add_library(lycad_interact STATIC
     Tool.h                  Tool.cpp
     SelectionTool.h         SelectionTool.cpp
     DrawTools.h             DrawTools.cpp
+    AnnotationTools.h       AnnotationTools.cpp
     ModifyTools.h           ModifyTools.cpp
     ToolManager.h           ToolManager.cpp
 )

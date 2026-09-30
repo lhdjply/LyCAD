@@ -14,16 +14,21 @@
 
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
 #include "core/Document.h"
 #include "core/Format.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 #include "io/CadFile.h"
 #include "io/DwgCodec.h"
 
 #include <QFile>
 #include <QTemporaryDir>
+
+#include <cmath>
 
 using namespace lycad;
 
@@ -39,7 +44,9 @@ private slots:
     void dwgSignatureIsRecognized();
 
 private:
-    static void buildSampleDocument(Document& document);
+    /// includeHatch 为 false 时（R12）不构造填充图元——
+    /// R12 没有 HATCH 实体，导出会降级为闭合多段线，往返签名必然不同。
+    static void buildSampleDocument(Document& document, bool includeHatch);
     static QStringList entitySignatures(const Document& document);
     /// includeLineweight 为 false 时忽略线宽字段——
     /// R12 的 LAYER 记录没有 370 组码，线宽本身无法表达，比对时需排除。
@@ -59,7 +66,7 @@ void TestDxfRoundTrip::initTestCase()
     registerBuiltinCodecs();
 }
 
-void TestDxfRoundTrip::buildSampleDocument(Document& document)
+void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch)
 {
     document.clear(true);
 
@@ -102,6 +109,65 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document)
 
     // 点
     document.addEntity(std::make_unique<PointEntity>(Point2D(7.5, -3.25)));
+
+    // 文字：默认左/基线对齐；含中文内容
+    document.addEntity(std::make_unique<TextEntity>(QStringLiteral("LyCAD 往返测试"),
+                                                    Point2D(5.0, 140.0), 5.0));
+
+    // 文字：居中/居中 对齐（走 DXF 72/73 + 11/21 通道）
+    {
+        auto centered = std::make_unique<TextEntity>(QStringLiteral("中心文字"),
+                                                     Point2D(60.0, 60.0), 3.0);
+        centered->setHAlign(TextEntity::HAlign::Center);
+        centered->setVAlign(TextEntity::VAlign::Middle);
+        centered->setAlignmentPoint(Point2D(60.0, 60.0));
+        centered->setLayerName(QStringLiteral("轮廓"));
+        document.addEntity(std::move(centered));
+    }
+
+    // 填充（R2000 专属；R12 导出会降级为多段线，故在该版本下跳过）
+    if (includeHatch) {
+        auto hatch = std::make_unique<HatchEntity>(
+            std::vector<Point2D>{ Point2D(80.0, 80.0), Point2D(110.0, 80.0),
+                                  Point2D(115.0, 100.0), Point2D(85.0, 105.0) },
+            QStringLiteral("ANSI31"), 2.0, 0.0);
+        hatch->setLayerName(QStringLiteral("轮廓"));
+        document.addEntity(std::move(hatch));
+    }
+
+    // 尺寸标注：对齐 / 线性 / 半径 / 直径
+    {
+        auto aligned = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Aligned);
+        aligned->setFirstPoint(Point2D(0.0, 0.0));
+        aligned->setSecondPoint(Point2D(120.0, 45.5));
+        aligned->setDimLinePoint(Point2D(60.0, -20.0));
+        aligned->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(aligned));
+
+        auto linear = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Linear);
+        linear->setFirstPoint(Point2D(130.0, 0.0));
+        linear->setSecondPoint(Point2D(130.0, 60.0));
+        linear->setDimLinePoint(Point2D(150.0, 30.0));
+        linear->setRotation(degToRad(90.0));
+        linear->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(linear));
+
+        const Point2D circleCenter(60.0, 60.0);
+        auto radial = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Radial);
+        radial->setFirstPoint(circleCenter);
+        radial->setSecondPoint(circleCenter + Vector2D(25.0 * std::cos(degToRad(30.0)),
+                                                       25.0 * std::sin(degToRad(30.0))));
+        radial->setDimLinePoint(Point2D(100.0, 90.0));
+        radial->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(radial));
+
+        auto diametric = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Diametric);
+        diametric->setFirstPoint(Point2D(35.0, 60.0));
+        diametric->setSecondPoint(Point2D(85.0, 60.0));
+        diametric->setDimLinePoint(Point2D(60.0, 95.0));
+        diametric->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(diametric));
+    }
 
     document.endBatchLoad();
 
@@ -186,6 +252,47 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
                                                  + formatDxfDouble(point.position().y));
             break;
         }
+        case EntityType::Text: {
+            const auto& text = static_cast<const TextEntity&>(*entity);
+            geometry = QStringLiteral("T[%1];P%2;H%3;R%4;A%5/%6")
+                           .arg(text.displayString(),
+                                formatDxfDouble(text.position().x) + QLatin1Char(',')
+                                    + formatDxfDouble(text.position().y),
+                                formatDxfDouble(text.height()),
+                                formatDxfDouble(radToDeg(text.rotation()), 6))
+                           .arg(static_cast<int>(text.hAlign()))
+                           .arg(static_cast<int>(text.vAlign()));
+            break;
+        }
+        case EntityType::Hatch: {
+            const auto& hatch = static_cast<const HatchEntity&>(*entity);
+            QStringList vertexTexts;
+            for (const Point2D& p : hatch.boundary()) {
+                vertexTexts << formatDxfDouble(p.x) + QLatin1Char(',')
+                               + formatDxfDouble(p.y);
+            }
+            geometry = QStringLiteral("N%1;%2;PT%3;S%4;K%5")
+                           .arg(hatch.vertexCount())
+                           .arg(vertexTexts.join(QLatin1Char('|')),
+                                hatch.patternName(),
+                                formatDxfDouble(hatch.patternScale()))
+                           .arg(formatDxfDouble(radToDeg(hatch.patternAngle()), 6));
+            break;
+        }
+        case EntityType::Dimension: {
+            const auto& dim = static_cast<const DimensionEntity&>(*entity);
+            geometry = QStringLiteral("D%1;F%2;S%3;L%4;R%5;TX[%6]")
+                           .arg(static_cast<int>(dim.dimType()))
+                           .arg(formatDxfDouble(dim.firstPoint().x) + QLatin1Char(',')
+                                    + formatDxfDouble(dim.firstPoint().y),
+                                formatDxfDouble(dim.secondPoint().x) + QLatin1Char(',')
+                                    + formatDxfDouble(dim.secondPoint().y),
+                                formatDxfDouble(dim.dimLinePoint().x) + QLatin1Char(',')
+                                    + formatDxfDouble(dim.dimLinePoint().y),
+                                formatDxfDouble(radToDeg(dim.rotation()), 6))
+                           .arg(dim.textOverride());
+            break;
+        }
         }
 
         out << QStringLiteral("%1|L=%2|C=%3|V=%4|%5")
@@ -220,7 +327,9 @@ bool TestDxfRoundTrip::roundTrip(const QString& version, const QString& fileName
                                  QString* failure)
 {
     Document source;
-    buildSampleDocument(source);
+    // R12 没有 HATCH 实体，导出会降级为闭合多段线，
+    // 因此在该版本下不构造填充，其余图元的往返保真不受影响
+    buildSampleDocument(source, version != QLatin1String("AC1009"));
 
     const QString path = m_dir.filePath(fileName);
 
@@ -350,14 +459,15 @@ void TestDxfRoundTrip::binaryDxfIsReadable()
 
 void TestDxfRoundTrip::unsupportedEntitiesAreCountedNotDropped()
 {
-    // 含 TEXT 的最小 ASCII DXF：TEXT 不被建模，但必须被计数并报告，
+    // 含 MTEXT 的最小 ASCII DXF：MTEXT 不被建模，但必须被计数并报告，
     // 且不能影响同一文件中 LINE 的导入。
+    // （TEXT 自本版本起已被建模，改用仍未支持的 MTEXT 验证跳过计数。）
     const QByteArray text = R"(0
 SECTION
 2
 ENTITIES
 0
-TEXT
+MTEXT
 8
 0
 10
@@ -407,7 +517,7 @@ EOF
 
     bool reported = false;
     for (const QString& warning : result.warnings) {
-        if (warning.contains(QStringLiteral("TEXT"))) {
+        if (warning.contains(QStringLiteral("MTEXT"))) {
             reported = true;
             break;
         }

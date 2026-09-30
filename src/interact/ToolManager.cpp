@@ -4,6 +4,7 @@
 #include "interact/ToolManager.h"
 
 #include "core/Document.h"
+#include "interact/AnnotationTools.h"
 #include "interact/DrawTools.h"
 #include "interact/ModifyTools.h"
 #include "interact/SelectionTool.h"
@@ -104,6 +105,31 @@ void ToolManager::registerBuiltinTools()
                  { QStringLiteral("REC"), QStringLiteral("RECT") },
                  QStringLiteral("绘制矩形（两个对角点）"),
                  [](ToolContext& c) { return std::make_unique<DrawRectangleTool>(c); });
+
+    // ---- 注释 ---------------------------------------------------------------
+    registerTool(QStringLiteral("TEXT"), { QStringLiteral("DT") },
+                 QStringLiteral("标注文字（先输入内容，再指定插入点）"),
+                 [](ToolContext& c) { return std::make_unique<DrawTextTool>(c); });
+
+    registerTool(QStringLiteral("HATCH"), { QStringLiteral("H"), QStringLiteral("BHATCH") },
+                 QStringLiteral("填充（取点构成闭合边界，回车填充）"),
+                 [](ToolContext& c) { return std::make_unique<DrawHatchTool>(c); });
+
+    registerTool(QStringLiteral("DIMALIGNED"), { QStringLiteral("DAL") },
+                 QStringLiteral("对齐标注（两条界线原点 + 尺寸线位置）"),
+                 [](ToolContext& c) { return std::make_unique<DrawDimAlignedTool>(c); });
+
+    registerTool(QStringLiteral("DIMLINEAR"), { QStringLiteral("DLI") },
+                 QStringLiteral("线性标注（水平方向测量）"),
+                 [](ToolContext& c) { return std::make_unique<DrawDimLinearTool>(c); });
+
+    registerTool(QStringLiteral("DIMRADIUS"), { QStringLiteral("DRA") },
+                 QStringLiteral("半径标注（拾取圆或圆弧）"),
+                 [](ToolContext& c) { return std::make_unique<DrawDimRadialTool>(c); });
+
+    registerTool(QStringLiteral("DIMDIAMETER"), { QStringLiteral("DDI") },
+                 QStringLiteral("直径标注（拾取圆或圆弧）"),
+                 [](ToolContext& c) { return std::make_unique<DrawDimDiametricTool>(c); });
 
     // ---- 编辑 ---------------------------------------------------------------
     registerTool(QStringLiteral("MOVE"), { QStringLiteral("M") },

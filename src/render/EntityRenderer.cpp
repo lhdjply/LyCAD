@@ -5,11 +5,15 @@
 
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 
+#include <QFontMetricsF>
 #include <QPainter>
 
 #include <algorithm>
@@ -283,6 +287,172 @@ void drawPolylineEntity(QPainter& painter, const PolylineEntity& polyline,
     painter.drawPath(path);
 }
 
+// -----------------------------------------------------------------------------
+//  文字
+// -----------------------------------------------------------------------------
+void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext& context)
+{
+    const QString content = text.displayString();
+    if (content.isEmpty()) return;
+
+    const Point2D anchorDevice = context.view->toDevice(text.effectivePosition());
+    const double heightPixels = text.height() * context.view->scale();
+
+    // 缩得太小时画一个点占位，保持「这里有文字」的可见性
+    if (heightPixels < 2.5) {
+        painter.drawPoint(QPointF(anchorDevice.x, anchorDevice.y));
+        return;
+    }
+
+    QFont font = painter.font();
+    font.setPixelSize(std::max(2, static_cast<int>(std::lround(heightPixels))));
+    painter.setFont(font);
+    const QFontMetricsF metrics(font);
+
+    painter.save();
+    painter.translate(anchorDevice.x, anchorDevice.y);
+    // 世界坐标逆时针为正；设备坐标 Y 轴向下，方向相反
+    painter.rotate(-radToDeg(text.rotation()));
+
+    // 垂直对齐：换算为基线相对锚点的偏移
+    double baselineOffset = 0.0;
+    switch (text.vAlign()) {
+    case TextEntity::VAlign::Baseline: baselineOffset = 0.0; break;
+    case TextEntity::VAlign::Bottom:   baselineOffset = metrics.ascent(); break;
+    case TextEntity::VAlign::Middle:   baselineOffset = (metrics.ascent() - metrics.descent()) * 0.5; break;
+    case TextEntity::VAlign::Top:      baselineOffset = metrics.ascent() + metrics.descent(); break;
+    }
+
+    // 水平对齐：以锚点为参考的起点偏移
+    double x = 0.0;
+    const double advance = metrics.horizontalAdvance(content);
+    switch (text.hAlign()) {
+    case TextEntity::HAlign::Left:   x = 0.0; break;
+    case TextEntity::HAlign::Center: x = -advance * 0.5; break;
+    case TextEntity::HAlign::Right:  x = -advance; break;
+    }
+
+    painter.drawText(QPointF(x, baselineOffset), content);
+    painter.restore();
+}
+
+// -----------------------------------------------------------------------------
+//  填充
+// -----------------------------------------------------------------------------
+void drawHatchEntity(QPainter& painter, const HatchEntity& hatch, const DrawContext& context)
+{
+    const std::vector<Point2D>& pts = hatch.boundary();
+    if (pts.size() < 3) return;
+
+    QPainterPath path;
+    const Point2D first = context.view->toDevice(pts.front());
+    path.moveTo(first.x, first.y);
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        const Point2D d = context.view->toDevice(pts[i]);
+        path.lineTo(d.x, d.y);
+    }
+    path.closeSubpath();
+
+    const QColor color = painter.pen().color();
+
+    if (hatch.isSolid()) {
+        painter.fillPath(path, color);
+        painter.drawPath(path);
+        return;
+    }
+
+    // 平行线图案：间距不足时退化为边界轮廓，避免糊成一团
+    const double spacingPixels = hatch.patternSpacing() * context.view->scale();
+    if (spacingPixels >= 2.5) {
+        // 图案线方向（世界逆时针角 → 设备坐标 Y 向下取负）
+        const double theta = hatch.patternLineAngle();
+        const Vector2D dir(std::cos(theta), -std::sin(theta));
+        const Vector2D perp = dir.perpendicular();
+
+        // 在路径包围盒上求图案线族的参数范围
+        const QRectF bounds = path.boundingRect();
+        const QPointF corners[4] = {
+            bounds.topLeft(), bounds.topRight(), bounds.bottomLeft(), bounds.bottomRight()
+        };
+        double sMin = std::numeric_limits<double>::max();
+        double sMax = std::numeric_limits<double>::lowest();
+        for (const QPointF& c : corners) {
+            const double s = c.x() * perp.x + c.y() * perp.y;
+            sMin = std::min(sMin, s);
+            sMax = std::max(sMax, s);
+        }
+
+        const double diagonal = std::hypot(bounds.width(), bounds.height());
+        const Vector2D base(perp.x * sMin, perp.y * sMin);
+
+        painter.save();
+        painter.setClipPath(path);
+
+        QVector<QLineF> lines;
+        for (double s = sMin; s <= sMax; s += spacingPixels) {
+            const QPointF center(base.x + perp.x * (s - sMin) + dir.x * diagonal * 0.5,
+                                 base.y + perp.y * (s - sMin) + dir.y * diagonal * 0.5);
+            lines.append(QLineF(center.x() - dir.x * diagonal, center.y() - dir.y * diagonal,
+                                center.x() + dir.x * diagonal, center.y() + dir.y * diagonal));
+        }
+        painter.drawLines(lines);
+        painter.restore();
+    }
+
+    painter.drawPath(path);
+}
+
+// -----------------------------------------------------------------------------
+//  尺寸标注
+// -----------------------------------------------------------------------------
+void drawDimensionEntity(QPainter& painter, const DimensionEntity& dim,
+                         const DrawContext& context)
+{
+    const DimensionEntity::Geometry geo = dim.geometry();
+    if (!geo.valid) return;
+
+    const QColor color = painter.pen().color();
+
+    // 尺寸线 / 界线 / 引线
+    for (const auto& seg : geo.segments) {
+        const Point2D a = context.view->toDevice(seg.first);
+        const Point2D b = context.view->toDevice(seg.second);
+        painter.drawLine(QPointF(a.x, a.y), QPointF(b.x, b.y));
+    }
+
+    // 箭头（实心三角）
+    QPainterPath arrows;
+    for (const DimensionEntity::Arrow& arrow : geo.arrows) {
+        const Point2D tip = context.view->toDevice(arrow.tip);
+        const Point2D b1 = context.view->toDevice(arrow.base1);
+        const Point2D b2 = context.view->toDevice(arrow.base2);
+        arrows.moveTo(tip.x, tip.y);
+        arrows.lineTo(b1.x, b1.y);
+        arrows.lineTo(b2.x, b2.y);
+        arrows.closeSubpath();
+    }
+    painter.fillPath(arrows, color);
+
+    // 测量文字
+    const double heightPixels = geo.textHeight * context.view->scale();
+    if (geo.text.isEmpty() || heightPixels < 2.5) return;
+
+    const Point2D anchor = context.view->toDevice(geo.textAnchor);
+    QFont font = painter.font();
+    font.setPixelSize(std::max(2, static_cast<int>(std::lround(heightPixels))));
+    const QFontMetricsF metrics(font);
+
+    painter.save();
+    painter.setFont(font);
+    painter.translate(anchor.x, anchor.y);
+    painter.rotate(-radToDeg(geo.textAngle));
+    // 文字锚点即字符串的中心（与 DXF 匿名块的居中写法一致）
+    painter.drawText(QPointF(-metrics.horizontalAdvance(geo.text) * 0.5,
+                             (metrics.ascent() - metrics.descent()) * 0.5),
+                     geo.text);
+    painter.restore();
+}
+
 } // namespace
 
 // -----------------------------------------------------------------------------
@@ -412,6 +582,18 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
         const auto& point = static_cast<const PointEntity&>(entity);
         const Point2D d = context.view->toDevice(point.position());
         drawPointMarker(painter, d, color, settings.pickBoxPixels * 0.7);
+        break;
+    }
+    case EntityType::Text: {
+        drawTextEntity(painter, static_cast<const TextEntity&>(entity), context);
+        break;
+    }
+    case EntityType::Hatch: {
+        drawHatchEntity(painter, static_cast<const HatchEntity&>(entity), context);
+        break;
+    }
+    case EntityType::Dimension: {
+        drawDimensionEntity(painter, static_cast<const DimensionEntity&>(entity), context);
         break;
     }
     }

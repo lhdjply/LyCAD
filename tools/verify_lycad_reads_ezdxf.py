@@ -10,7 +10,8 @@
   · 块定义 + INSERT 引用（LyCAD 在导入时按插入点/比例/旋转展开）
   · 嵌套 INSERT（块中引用块）
   · 旧式 POLYLINE/VERTEX（非 LWPOLYLINE）
-  · 不支持实体的混合存在（TEXT / HATCH 应被计数跳过而非导致失败）
+  · 文字 / 填充 / 尺寸标注（已建模，验证内容与测量值正确还原）
+  · 仍未支持实体的混合存在（MTEXT 应被计数跳过而非导致失败）
   · 非 ASCII 图层名与文字
 """
 import sys
@@ -86,9 +87,27 @@ def build_reference_dxf(path: Path):
     outer.add_blockref("螺孔", (20, 0))
     msp.add_blockref("螺孔组", (300, 0), dxfattribs={"xscale": 0.5, "yscale": 0.5})
 
-    # LyCAD 未建模的实体：应被跳过并报数，而不是让整次导入失败
-    msp.add_text("测试文字", dxfattribs={"height": 5}).set_placement((0, 200))
-    msp.add_hatch(color=2).paths.add_polyline_path([(0, 250), (50, 250), (50, 300), (0, 300)])
+    # 文字：已建模，验证内容与属性还原
+    msp.add_text("测试文字", dxfattribs={"height": 5, "layer": "中文图层"}).set_placement((0, 200))
+
+    # 填充：已建模（单环多段线边界 + 图案）
+    hatch = msp.add_hatch(color=2)
+    hatch.set_pattern_fill("ANSI31", scale=2.0)
+    hatch.paths.add_polyline_path([(0, 250), (50, 250), (50, 300), (0, 300)])
+
+    # 尺寸标注：对齐 + 半径（render() 生成几何块，LyCAD 读取时忽略该块）
+    dim1 = msp.add_aligned_dim(p1=(200, 0), p2=(300, 0), distance=-25,
+                               dxfattribs={"layer": "轮廓"})
+    dim1.render()
+    angle = math.radians(60.0)
+    dim2 = msp.add_radius_dim(center=(50, 50),
+                              mpoint=(50 + 20 * math.cos(angle),
+                                      50 + 20 * math.sin(angle)),
+                              dxfattribs={"layer": "轮廓"})
+    dim2.render()
+
+    # 仍未建模的实体：应被跳过并报数，而不是让整次导入失败
+    msp.add_mtext("仍未建模的多行文字", dxfattribs={"layer": "中文图层"})
 
     doc.saveas(str(path))
     return doc
@@ -158,9 +177,10 @@ def main():
     # ---- 从参考文档推导期望值，避免写死数字 ----
     #
     # LyCAD 在导入时把 INSERT 展开为独立图元（块内 0 层图元继承 INSERT 图层），
-    # 未建模的实体（TEXT / HATCH 等）被跳过。期望值按同一规则从源文档算出，
+    # 未建模的实体（MTEXT 等）被跳过。期望值按同一规则从源文档算出，
     # 再与 LyCAD 的读取结果逐项比对。
-    SUPPORTED = {"LINE", "CIRCLE", "ARC", "POINT", "LWPOLYLINE", "POLYLINE"}
+    SUPPORTED = {"LINE", "CIRCLE", "ARC", "POINT", "LWPOLYLINE", "POLYLINE",
+                 "TEXT", "HATCH", "DIMENSION"}
     # LyCAD 内部把 LWPOLYLINE 与旧式 POLYLINE 统一表示为多段线
     NORMALIZE = {"POLYLINE": "LWPOLYLINE"}
 
@@ -246,6 +266,26 @@ def main():
     poly_lengths = sorted(round(float(e["len"]), 4) for e in by_type.get("LWPOLYLINE", []))
     check(any(close(v, 120.0, 1e-3) for v in poly_lengths),
           f"闭合 POLYLINE 周长应为 120（含收尾段），实际 {poly_lengths}")
+
+    # ---- 文字：内容必须被正确解码 ----
+    text_contents = [e.get("text", "") for e in by_type.get("TEXT", [])]
+    check("测试文字" in text_contents, f"文字内容「测试文字」未被正确还原: {text_contents}")
+
+    # ---- 填充：作为独立实体导入 ----
+    check(len(by_type.get("HATCH", [])) == 1,
+          f"应导入 1 个填充实体，实际 {len(by_type.get('HATCH', []))}")
+
+    # ---- 尺寸标注：测量值必须与源几何一致（显示文本含 R/⌀ 前缀，提取数值） ----
+    def numeric(text):
+        digits = re.sub(r"[^0-9.]", "", text)
+        return float(digits) if digits else 0.0
+
+    dim_values = sorted(round(numeric(e.get("dim", "")), 4)
+                        for e in by_type.get("DIMENSION", []))
+    check(any(close(v, 100.0, 1e-3) for v in dim_values),
+          f"对齐标注测量值应为 100，实际 {dim_values}")
+    check(any(close(v, 20.0, 1e-3) for v in dim_values),
+          f"半径标注测量值应为 20，实际 {dim_values}")
 
     print(f"\n{'=' * 60}")
     if FAILURES:

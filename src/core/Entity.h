@@ -32,7 +32,10 @@ enum class EntityType {
     Line,
     Circle,
     Arc,
-    Polyline
+    Polyline,
+    Text,
+    Hatch,
+    Dimension
 };
 
 /// 英文类型名（DXF 中的实体名，如 "LINE"）

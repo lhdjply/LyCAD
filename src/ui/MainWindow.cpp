@@ -234,8 +234,20 @@ void MainWindow::createMenus()
         { "圆弧(&A)", "ARC" },
         { "矩形(&R)", "RECTANGLE" },
         { "点(&O)", "POINT" },
+        { nullptr, "" },                    // 分隔线
+        { "文字(&T)", "TEXT" },
+        { "填充(&H)", "HATCH" },
+        { nullptr, "" },
+        { "对齐标注(&G)", "DIMALIGNED" },
+        { "线性标注(&N)", "DIMLINEAR" },
+        { "半径标注(&U)", "DIMRADIUS" },
+        { "直径标注(&M)", "DIMDIAMETER" },
     };
     for (const DrawEntry& entry : kDrawEntries) {
+        if (!entry.label) {
+            drawMenu->addSeparator();
+            continue;
+        }
         QAction* action = drawMenu->addAction(QString::fromUtf8(entry.label));
         const QString command = QString::fromLatin1(entry.command);
         connect(action, &QAction::triggered, this, [this, command] { runCommand(command); });
@@ -376,6 +388,13 @@ void MainWindow::createToolBars()
         { "圆弧",   "ARC",       "圆弧 (ARC / A)" },
         { "矩形",   "RECTANGLE", "矩形 (RECTANGLE / REC)" },
         { "点",     "POINT",     "点 (POINT / PO)" },
+        { "|",      "",          "" },
+        { "文字",   "TEXT",      "文字 (TEXT / DT)" },
+        { "填充",   "HATCH",     "填充 (HATCH / H)" },
+        { "对齐标注", "DIMALIGNED", "对齐标注 (DIMALIGNED / DAL)" },
+        { "线性标注", "DIMLINEAR",  "线性标注 (DIMLINEAR / DLI)" },
+        { "半径标注", "DIMRADIUS",  "半径标注 (DIMRADIUS / DRA)" },
+        { "直径标注", "DIMDIAMETER","直径标注 (DIMDIAMETER / DDI)" },
         { "|",      "",          "" },
         { "移动",   "MOVE",      "移动 (MOVE / M)" },
         { "复制",   "COPY",      "复制 (COPY / CO)" },

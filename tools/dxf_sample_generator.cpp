@@ -19,11 +19,14 @@
 // =============================================================================
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 #include "io/CadFile.h"
 
 #include <QCoreApplication>
@@ -45,7 +48,7 @@ QTextStream& out()
     return stream;
 }
 
-/// 构造样例文档：图层、线型、颜色、线宽、以及全部五类图元
+/// 构造样例文档：图层、线型、颜色、线宽、以及全部八类图元
 void buildSample(Document& document)
 {
     document.clear(true);
@@ -137,6 +140,67 @@ void buildSample(Document& document)
         document.addEntity(std::move(hidden));
     }
 
+    // 文字：默认对齐 + 居中对齐，内容含中文与数字
+    {
+        auto text = std::make_unique<TextEntity>(QStringLiteral("LyCAD 样例图纸"),
+                                                 Point2D(10.0, 104.0), 6.0);
+        text->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(text));
+
+        auto centered = std::make_unique<TextEntity>(QStringLiteral("直径 50"),
+                                                     Point2D(60.0, 55.0), 4.0);
+        centered->setLayerName(QStringLiteral("标注"));
+        centered->setHAlign(TextEntity::HAlign::Center);
+        centered->setVAlign(TextEntity::VAlign::Middle);
+        centered->setAlignmentPoint(Point2D(60.0, 55.0));
+        document.addEntity(std::move(centered));
+    }
+
+    // 填充：五边形边界，ANSI31 图案
+    {
+        HatchEntity hatch({ Point2D(100.0, 15.0), Point2D(130.0, 15.0),
+                            Point2D(140.0, 38.0), Point2D(115.0, 52.0),
+                            Point2D(92.0, 38.0) },
+                          QStringLiteral("ANSI31"), 1.5, 0.0);
+        hatch.setLayerName(QStringLiteral("轮廓"));
+        document.addEntity(std::move(hatch.clone()));
+    }
+
+    // 尺寸标注：对齐 / 线性 / 半径 / 直径 各一个
+    {
+        auto aligned = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Aligned);
+        aligned->setFirstPoint(Point2D(0.0, 0.0));
+        aligned->setSecondPoint(Point2D(180.0, 0.0));
+        aligned->setDimLinePoint(Point2D(90.0, -18.0));
+        aligned->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(aligned));
+
+        auto linear = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Linear);
+        linear->setFirstPoint(Point2D(180.0, 0.0));
+        linear->setSecondPoint(Point2D(180.0, 110.0));
+        linear->setDimLinePoint(Point2D(198.0, 55.0));
+        linear->setRotation(degToRad(90.0));        // 垂直方向测量
+        linear->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(linear));
+
+        auto radial = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Radial);
+        radial->setFirstPoint(Point2D(60.0, 55.0));          // 圆心
+        radial->setSecondPoint(Point2D(60.0 + 25.0 * std::cos(degToRad(45.0)),
+                                       55.0 + 25.0 * std::sin(degToRad(45.0))));
+        radial->setDimLinePoint(Point2D(96.0, 84.0));        // 文字位置
+        radial->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(radial));
+
+        auto diametric = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Diametric);
+        const Point2D circleCenter(120.0, 55.0);
+        const double arcRadius = 25.0;
+        diametric->setFirstPoint(circleCenter + Vector2D(-arcRadius, 0.0));
+        diametric->setSecondPoint(circleCenter + Vector2D(arcRadius, 0.0));
+        diametric->setDimLinePoint(Point2D(120.0, 88.0));    // 文字位置
+        diametric->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(diametric));
+    }
+
     document.endBatchLoad();
 }
 
@@ -199,13 +263,24 @@ int inspect(const QString& path)
         if (!entity) continue;
         out() << QStringLiteral("  - %1").arg(entity->describe()) << Qt::endl;
 
+        // 类型专属字段：文字内容 / 标注测量值，供脚本比对
+        QString extra;
+        if (entity->type() == EntityType::Text) {
+            extra = QStringLiteral("|text=%1")
+                        .arg(static_cast<const TextEntity*>(entity)->displayString());
+        } else if (entity->type() == EntityType::Dimension) {
+            extra = QStringLiteral("|dim=%1")
+                        .arg(static_cast<const DimensionEntity*>(entity)->displayText());
+        }
+
         // 数值化输出便于脚本比对
-        out() << QStringLiteral("    raw|type=%1|layer=%2|color=%3|visible=%4|len=%5")
+        out() << QStringLiteral("    raw|type=%1|layer=%2|color=%3|visible=%4|len=%5%6")
                      .arg(entityTypeName(entity->type()),
                           entity->layerName())
                      .arg(entity->colorIndex())
                      .arg(entity->isVisible() ? 1 : 0)
                      .arg(entity->length(), 0, 'f', 6)
+                     .arg(extra)
               << Qt::endl;
     }
 

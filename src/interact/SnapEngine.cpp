@@ -5,10 +5,13 @@
 
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 
 #include <algorithm>
 #include <array>
@@ -192,6 +195,30 @@ void SnapEngine::collectEntityCandidates(const Document& document,
         case EntityType::Point: {
             const auto& point = static_cast<const PointEntity&>(*entity);
             if (m_settings.node) touched |= add(point.position(), SnapKind::NodePoint);
+            break;
+        }
+        case EntityType::Text: {
+            // 文字只有一个定位点（NodePoint 捕捉语义）
+            const auto& text = static_cast<const TextEntity&>(*entity);
+            if (m_settings.node) touched |= add(text.effectivePosition(), SnapKind::NodePoint);
+            break;
+        }
+        case EntityType::Hatch: {
+            const auto& hatch = static_cast<const HatchEntity&>(*entity);
+            if (m_settings.endpoint) {
+                for (const Point2D& vertex : hatch.boundary()) {
+                    touched |= add(vertex, SnapKind::Endpoint);
+                }
+            }
+            break;
+        }
+        case EntityType::Dimension: {
+            // 标注的定义点按端点语义捕捉
+            const auto& dim = static_cast<const DimensionEntity&>(*entity);
+            if (m_settings.endpoint) {
+                touched |= add(dim.firstPoint(), SnapKind::Endpoint);
+                touched |= add(dim.secondPoint(), SnapKind::Endpoint);
+            }
             break;
         }
         }

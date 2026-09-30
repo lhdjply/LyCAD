@@ -5,17 +5,20 @@
 //  覆盖范围
 //    · 版本：AutoCAD R12 (AC1009) 至 AutoCAD 2018 (AC1032) 的 ASCII 与二进制 DXF。
 //      高版本的新实体若不在支持列表内会被跳过并计入警告，不影响其余内容。
-//    · 实体：POINT / LINE / CIRCLE / ARC / LWPOLYLINE / POLYLINE(二维) / SOLID / TRACE。
+//    · 实体：POINT / LINE / CIRCLE / ARC / LWPOLYLINE / POLYLINE(二维) / SOLID / TRACE
+//      / TEXT / HATCH(单环边界) / DIMENSION(线性/对齐/半径/直径)。
 //    · 符号表：LAYER（名称、颜色、线型、线宽、开关/冻结/锁定标志）。
 //    · 块与引用：BLOCKS 区被完整解析，INSERT 在导入时按插入点、比例、旋转角
 //      展开为独立图元，并遵循「块内 0 层图元继承 INSERT 图层」的标准语义。
+//      尺寸标注的匿名几何块（*Dnn）只作显示用途，解析后即被忽略——
+//      标注几何由定义点实时推导。
 //
 //  设计取舍
 //    块引用选择「导入即展开」而非保留引用语义，是因为本软件当前不建模块定义。
 //    这样做的代价是文件往返后块会被打散；收益是图形内容零丢失，且不引入一个
 //    半成品的块引用体系。该行为会在导入结果中明确告知用户。
 //
-//  未建模的实体（TEXT/MTEXT/HATCH/DIMENSION/SPLINE/ELLIPSE/三维实体等）会按类型
+//  未建模的实体（MTEXT/SPLINE/ELLIPSE/三维实体等）会按类型
 //  汇总计数后跳过，不做静默丢弃。
 // =============================================================================
 #pragma once
@@ -101,6 +104,12 @@ private:
                                                          IoResult* result);
     std::vector<std::unique_ptr<Entity>> readLegacyPolyline(IoResult* result);
     std::vector<std::unique_ptr<Entity>> readInsert(IoResult* result);
+    std::vector<std::unique_ptr<Entity>> parseText(const std::vector<DxfGroup>& groups,
+                                                   IoResult* result);
+    std::vector<std::unique_ptr<Entity>> parseHatch(const std::vector<DxfGroup>& groups,
+                                                    IoResult* result);
+    std::vector<std::unique_ptr<Entity>> parseDimension(const std::vector<DxfGroup>& groups,
+                                                        IoResult* result);
     void consumeVertexSequence();
 
     static void applyCommonProperties(const std::vector<DxfGroup>& groups, Entity& entity);

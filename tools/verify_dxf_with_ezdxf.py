@@ -32,7 +32,8 @@ def close(a, b, tol=1e-6):
     return abs(a - b) <= tol
 
 
-def verify(path: Path, expected_version: str, has_lineweight: bool, has_lwpolyline: bool):
+def verify(path: Path, expected_version: str, has_lineweight: bool,
+           has_lwpolyline: bool, has_hatch: bool):
     print(f"\n=== 校验 {path.name} (期望版本 {expected_version}) ===")
 
     # recover 模式会报告结构性问题；正常文件应无需修复
@@ -82,13 +83,18 @@ def verify(path: Path, expected_version: str, has_lineweight: bool, has_lwpolyli
     modelspace = doc.modelspace()
     types = [e.dxftype() for e in modelspace]
     print(f"  实体: {types}")
-    check(len(types) == 10, f"实体数应为 10，实际 {len(types)}")
+    check(len(types) == 17, f"实体数应为 17，实际 {len(types)}")
     check(types.count("LINE") == 4, f"LINE 数应为 4，实际 {types.count('LINE')}")
     check(types.count("CIRCLE") == 2, f"CIRCLE 数应为 2，实际 {types.count('CIRCLE')}")
     check(types.count("ARC") == 1, "ARC 数应为 1")
     check(types.count("POINT") == 1, "POINT 数应为 1")
+    check(types.count("TEXT") == 2, f"TEXT 数应为 2，实际 {types.count('TEXT')}")
+    check(types.count("DIMENSION") == 4, f"DIMENSION 数应为 4，实际 {types.count('DIMENSION')}")
     poly_type = "LWPOLYLINE" if has_lwpolyline else "POLYLINE"
-    check(types.count(poly_type) == 2, f"{poly_type} 数应为 2，实际 {types.count(poly_type)}")
+    # R2000：外框 + 圆弧段多段线 = 2；R12 额外多一条由 HATCH 降级而来的闭合多段线
+    expected_polys = 3 if not has_hatch else 2
+    check(types.count(poly_type) == expected_polys,
+          f"{poly_type} 数应为 {expected_polys}，实际 {types.count(poly_type)}")
 
     # 圆弧几何
     arcs = modelspace.query("ARC")
@@ -137,17 +143,18 @@ def verify(path: Path, expected_version: str, has_lineweight: bool, has_lwpolyli
         return [round(b[0] if isinstance(b, tuple) else b, 6) for b in raw]
 
     closed = [poly for poly in polylines if is_closed(poly)]
-    check(len(closed) == 2, f"样例中两条多段线均为闭合，实际闭合 {len(closed)} 条")
+    check(len(closed) == expected_polys, f"闭合多段线应为 {expected_polys} 条，实际 {len(closed)} 条")
 
     # 用凸度区分「直线外框」与「含圆弧段的多段线」
     arc_polys = [poly for poly in polylines if any(abs(b) > 1e-9 for b in bulges_of(poly))]
     check(len(arc_polys) == 1, f"应恰好有一条含圆弧段的多段线，实际 {len(arc_polys)}")
 
-    frames = [poly for poly in polylines if not any(abs(b) > 1e-9 for b in bulges_of(poly))]
-    check(len(frames) == 1, "应恰好有一条纯直线多段线（外框）")
+    frames = [poly for poly in polylines
+              if not any(abs(b) > 1e-9 for b in bulges_of(poly))
+              and len(vertices_of(poly)) == 4]
+    check(len(frames) == 1, "应恰好有一条 4 顶点纯直线多段线（外框）")
     if frames:
         points = vertices_of(frames[0])
-        check(len(points) == 4, f"外框应有 4 个顶点，实际 {len(points)}")
         xs = sorted({round(pt[0], 6) for pt in points})
         ys = sorted({round(pt[1], 6) for pt in points})
         check(xs == [0.0, 180.0] and ys == [0.0, 110.0],
@@ -163,6 +170,18 @@ def verify(path: Path, expected_version: str, has_lineweight: bool, has_lwpolyli
         check(0.6 in bulges, f"缺失凸度 +0.6（逆时针弧段），实际 {bulges}")
         check(-0.4 in bulges, f"缺失凸度 -0.4（顺时针弧段），实际 {bulges}")
 
+    # R12 下填充被降级为闭合多段线：验证几何信息不丢失
+    if not has_hatch:
+        hatch_like = [poly for poly in polylines
+                      if not any(abs(b) > 1e-9 for b in bulges_of(poly))
+                      and len(vertices_of(poly)) == 5]
+        check(len(hatch_like) == 1, "R12 中应由 HATCH 降级出一条 5 顶点闭合多段线")
+        if hatch_like:
+            got = {(round(x, 6), round(y, 6)) for x, y in vertices_of(hatch_like[0])}
+            expected = {(100.0, 15.0), (130.0, 15.0), (140.0, 38.0),
+                        (115.0, 52.0), (92.0, 38.0)}
+            check(got == expected, f"降级多段线的顶点集合不符: {sorted(got)}")
+
     # 图层归属
     layer_of = {}
     for entity in modelspace:
@@ -170,7 +189,100 @@ def verify(path: Path, expected_version: str, has_lineweight: bool, has_lwpolyli
         layer_of[entity.dxf.layer] += 1
     print(f"  实体图层分布: {layer_of}")
     check(layer_of.get("中心线") == 2, f"中心线层应有 2 个实体，实际 {layer_of.get('中心线')}")
-    check(layer_of.get("轮廓", 0) >= 4, "轮廓层实体数偏少")
+    check(layer_of.get("轮廓", 0) >= 5, "轮廓层实体数偏少")
+    check(layer_of.get("标注", 0) == 8,
+          f"标注层应有 8 个实体（点/隐藏圆/2 文字/4 标注），实际 {layer_of.get('标注')}")
+
+    # ---- 文字 ----
+    texts = modelspace.query("TEXT")
+    by_content = {t.dxf.text: t for t in texts}
+    check("LyCAD 样例图纸" in by_content, f"缺含中文的文字实体: {list(by_content)}")
+    check("直径 50" in by_content, "缺第二条文字实体")
+    if "LyCAD 样例图纸" in by_content:
+        t1 = by_content["LyCAD 样例图纸"]
+        check(close(t1.dxf.height, 6.0), f"文字字高应为 6，实际 {t1.dxf.height}")
+        check(t1.dxf.halign == 0 and t1.dxf.valign == 0, "第一条文字应为左/基线对齐")
+        check(close(t1.dxf.insert.x, 10.0) and close(t1.dxf.insert.y, 104.0),
+              f"文字插入点错误: {t1.dxf.insert}")
+    if "直径 50" in by_content:
+        t2 = by_content["直径 50"]
+        check(t2.dxf.halign == 1 and t2.dxf.valign == 2,
+              f"第二条文字应为居中/居中对齐，实际 halign={t2.dxf.halign} valign={t2.dxf.valign}")
+        check(close(t2.dxf.align_point.x, 60.0) and close(t2.dxf.align_point.y, 55.0),
+              f"第二对齐点错误: {t2.dxf.align_point}")
+        check(close(t2.dxf.height, 4.0), "第二条文字字高应为 4")
+
+    # ---- 填充（仅 R2000） ----
+    hatches = modelspace.query("HATCH")
+    if has_hatch:
+        check(len(hatches) == 1, f"HATCH 数应为 1，实际 {len(hatches)}")
+        if hatches:
+            h = hatches[0]
+            check(h.dxf.pattern_name.upper() == "ANSI31",
+                  f"填充图案应为 ANSI31，实际 {h.dxf.pattern_name}")
+            check(close(h.dxf.pattern_scale, 1.5),
+                  f"填充比例应为 1.5，实际 {h.dxf.pattern_scale}")
+            check(not h.dxf.solid_fill, "填充不应是实体填充")
+            paths = list(h.paths)
+            check(len(paths) == 1, f"边界环数应为 1，实际 {len(paths)}")
+            if paths and hasattr(paths[0], "vertices"):
+                verts = [(float(v.x), float(v.y)) for v in paths[0].vertices]
+                got = {(round(x, 6), round(y, 6)) for x, y in verts}
+                expected = {(100.0, 15.0), (130.0, 15.0), (140.0, 38.0),
+                            (115.0, 52.0), (92.0, 38.0)}
+                check(got == expected, f"填充边界顶点集合不符: {sorted(got)}")
+    else:
+        check(len(hatches) == 0, "R12 文件不应包含 HATCH 实体")
+
+    # ---- 尺寸标注 ----
+    dims = modelspace.query("DIMENSION")
+    check(len(dims) == 4, f"DIMENSION 数应为 4，实际 {len(dims)}")
+    subtypes = sorted(d.dxf.dimtype & 7 for d in dims)
+    check(subtypes == [0, 1, 3, 4],
+          f"标注类型集合应为 线性/对齐/直径/半径，实际 {subtypes}")
+
+    for d in dims:
+        subtype = d.dxf.dimtype & 7
+
+        # 每个标注都必须引用一个已定义的匿名几何块（ezdxf 中属性名为 geometry）
+        block_name = d.dxf.geometry
+        check(bool(block_name) and block_name in doc.blocks,
+              f"标注的几何块 {block_name!r} 应存在于 BLOCKS 区")
+        if block_name in doc.blocks:
+            block_entities = list(doc.blocks.get(block_name))
+            check(len(block_entities) >= 3,
+                  f"几何块 {block_name} 内容过少: {len(block_entities)} 个实体")
+            has_text = any(e.dxftype() == "TEXT" for e in block_entities)
+            has_solid = any(e.dxftype() == "SOLID" for e in block_entities)
+            check(has_text, f"几何块 {block_name} 缺少测量文字")
+            check(has_solid, f"几何块 {block_name} 缺少箭头 (SOLID)")
+
+        measurement = getattr(d.dxf, "actual_measurement", 0.0)
+        if subtype == 1:      # 对齐
+            check(close(d.dxf.defpoint2.x, 0.0) and close(d.dxf.defpoint2.y, 0.0),
+                  f"对齐标注界线原点 1 错误: {d.dxf.defpoint2}")
+            check(close(d.dxf.defpoint3.x, 180.0) and close(d.dxf.defpoint3.y, 0.0),
+                  f"对齐标注界线原点 2 错误: {d.dxf.defpoint3}")
+            check(close(measurement, 180.0), f"对齐标注测量值应为 180，实际 {measurement}")
+        elif subtype == 0:    # 线性（垂直）
+            check(close(d.dxf.defpoint2.x, 180.0) and close(d.dxf.defpoint2.y, 0.0),
+                  f"线性标注界线原点 1 错误: {d.dxf.defpoint2}")
+            check(close(d.dxf.defpoint3.x, 180.0) and close(d.dxf.defpoint3.y, 110.0),
+                  f"线性标注界线原点 2 错误: {d.dxf.defpoint3}")
+            check(close(measurement, 110.0), f"线性标注测量值应为 110，实际 {measurement}")
+        elif subtype == 4:    # 半径
+            check(close(d.dxf.defpoint.x, 60.0) and close(d.dxf.defpoint.y, 55.0),
+                  f"半径标注圆心错误: {d.dxf.defpoint}")
+            r = d.dxf.defpoint.distance(d.dxf.defpoint4) if hasattr(d.dxf.defpoint, 'distance') \
+                else math.hypot(d.dxf.defpoint4.x - d.dxf.defpoint.x,
+                                d.dxf.defpoint4.y - d.dxf.defpoint.y)
+            check(close(r, 25.0), f"半径标注的圆上点距圆心应为 25，实际 {r}")
+            check(close(measurement, 25.0), f"半径标注测量值应为 25，实际 {measurement}")
+        elif subtype == 3:    # 直径
+            r = math.hypot(d.dxf.defpoint4.x - d.dxf.defpoint.x,
+                           d.dxf.defpoint4.y - d.dxf.defpoint.y)
+            check(close(r, 50.0), f"直径标注两定义点距离应为 50，实际 {r}")
+            check(close(measurement, 50.0), f"直径标注测量值应为 50，实际 {measurement}")
 
     # ---- 回写再读：验证 ezdxf 能无损重写我们的文件 ----
     rewritten = ezdxf.recover.readfile(str(path))[0]
@@ -190,12 +302,14 @@ def main():
     verify(sample_dir / "lycad_sample_r12.dxf",
            expected_version="AC1009",
            has_lineweight=False,     # R12 无 370 组码
-           has_lwpolyline=False)     # R12 使用 POLYLINE/VERTEX
+           has_lwpolyline=False,     # R12 使用 POLYLINE/VERTEX
+           has_hatch=False)          # R12 无 HATCH，降级为多段线
 
     verify(sample_dir / "lycad_sample_2000.dxf",
            expected_version="AC1015",
            has_lineweight=True,
-           has_lwpolyline=True)
+           has_lwpolyline=True,
+           has_hatch=True)
 
     print(f"\n{'=' * 60}")
     if FAILURES:

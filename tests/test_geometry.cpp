@@ -6,8 +6,11 @@
 
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 #include "core/Types.h"
 #include "interact/CoordinateInput.h"
 
@@ -37,6 +40,14 @@ private slots:
     void polylineBulgeSemicircle();
     void polylineMirrorFlipsBulgeSign();
     void rectangleIsClosedPolyline();
+
+    // ---- 文字 / 填充 / 标注 ---------------------------------------------------
+    void textBoundingBoxAndAlignment();
+    void hatchContainmentAndArea();
+    void hatchTransformMovesBoundary();
+    void dimensionMeasurementAllTypes();
+    void dimensionGeometryDerivation();
+    void dimensionGripsReflowGeometry();
 
     // ---- 坐标解析 -----------------------------------------------------------
     void coordinateParsing();
@@ -310,6 +321,185 @@ void TestGeometry::rectangleIsClosedPolyline()
     QVERIFY(rectangle.crosses(Box2D::fromCorners(Point2D(2.0, 1.0), Point2D(6.0, 2.0))));
     // 框完全位于矩形内部，不与边相交
     QVERIFY(!rectangle.crosses(Box2D::fromCorners(Point2D(1.0, 1.0), Point2D(2.0, 2.0))));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::textBoundingBoxAndAlignment()
+{
+    const TextEntity text(QStringLiteral("测试AB"), Point2D(10.0, 20.0), 4.0);
+
+    // 宽度估算：2 个 CJK（各 1.0 字高）+ 2 个 ASCII（各 0.55 字高）= 3.1 × 4
+    QVERIFY(std::abs(text.estimatedWidth() - 3.1 * 4.0) < 1e-9);
+
+    // 包围盒必须覆盖插入点且高度为正
+    const Box2D box = text.boundingBox();
+    QVERIFY(box.isValid());
+    QVERIFY(box.width() > 0.0 && box.height() > 0.0);
+    QVERIFY(box.contains(Point2D(10.0, 20.0), 0.1));
+
+    // 旋转 90° 后包围盒宽高互换
+    {
+        TextEntity rotated(QStringLiteral("测试AB"), Point2D(10.0, 20.0), 4.0);
+        rotated.setRotation(kHalfPi);
+        const Box2D rotatedBox = rotated.boundingBox();
+        QVERIFY(std::abs(rotatedBox.width() - box.height()) < 1e-9);
+        QVERIFY(std::abs(rotatedBox.height() - box.width()) < 1e-9);
+    }
+
+    // 左/基线对齐使用第一对齐点；居中/居中使用第二对齐点
+    QCOMPARE(text.effectivePosition(), Point2D(10.0, 20.0));
+
+    {
+        TextEntity centered(QStringLiteral("测试AB"), Point2D(10.0, 20.0), 4.0);
+        centered.setHAlign(TextEntity::HAlign::Center);
+        centered.setVAlign(TextEntity::VAlign::Middle);
+        centered.setAlignmentPoint(Point2D(50.0, 60.0));
+        QCOMPARE(centered.effectivePosition(), Point2D(50.0, 60.0));
+
+        // 夹点拖拽应移动参与定位的那个点
+        QVERIFY(centered.moveGrip(0, Point2D(70.0, 80.0)));
+        QCOMPARE(centered.alignmentPoint(), Point2D(70.0, 80.0));
+        QCOMPARE(centered.position(), Point2D(10.0, 20.0));
+    }
+
+    // 等比变换：字高随缩放变化，旋转角叠加
+    {
+        TextEntity scaled(QStringLiteral("测试AB"), Point2D(10.0, 20.0), 4.0);
+        scaled.transform(Transform2D::translation(1.0, 1.0)
+                         * Transform2D::scalingAround(Point2D(0.0, 0.0), 2.0, 2.0));
+        QVERIFY(std::abs(scaled.height() - 8.0) < 1e-9);
+    }
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::hatchContainmentAndArea()
+{
+    // 单位正方形边界
+    const HatchEntity hatch({ Point2D(0.0, 0.0), Point2D(4.0, 0.0),
+                              Point2D(4.0, 3.0), Point2D(0.0, 3.0) },
+                            QStringLiteral("ANSI31"), 2.0, 0.0);
+
+    QVERIFY(hatch.containsPoint(Point2D(2.0, 1.5)));
+    QVERIFY(!hatch.containsPoint(Point2D(5.0, 5.0)));
+
+    // 内部点拾取距离为 0，外部点为到边界的最短距离
+    QCOMPARE(hatch.distanceTo(Point2D(2.0, 1.5)), 0.0);
+    QVERIFY(std::abs(hatch.distanceTo(Point2D(6.0, 1.5)) - 2.0) < 1e-9);
+
+    QVERIFY(std::abs(hatch.polygonArea() - 12.0) < 1e-9);
+
+    // 图案参数
+    QVERIFY(!hatch.isSolid());
+    QVERIFY(std::abs(hatch.patternSpacing() - HatchEntity::kAnsi31BaseSpacing * 2.0) < 1e-9);
+
+    const HatchEntity solid({ Point2D(0.0, 0.0), Point2D(1.0, 0.0), Point2D(0.0, 1.0) },
+                            QStringLiteral("SOLID"), 1.0, 0.0);
+    QVERIFY(solid.isSolid());
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::hatchTransformMovesBoundary()
+{
+    HatchEntity hatch({ Point2D(0.0, 0.0), Point2D(4.0, 0.0),
+                        Point2D(4.0, 3.0), Point2D(0.0, 3.0) });
+
+    hatch.transform(Transform2D::translation(Vector2D(10.0, 20.0)));
+
+    QCOMPARE(hatch.vertex(0), Point2D(10.0, 20.0));
+    QCOMPARE(hatch.vertex(2), Point2D(14.0, 23.0));
+    QVERIFY(hatch.containsPoint(Point2D(12.0, 21.5)));
+    QVERIFY(!hatch.containsPoint(Point2D(2.0, 1.5)));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::dimensionMeasurementAllTypes()
+{
+    // 对齐：两点距离
+    DimensionEntity aligned(DimensionEntity::DimType::Aligned);
+    aligned.setFirstPoint(Point2D(0.0, 0.0));
+    aligned.setSecondPoint(Point2D(3.0, 4.0));
+    QVERIFY(std::abs(aligned.measurement() - 5.0) < 1e-9);
+
+    // 线性：沿尺寸线方向投影。水平标注测 X 距离
+    DimensionEntity horizontal(DimensionEntity::DimType::Linear);
+    horizontal.setFirstPoint(Point2D(1.0, 10.0));
+    horizontal.setSecondPoint(Point2D(4.0, 20.0));
+    horizontal.setRotation(0.0);
+    QVERIFY(std::abs(horizontal.measurement() - 3.0) < 1e-9);
+
+    // 垂直标注测 Y 距离
+    horizontal.setRotation(kHalfPi);
+    QVERIFY(std::abs(horizontal.measurement() - 10.0) < 1e-9);
+
+    // 半径 / 直径
+    DimensionEntity radial(DimensionEntity::DimType::Radial);
+    radial.setFirstPoint(Point2D(0.0, 0.0));
+    radial.setSecondPoint(Point2D(5.0, 0.0));
+    QVERIFY(std::abs(radial.measurement() - 5.0) < 1e-9);
+    QVERIFY(radial.displayText().startsWith(QLatin1Char('R')));
+
+    DimensionEntity diametric(DimensionEntity::DimType::Diametric);
+    diametric.setFirstPoint(Point2D(-5.0, 0.0));
+    diametric.setSecondPoint(Point2D(5.0, 0.0));
+    QVERIFY(std::abs(diametric.measurement() - 10.0) < 1e-9);
+    QVERIFY(diametric.displayText().contains(QChar(0x00D8)));   // ⌀
+
+    // 文字覆盖优先于自动测量
+    diametric.setTextOverride(QStringLiteral("参照图纸"));
+    QCOMPARE(diametric.displayText(), QStringLiteral("参照图纸"));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::dimensionGeometryDerivation()
+{
+    // 水平对齐标注：界线垂直引至尺寸线，文字位于尺寸线上方
+    DimensionEntity dim(DimensionEntity::DimType::Aligned);
+    dim.setFirstPoint(Point2D(0.0, 0.0));
+    dim.setSecondPoint(Point2D(100.0, 0.0));
+    dim.setDimLinePoint(Point2D(50.0, -20.0));
+    dim.setTextHeight(4.0);
+
+    const DimensionEntity::Geometry geo = dim.geometry();
+    QVERIFY(geo.valid);
+    QCOMPARE(geo.segments.size(), std::size_t(3));      // 2 条界线 + 1 条尺寸线
+    QCOMPARE(geo.arrows.size(), std::size_t(2));
+    QCOMPARE(geo.text, dim.displayText());
+
+    // 尺寸线两端垂足
+    QVERIFY(geo.segments[2].first.distanceTo(Point2D(0.0, -20.0)) < 1e-9);
+    QVERIFY(geo.segments[2].second.distanceTo(Point2D(100.0, -20.0)) < 1e-9);
+
+    // 文字锚点在尺寸线上方（可读方向一侧）
+    QVERIFY(geo.textAnchor.y > -20.0);
+    QVERIFY(std::abs(geo.textAnchor.x - 50.0) < 1e-9);
+
+    // 文字方向保持水平（0° 附近）
+    QVERIFY(std::abs(normalizeAngle(geo.textAngle)) < 1e-9
+            || std::abs(normalizeAngle(geo.textAngle) - kTwoPi) < 1e-9);
+
+    // 拾取：靠近尺寸线时应命中
+    QVERIFY(dim.distanceTo(Point2D(50.0, -20.0)) < 1e-9);
+    // 远离时距离单调增大
+    QVERIFY(dim.distanceTo(Point2D(50.0, 30.0)) > dim.distanceTo(Point2D(50.0, 0.0)));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::dimensionGripsReflowGeometry()
+{
+    DimensionEntity dim(DimensionEntity::DimType::Aligned);
+    dim.setFirstPoint(Point2D(0.0, 0.0));
+    dim.setSecondPoint(Point2D(100.0, 0.0));
+    dim.setDimLinePoint(Point2D(50.0, -20.0));
+
+    // 拖动尺寸线夹点：测量值不变，几何随之重排
+    QVERIFY(dim.moveGrip(2, Point2D(50.0, 30.0)));
+    QVERIFY(std::abs(dim.measurement() - 100.0) < 1e-9);
+    const DimensionEntity::Geometry geo = dim.geometry();
+    QVERIFY(geo.segments[2].first.distanceTo(Point2D(0.0, 30.0)) < 1e-9);
+
+    // 拖动界线原点：测量值改变（对齐标注取两点直线距离）
+    QVERIFY(dim.moveGrip(1, Point2D(140.0, 30.0)));
+    QVERIFY(std::abs(dim.measurement() - std::hypot(140.0, 30.0)) < 1e-9);
 }
 
 // -----------------------------------------------------------------------------

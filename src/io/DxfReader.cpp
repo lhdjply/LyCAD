@@ -5,10 +5,13 @@
 
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
+#include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/TextEntity.h"
 
 #include <QFile>
 
@@ -529,6 +532,18 @@ std::vector<std::unique_ptr<Entity>> DxfReader::buildEntities(const QString& typ
         return out;
     }
 
+    if (upper == QLatin1String("TEXT")) {
+        return parseText(groups, result);
+    }
+
+    if (upper == QLatin1String("HATCH")) {
+        return parseHatch(groups, result);
+    }
+
+    if (upper == QLatin1String("DIMENSION")) {
+        return parseDimension(groups, result);
+    }
+
     if (upper == QLatin1String("SOLID") || upper == QLatin1String("TRACE")) {
         // 填充实体不做面填充，退化为轮廓闭合多段线，保证几何信息不丢失
         const Point2D p0(doubleOf(groups, 10), doubleOf(groups, 20));
@@ -603,6 +618,178 @@ std::vector<std::unique_ptr<Entity>> DxfReader::parseLwPolyline(const std::vecto
 
     m_skippedTypes[QStringLiteral("LWPOLYLINE(无有效顶点)")] =
         m_skippedTypes.value(QStringLiteral("LWPOLYLINE(无有效顶点)"), 0) + 1;
+    return out;
+}
+
+std::vector<std::unique_ptr<Entity>> DxfReader::parseText(const std::vector<DxfGroup>& groups,
+                                                          IoResult* result)
+{
+    Q_UNUSED(result);
+
+    std::vector<std::unique_ptr<Entity>> out;
+
+    const QString content = stringOf(groups, 1);
+    if (content.trimmed().isEmpty()) {
+        m_skippedTypes[QStringLiteral("TEXT(空内容)")] =
+            m_skippedTypes.value(QStringLiteral("TEXT(空内容)"), 0) + 1;
+        return out;
+    }
+
+    auto e = std::make_unique<TextEntity>();
+    e->setContent(content);
+
+    const double height = doubleOf(groups, 40, 0.0);
+    e->setHeight(height > kGeomTol ? height : 3.5);
+    e->setRotation(degToRad(doubleOf(groups, 50, 0.0)));
+
+    const Point2D first(doubleOf(groups, 10), doubleOf(groups, 20));
+    e->setPosition(first);
+
+    // 72/73 的取值可能来自旧软件的非标准输出，钳制到合法范围
+    auto clampIndex = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    e->setHAlign(static_cast<TextEntity::HAlign>(clampIndex(intOf(groups, 72, 0), 0, 2)));
+    e->setVAlign(static_cast<TextEntity::VAlign>(clampIndex(intOf(groups, 73, 0), 0, 3)));
+
+    // 第二对齐点只在非左/基线对齐时有意义；缺失时退回第一对齐点
+    if (e->usesAlignmentPoint() && (hasGroup(groups, 11) || hasGroup(groups, 21))) {
+        e->setAlignmentPoint(Point2D(doubleOf(groups, 11), doubleOf(groups, 21)));
+    } else {
+        e->setAlignmentPoint(first);
+    }
+
+    applyCommonProperties(groups, *e);
+    out.push_back(std::move(e));
+    return out;
+}
+
+std::vector<std::unique_ptr<Entity>> DxfReader::parseHatch(const std::vector<DxfGroup>& groups,
+                                                           IoResult* result)
+{
+    Q_UNUSED(result);
+
+    std::vector<std::unique_ptr<Entity>> out;
+
+    // 提取第一个多段线型边界环。DXF 的环可以由直线/圆弧边（92 无 bit0）
+    // 或多段线（92 带 bit0）构成；后者以 10/20 顶点对直接给出，解析代价低，
+    // 也是绝大多数软件写出的形态。多环嵌套暂取第一个有效环。
+    std::vector<Point2D> boundary;
+    for (std::size_t i = 0; i < groups.size() && boundary.empty(); ++i) {
+        const DxfGroup& g = groups[i];
+        if (g.code != 92 || (g.integer & 1) == 0) continue;
+
+        std::size_t j = i + 1;
+        while (j < groups.size()) {
+            const DxfGroup& vg = groups[j];
+            if (vg.code == 97 || vg.code == 92 || vg.code == 91) break;   // 环结束
+            if (vg.code == 10 && j + 1 < groups.size() && groups[j + 1].code == 20) {
+                boundary.push_back(Point2D(vg.real, groups[j + 1].real));
+                ++j;                                                      // 消费成对的 20
+            }
+            ++j;
+        }
+        if (boundary.size() < 3) boundary.clear();    // 不是有效闭合环，继续找下一个
+    }
+
+    if (boundary.size() < 3) {
+        m_skippedTypes[QStringLiteral("HATCH(无可解析边界)")] =
+            m_skippedTypes.value(QStringLiteral("HATCH(无可解析边界)"), 0) + 1;
+        return out;
+    }
+
+    const bool solid = (intOf(groups, 70, 0) & 1) != 0;
+    const QString patternName = stringOf(groups, 2, QStringLiteral("ANSI31"));
+    const double scale = doubleOf(groups, 41, 1.0);
+    const double angleDeg = doubleOf(groups, 52, 0.0);
+
+    auto e = std::make_unique<HatchEntity>(std::move(boundary),
+                                           solid ? QStringLiteral("SOLID") : patternName,
+                                           scale > kGeomTol ? scale : 1.0,
+                                           degToRad(angleDeg));
+    applyCommonProperties(groups, *e);
+    out.push_back(std::move(e));
+    return out;
+}
+
+std::vector<std::unique_ptr<Entity>> DxfReader::parseDimension(const std::vector<DxfGroup>& groups,
+                                                               IoResult* result)
+{
+    Q_UNUSED(result);
+
+    std::vector<std::unique_ptr<Entity>> out;
+
+    // 70 的低 3 位为标注类型；bit 32（几何块引用）与 bit 64（序标注轴）需屏蔽
+    const int type = intOf(groups, 70, 0) & 7;
+
+    auto skip = [this](const QString& why) {
+        const QString key = QStringLiteral("DIMENSION(%1)").arg(why);
+        m_skippedTypes[key] = m_skippedTypes.value(key, 0) + 1;
+    };
+
+    DimensionEntity::DimType dimType;
+    switch (type) {
+    case 0: dimType = DimensionEntity::DimType::Linear;    break;
+    case 1: dimType = DimensionEntity::DimType::Aligned;   break;
+    case 3: dimType = DimensionEntity::DimType::Diametric; break;
+    case 4: dimType = DimensionEntity::DimType::Radial;    break;
+    default:
+        skip(QStringLiteral("类型 %1 暂不支持").arg(type));
+        return out;
+    }
+
+    auto e = std::make_unique<DimensionEntity>(dimType);
+
+    const Point2D p10(doubleOf(groups, 10), doubleOf(groups, 20));
+    const Point2D p13(doubleOf(groups, 13), doubleOf(groups, 23));
+    const Point2D p14(doubleOf(groups, 14), doubleOf(groups, 24));
+    const Point2D p15(doubleOf(groups, 15), doubleOf(groups, 25));
+    const Point2D textPoint(doubleOf(groups, 11), doubleOf(groups, 21));
+
+    switch (dimType) {
+    case DimensionEntity::DimType::Linear:
+        e->setFirstPoint(p13);
+        e->setSecondPoint(p14);
+        e->setDimLinePoint(p10);
+        e->setRotation(degToRad(doubleOf(groups, 50, 0.0)));
+        break;
+    case DimensionEntity::DimType::Aligned:
+        e->setFirstPoint(p13);
+        e->setSecondPoint(p14);
+        e->setDimLinePoint(p10);
+        break;
+    case DimensionEntity::DimType::Radial:
+        e->setFirstPoint(p10);
+        e->setSecondPoint(p15);
+        e->setDimLinePoint(textPoint);
+        break;
+    case DimensionEntity::DimType::Diametric:
+        e->setFirstPoint(p10);
+        e->setSecondPoint(p15);
+        e->setDimLinePoint(textPoint);
+        break;
+    }
+
+    // 半径/直径标注缺少文字位置组码时，沿径向给一个默认位置，
+    // 避免文字凭空落在坐标原点
+    if ((dimType == DimensionEntity::DimType::Radial
+         || dimType == DimensionEntity::DimType::Diametric)
+        && !hasGroup(groups, 11) && !hasGroup(groups, 21)) {
+        const Vector2D u = (e->secondPoint() - e->firstPoint()).normalizedOr(Vector2D(1.0, 0.0));
+        e->setDimLinePoint(e->secondPoint() + u * (e->textHeight() * 2.0));
+    }
+
+    QString overrideText = stringOf(groups, 1).trimmed();
+    if (overrideText == QLatin1String("<>")) overrideText.clear();
+    e->setTextOverride(overrideText);
+
+    applyCommonProperties(groups, *e);
+
+    // 零测量的标注没有几何意义（除非用户指定了覆盖文字）
+    if (e->measurement() <= kGeomTol && overrideText.isEmpty()) {
+        skip(QStringLiteral("测量值为零"));
+        return out;
+    }
+
+    out.push_back(std::move(e));
     return out;
 }
 
