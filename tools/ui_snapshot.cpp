@@ -178,17 +178,29 @@ int main(int argc, char* argv[])
             out() << QStringLiteral("  文档中没有文字图元，跳过双击编辑验证。") << Qt::endl;
         } else {
             auto* text = static_cast<const TextEntity*>(doc->entity(textId));
-            const QString original = text->content();
 
             // 文字插入点 → 屏幕坐标
             const Point2D device = canvas->view().toDevice(text->effectivePosition());
             const QPoint screen(static_cast<int>(device.x), static_cast<int>(device.y));
 
-            // 预约自动应答：对话框弹出后填入新内容并确认
-            const QString replacement = original + QStringLiteral("-已编辑");
-            QTimer::singleShot(250, [replacement]() {
+            // 记录双击实际命中的文字：光标处可能有多条文字的包围盒重叠
+            //（宽容包围盒 + 填充遮挡），双击编辑的是其中最上层的那条
+            EntityId editTarget = kInvalidEntityId;
+            QObject::connect(tools, &ToolManager::textEditRequested,
+                             [&editTarget](EntityId id) { editTarget = id; });
+
+            // 编辑前记录全部文字内容（命中对象在双击前不可预知）
+            QHash<EntityId, QString> contentsBefore;
+            for (EntityId id : doc->drawOrder()) {
+                if (doc->entity(id) && doc->entity(id)->type() == EntityType::Text) {
+                    contentsBefore[id] = static_cast<const TextEntity*>(doc->entity(id))->content();
+                }
+            }
+
+            // 预约自动应答：对话框弹出后在原有内容后追加后缀并确认
+            QTimer::singleShot(250, []() {
                 if (auto* modal = qobject_cast<QInputDialog*>(QApplication::activeModalWidget())) {
-                    modal->setTextValue(replacement);
+                    modal->setTextValue(modal->textValue() + QStringLiteral("-已编辑"));
                     modal->accept();
                 }
             });
@@ -196,37 +208,48 @@ int main(int argc, char* argv[])
             QTest::mouseDClick(canvas, Qt::LeftButton, Qt::NoModifier, screen);
             settle(application, 300);
 
-            auto* edited = static_cast<const TextEntity*>(doc->entity(textId));
-            if (edited && edited->content() == replacement) {
-                out() << QStringLiteral("  双击编辑链路：\"%1\" → \"%2\"")
-                             .arg(original, edited->content())
-                      << Qt::endl;
+            if (editTarget == kInvalidEntityId) {
+                out() << QStringLiteral("  双击未命中任何文字，编辑链路失效。") << Qt::endl;
+                ++failures;
+            } else {
+                const QString before = contentsBefore.value(editTarget);
+                const QString after =
+                    static_cast<const TextEntity*>(doc->entity(editTarget))->content();
 
-                // 撤销应还原原文，重做应再次生效
-                doc->undoStack()->undo();
-                const bool undoOk =
-                    static_cast<const TextEntity*>(doc->entity(textId))->content() == original;
-                doc->undoStack()->redo();
-                const bool redoOk =
-                    static_cast<const TextEntity*>(doc->entity(textId))->content() == replacement;
-                out() << QStringLiteral("  撤销/重做: %1 / %2")
-                             .arg(undoOk ? QStringLiteral("通过")
-                                         : QStringLiteral("失败"),
-                                  redoOk ? QStringLiteral("通过")
-                                         : QStringLiteral("失败"))
-                      << Qt::endl;
-                if (!undoOk || !redoOk) ++failures;
+                if (after == before + QStringLiteral("-已编辑")) {
+                    out() << QStringLiteral("  双击编辑链路：命中文字 #%1，\"%2\" → \"%3\"")
+                                     .arg(editTarget)
+                                     .arg(before, after)
+                          << Qt::endl;
 
-                doc->selection().setIds({ textId });
-                if (!capture(application, window,
-                             dir.filePath(QStringLiteral("ui_text_edit.png")))) {
+                    // 撤销应还原原文，重做应再次生效
+                    doc->undoStack()->undo();
+                    const bool undoOk =
+                        static_cast<const TextEntity*>(doc->entity(editTarget))->content() == before;
+                    doc->undoStack()->redo();
+                    const bool redoOk =
+                        static_cast<const TextEntity*>(doc->entity(editTarget))->content()
+                            == before + QStringLiteral("-已编辑");
+                    out() << QStringLiteral("  撤销/重做: %1 / %2")
+                                 .arg(undoOk ? QStringLiteral("通过")
+                                             : QStringLiteral("失败"),
+                                      redoOk ? QStringLiteral("通过")
+                                             : QStringLiteral("失败"))
+                          << Qt::endl;
+                    if (!undoOk || !redoOk) ++failures;
+
+                    doc->selection().setIds({ editTarget });
+                    if (!capture(application, window,
+                                 dir.filePath(QStringLiteral("ui_text_edit.png")))) {
+                        ++failures;
+                    }
+                } else {
+                    out() << QStringLiteral("  双击后文字内容未变化，编辑链路失效。") << Qt::endl;
                     ++failures;
                 }
-            } else {
-                out() << QStringLiteral("  双击后文字内容未变化，编辑链路失效。") << Qt::endl;
-                ++failures;
             }
             doc->selection().clear();
+            QObject::disconnect(tools, &ToolManager::textEditRequested, nullptr, nullptr);
         }
     }
 

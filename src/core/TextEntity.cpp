@@ -13,10 +13,12 @@ namespace lycad {
 
 namespace {
 
-/// 文字宽度估算系数：单位字高下，ASCII 平均可视宽度
-constexpr double kAsciiWidthFactor = 0.55;
-/// CJK 全角字符宽度系数（一个汉字约为一个字高宽）
-constexpr double kCjkWidthFactor = 1.0;
+/// 单个字符的估算宽度（单位：字高）。
+/// 渲染器的 em = h / 0.72，故真实步进约为：ASCII ≈ 0.55em ≈ 0.76h，
+/// CJK = 1.0em ≈ 1.39h。此处取略宽松的值，保证包围盒罩住实际字形。
+constexpr double kAsciiWidthFactor = 0.85;
+/// CJK 全角字符宽度系数
+constexpr double kCjkWidthFactor = 1.45;
 
 bool isWideChar(char32_t code)
 {
@@ -34,7 +36,8 @@ bool isWideChar(char32_t code)
 /// 单个字符的估算宽度（单位：字高）
 double charWidthFactor(char32_t code)
 {
-    if (code == U' ') return 0.35;
+    if (code == U' ') return 0.50;
+    if (code == U'.') return 0.45;
     if (code < 0x20)  return 0.0;
     return isWideChar(code) ? kCjkWidthFactor : kAsciiWidthFactor;
 }
@@ -95,18 +98,41 @@ double TextEntity::estimatedWidth() const noexcept
     return width * m_height * m_widthFactor;
 }
 
+double TextEntity::baselineOffsetWorld() const noexcept
+{
+    // 与渲染器各垂直对齐档的基线偏移保持同一换算（世界坐标，向上为正）：
+    //   基线对齐 → 基线在锚点
+    //   底部对齐 → 字形下缘贴锚点，基线上移 kDescentRatio·h
+    //   中部对齐 → 字形范围中点在锚点
+    //   顶部对齐 → 字形上缘贴锚点，基线下移 kAscentRatio·h
+    switch (m_vAlign) {
+    case VAlign::Baseline: return 0.0;
+    case VAlign::Bottom:   return kDescentRatio * m_height;
+    case VAlign::Middle:   return -(kAscentRatio - kDescentRatio) * 0.5 * m_height;
+    case VAlign::Top:      return -kAscentRatio * m_height;
+    }
+    return 0.0;
+}
+
 std::vector<Point2D> TextEntity::outlineCorners() const
 {
-    // 以「插入点 = 左下角」的局部矩形，再旋转到世界方向。
-    // 水平镜像时文字自锚点向左延伸；垂直镜像时向下延伸。
+    // 局部坐标系（未旋转）：X 沿文字方向、Y 向上，原点在锚点。
+    // 矩形必须覆盖渲染器实际画出的字形：
+    //   · 垂直范围 = 基线 ± 墨迹范围（基线位置随对齐方式换算）
+    //   · 水平范围 = 自锚点起笔；水平镜像时向左延伸
+    //   · 垂直镜像时上下翻转
     const double w = std::max(estimatedWidth(), m_height * 0.5);
-    const double h = m_height;
+    const double b = baselineOffsetWorld();
+    double y0 = b - kInkBelowBaseline * m_height;
+    double y1 = b + kInkAboveBaseline * m_height;
+    if (m_upsideDown) {
+        y0 = -y1;
+        y1 = -y0;
+    }
+
     const double x0 = m_backwards ? -w : 0.0;
     const double x1 = m_backwards ? 0.0 : w;
-    const double y0 = m_upsideDown ? -h * 0.75 : 0.0;
-    const double y1 = m_upsideDown ? 0.0 : h * 0.75;
 
-    // 局部坐标：X 沿文字方向，Y 向上；基线位于局部 y = 0
     const std::vector<Point2D> local = {
         { x0, y0 },
         { x1, y0 },

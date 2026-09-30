@@ -22,6 +22,18 @@ public:
     /// 垂直对齐（对应 DXF 73）
     enum class VAlign { Baseline = 0, Bottom = 1, Middle = 2, Top = 3 };
 
+    // ---- 字形范围比例（与渲染器 kCapHeightToEmRatio 的换算保持一致） ----------
+    //
+    // 渲染器把 DXF 字高 h 解释为大写字母高度：em = h / 0.72。
+    // 据此，字形墨迹相对基线的范围为：
+    //   上方（大写高度 + CJK 出头）≈ +1.35h，下方（下伸部）≈ -0.35h。
+    // 估算刻意取宽松值，保证选择框/包围盒完整罩住实际字形。
+    static constexpr double kInkAboveBaseline = 1.45;   ///< 基线上方墨迹（× 字高）
+    static constexpr double kInkBelowBaseline = 0.40;   ///< 基线下方墨迹（× 字高）
+    /// 垂直对齐换算中用到的字体内距比例（× 字高）
+    static constexpr double kDescentRatio = 0.30;
+    static constexpr double kAscentRatio  = 1.05;
+
     TextEntity();
     explicit TextEntity(const QString& content,
                         const Point2D& position,
@@ -89,7 +101,10 @@ public:
     /// 单位字符宽度估计（CJK 记 1.0，ASCII 记 0.55，单位为字高；含宽度因子）
     double estimatedWidth() const noexcept;
 
-    /// 旋转后的文字矩形四角（已考虑镜像方向：backwards 时自锚点向左延伸）
+    /// 基线相对锚点的世界偏移（向上为正；与渲染器各对齐档的偏移换算一致）
+    double baselineOffsetWorld() const noexcept;
+
+    /// 旋转后的文字矩形四角（覆盖实际渲染的字形范围，含镜像与宽度因子）
     std::vector<Point2D> outlineCorners() const;
 
     // ---- Entity 接口 ---------------------------------------------------------

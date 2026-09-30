@@ -4,6 +4,7 @@
 #include "interact/SelectionTool.h"
 
 #include "core/Document.h"
+#include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "render/CadCanvas.h"
 
@@ -11,6 +12,7 @@
 #include <QPainter>
 
 #include <algorithm>
+#include <limits>
 
 namespace lycad {
 
@@ -197,15 +199,21 @@ bool SelectionTool::mouseDoubleClick(const CanvasEvent& event)
 
     // 文字优先：实心填充常常盖在文字上方，按常规拾取（自上而下）会先命中
     // 填充而不是文字，导致文字永远无法被双击。这里在全部图元中找
-    // 光标下最上层的文字图元，专门服务「双击编辑」这一意图。
+    // 光标下的文字图元；多条文字的包围盒重叠时，取锚点离点击处最近者——
+    // 「点谁编辑谁」。
     EntityId target = kInvalidEntityId;
+    double nearestAnchor = std::numeric_limits<double>::max();
     for (auto it = order.rbegin(); it != order.rend(); ++it) {
         const Entity* e = ctx().document->entity(*it);
         if (!e || e->type() != EntityType::Text) continue;
         if (!ctx().document->isSelectable(*it)) continue;
-        if (e->distanceTo(event.worldPos) <= tolerance) {
+        if (e->distanceTo(event.worldPos) > tolerance) continue;
+
+        const double anchorDist =
+            static_cast<const TextEntity*>(e)->effectivePosition().distanceTo(event.worldPos);
+        if (anchorDist < nearestAnchor) {
+            nearestAnchor = anchorDist;
             target = *it;
-            break;
         }
     }
 

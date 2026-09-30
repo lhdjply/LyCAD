@@ -22,15 +22,17 @@ constexpr double kTextOffset = 0.62;
 /// 箭头宽高比
 constexpr double kArrowWidthRatio = 1.0 / 3.0;
 
-/// 估算显示文字宽度（单位：字高）。标注文字以数字为主，取略宽的系数
+/// 估算显示文字宽度（单位：字高）。
+/// 与 TextEntity 的字宽估算保持同一比例（渲染 em = h/0.72），
+/// 略宽松以保证包围盒完整覆盖测量文字。
 double textWidthFactor(const QString& text)
 {
     double factor = 0.0;
     for (const QChar ch : text) {
         const ushort code = ch.unicode();
-        if (code >= 0x2E80) factor += 1.0;              // CJK / 全角
-        else if (code == U'.') factor += 0.3;
-        else factor += 0.58;
+        if (code >= 0x2E80) factor += 1.45;             // CJK / 全角
+        else if (code == U'.') factor += 0.45;
+        else factor += 0.85;
     }
     return std::max(factor, 1.0);
 }

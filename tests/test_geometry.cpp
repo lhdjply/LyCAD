@@ -375,8 +375,8 @@ void TestGeometry::textBoundingBoxAndAlignment()
 {
     const TextEntity text(QStringLiteral("测试AB"), Point2D(10.0, 20.0), 4.0);
 
-    // 宽度估算：2 个 CJK（各 1.0 字高）+ 2 个 ASCII（各 0.55 字高）= 3.1 × 4
-    QVERIFY(std::abs(text.estimatedWidth() - 3.1 * 4.0) < 1e-9);
+    // 宽度估算：2 个 CJK（各 1.45 字高）+ 2 个 ASCII（各 0.85 字高）= 4.6 × 4
+    QVERIFY(std::abs(text.estimatedWidth() - 4.6 * 4.0) < 1e-9);
 
     // 包围盒必须覆盖插入点且高度为正
     const Box2D box = text.boundingBox();
