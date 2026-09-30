@@ -1,0 +1,948 @@
+// =============================================================================
+//  LyCAD - interact/DrawTools.cpp
+// =============================================================================
+#include "interact/DrawTools.h"
+
+#include "core/ArcEntity.h"
+#include "core/CircleEntity.h"
+#include "core/Document.h"
+#include "core/LineEntity.h"
+#include "core/PointEntity.h"
+#include "core/PolylineEntity.h"
+#include "render/CadCanvas.h"
+
+#include <QKeyEvent>
+#include <QPainter>
+
+#include <algorithm>
+#include <cmath>
+
+namespace lycad {
+
+namespace {
+
+/// 预览线条的颜色与样式，与最终实体区分开
+const QColor kPreviewColor(0x1E, 0x88, 0xE5);
+
+/// 以虚线绘制一个临时图元的预览
+void drawPreviewEntity(QPainter& painter, const Entity& entity,
+                       const EntityRenderer::DrawContext& context)
+{
+    QPen pen(kPreviewColor);
+    pen.setWidthF(1.2);
+    pen.setStyle(Qt::DashLine);
+    pen.setCosmetic(true);
+
+    painter.save();
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawPath(EntityRenderer::toDevicePath(entity, *context.view));
+    painter.restore();
+}
+
+/// 在两点之间画橡皮筋
+void drawRubberBand(QPainter& painter, const EntityRenderer::DrawContext& context,
+                    const Point2D& from, const Point2D& to)
+{
+    const Point2D a = context.view->toDevice(from);
+    const Point2D b = context.view->toDevice(to);
+
+    QPen pen(kPreviewColor);
+    pen.setWidthF(1.0);
+    pen.setStyle(Qt::DashLine);
+    pen.setCosmetic(true);
+
+    painter.save();
+    painter.setPen(pen);
+    painter.drawLine(QPointF(a.x, a.y), QPointF(b.x, b.y));
+    painter.restore();
+}
+
+/// 把新图元归入当前图层，颜色随层
+template <typename T>
+void applyDefaults(T& entity, const ToolContext& context)
+{
+    if (!context.document) return;
+    entity.setLayerName(context.document->layers().currentLayerName());
+    entity.setColorByLayer();
+}
+
+/// 鼠标是否离开画布
+bool cursorAvailable(bool hasCursor)
+{
+    return hasCursor;
+}
+
+} // namespace
+
+// =============================================================================
+//  直线
+// =============================================================================
+DrawLineTool::DrawLineTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawLineTool::name() const { return QStringLiteral("LINE"); }
+QString DrawLineTool::displayName() const { return QStringLiteral("直线"); }
+
+QString DrawLineTool::prompt() const
+{
+    if (m_vertices.empty()) return QStringLiteral("指定第一个点:");
+    return QStringLiteral("指定下一点 [放弃(U)] <回车结束>:");
+}
+
+bool DrawLineTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const std::optional<Point2D> base = m_vertices.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_vertices.back());
+
+    const ResolvedPoint resolved = resolve(event.worldPos, base);
+
+    if (m_vertices.empty()) {
+        m_vertices.push_back(resolved.position);
+    } else {
+        createSegment(m_vertices.back(), resolved.position);
+        m_vertices.push_back(resolved.position);
+    }
+
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+bool DrawLineTool::mouseMove(const CanvasEvent& event)
+{
+    const std::optional<Point2D> base = m_vertices.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_vertices.back());
+
+    m_cursor = resolve(event.worldPos, base);
+    m_hasCursor = cursorAvailable(true);
+
+    if (m_cursor.kind != SnapKind::None) {
+        ctx().setSnapMarker(m_cursor.toSnapResult());
+    } else {
+        ctx().setSnapMarker(std::nullopt);
+    }
+
+    repaint();
+    return true;
+}
+
+bool DrawLineTool::keyPress(QKeyEvent* event)
+{
+    switch (event->key()) {
+    case Qt::Key_Escape:
+        finish();
+        return true;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+        // 至少放置了一个点即视为正常结束，否则等同取消
+        finish();
+        return true;
+    case Qt::Key_U:
+        undoLastSegment();
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool DrawLineTool::textInput(const QString& text)
+{
+    if (matchesOption(text, QStringLiteral("U"))) {
+        undoLastSegment();
+        return true;
+    }
+
+    const std::optional<Point2D> base = m_vertices.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_vertices.back());
+
+    const std::optional<Point2D> point = parsePointInput(text, base);
+    if (!point) return true;          // 已输出错误信息，视为已处理
+
+    if (m_vertices.empty()) {
+        m_vertices.push_back(*point);
+    } else {
+        createSegment(m_vertices.back(), *point);
+        m_vertices.push_back(*point);
+    }
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+void DrawLineTool::createSegment(const Point2D& from, const Point2D& to)
+{
+    if (from.distanceTo(to) <= kGeomTol) return;      // 零长线段直接忽略
+
+    auto line = std::make_unique<LineEntity>(from, to);
+    applyDefaults(*line, ctx());
+
+    const EntityId id = ctx().document->addEntity(std::move(line));
+    if (id != kInvalidEntityId) m_created.push_back(id);
+}
+
+void DrawLineTool::undoLastSegment()
+{
+    if (!m_created.empty()) {
+        ctx().document->removeEntity(m_created.back());
+        m_created.pop_back();
+    }
+    if (!m_vertices.empty()) m_vertices.pop_back();
+
+    notifyPromptChanged();
+    repaint();
+}
+
+void DrawLineTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    // 已确定的折线
+    for (std::size_t i = 0; i + 1 < m_vertices.size(); ++i) {
+        const Point2D a = context.view->toDevice(m_vertices[i]);
+        const Point2D b = context.view->toDevice(m_vertices[i + 1]);
+        QPen pen(kPreviewColor);
+        pen.setWidthF(1.2);
+        pen.setCosmetic(true);
+        painter.save();
+        painter.setPen(pen);
+        painter.drawLine(QPointF(a.x, a.y), QPointF(b.x, b.y));
+        painter.restore();
+    }
+
+    // 从最后一点到光标的橡皮筋
+    if (!m_vertices.empty() && m_hasCursor) {
+        drawRubberBand(painter, context, m_vertices.back(), m_cursor.position);
+    }
+}
+
+void DrawLineTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+    if (!m_created.empty()) {
+        message(QStringLiteral("已绘制 %1 条直线。").arg(m_created.size()));
+    }
+}
+
+// =============================================================================
+//  圆
+// =============================================================================
+DrawCircleTool::DrawCircleTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawCircleTool::name() const { return QStringLiteral("CIRCLE"); }
+QString DrawCircleTool::displayName() const { return QStringLiteral("圆"); }
+
+QString DrawCircleTool::prompt() const
+{
+    switch (m_mode) {
+    case Mode::CenterRadius:
+        return m_points.empty()
+            ? QStringLiteral("指定圆心 或 [三点(3P)/两点(2P)/直径(D)]:")
+            : QStringLiteral("指定半径 或 [直径(D)]:");
+    case Mode::ThreePoint:
+        return QStringLiteral("指定圆周上的第 %1 个点 [圆弧上三点]:").arg(m_points.size() + 1);
+    case Mode::TwoPoint:
+        return QStringLiteral("指定直径的第 %1 个端点:").arg(m_points.size() + 1);
+    case Mode::DiameterTyped:
+        return QStringLiteral("输入直径:");
+    }
+    return QString();
+}
+
+void DrawCircleTool::reset()
+{
+    m_mode = Mode::CenterRadius;
+    m_points.clear();
+    notifyPromptChanged();
+    repaint();
+}
+
+void DrawCircleTool::commitCircle(const Point2D& center, double radius)
+{
+    if (radius <= kGeomTol) {
+        message(QStringLiteral("半径必须大于 0，本操作被忽略。"));
+        return;
+    }
+
+    auto circle = std::make_unique<CircleEntity>(center, radius);
+    applyDefaults(*circle, ctx());
+    ctx().document->addEntity(std::move(circle));
+
+    message(QStringLiteral("已创建圆：半径 %1").arg(radius, 0, 'g', 6));
+}
+
+bool DrawCircleTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const std::optional<Point2D> base = m_points.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_points.back());
+    const ResolvedPoint resolved = resolve(event.worldPos, base);
+
+    switch (m_mode) {
+    case Mode::CenterRadius:
+        if (m_points.empty()) {
+            m_points.push_back(resolved.position);
+            notifyPromptChanged();
+        } else {
+            commitCircle(m_points.front(), m_points.front().distanceTo(resolved.position));
+            reset();
+        }
+        repaint();
+        return true;
+
+    case Mode::ThreePoint:
+        m_points.push_back(resolved.position);
+        if (m_points.size() == 3) {
+            const auto arc = ArcEntity::fromThreePoints(m_points[0], m_points[1], m_points[2]);
+            if (!arc) {
+                message(QStringLiteral("三点共线，无法确定圆。请重新指定。"));
+                m_points.clear();
+            } else {
+                auto circle = std::make_unique<CircleEntity>(arc->center(), arc->radius());
+                applyDefaults(*circle, ctx());
+                ctx().document->addEntity(std::move(circle));
+                message(QStringLiteral("已创建圆：半径 %1").arg(arc->radius(), 0, 'g', 6));
+                reset();
+                return true;
+            }
+        }
+        notifyPromptChanged();
+        repaint();
+        return true;
+
+    case Mode::TwoPoint:
+        m_points.push_back(resolved.position);
+        if (m_points.size() == 2) {
+            const Point2D center((m_points[0].x + m_points[1].x) * 0.5,
+                                 (m_points[0].y + m_points[1].y) * 0.5);
+            commitCircle(center, m_points[0].distanceTo(m_points[1]) * 0.5);
+            reset();
+            return true;
+        }
+        notifyPromptChanged();
+        repaint();
+        return true;
+
+    case Mode::DiameterTyped:
+        // 该模式只接受数值输入
+        message(QStringLiteral("请直接输入直径数值。"));
+        return true;
+    }
+
+    return true;
+}
+
+bool DrawCircleTool::mouseMove(const CanvasEvent& event)
+{
+    const std::optional<Point2D> base = m_points.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_points.back());
+    m_cursor = resolve(event.worldPos, base);
+    m_hasCursor = true;
+
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                                                        : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawCircleTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return
+        || event->key() == Qt::Key_Enter) {
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool DrawCircleTool::textInput(const QString& text)
+{
+    // 选项
+    if (m_mode == Mode::CenterRadius) {
+        if (matchesOption(text, QStringLiteral("3P"))) {
+            m_mode = Mode::ThreePoint;
+            m_points.clear();
+            notifyPromptChanged();
+            return true;
+        }
+        if (matchesOption(text, QStringLiteral("2P"))) {
+            m_mode = Mode::TwoPoint;
+            m_points.clear();
+            notifyPromptChanged();
+            return true;
+        }
+        if (matchesOption(text, QStringLiteral("D"))) {
+            m_mode = Mode::DiameterTyped;
+            m_points.clear();
+            notifyPromptChanged();
+            return true;
+        }
+    }
+
+    if (m_mode == Mode::DiameterTyped) {
+        const std::optional<double> diameter = parseScalarInput(text, QStringLiteral("直径"));
+        if (!diameter) return true;
+        const double radius = *diameter * 0.5;
+        if (radius <= kGeomTol) {
+            message(QStringLiteral("直径必须大于 0。"));
+            return true;
+        }
+        if (m_points.empty()) m_points.push_back(Point2D(0.0, 0.0));
+        commitCircle(m_points.front(), radius);
+        reset();
+        return true;
+    }
+
+    // 半径阶段直接输入数值
+    if (m_mode == Mode::CenterRadius && m_points.size() == 1) {
+        if (const std::optional<double> radius = parseScalarInput(text, QStringLiteral("半径"))) {
+            commitCircle(m_points.front(), *radius);
+            reset();
+            return true;
+        }
+        return true;
+    }
+
+    // 坐标输入
+    const std::optional<Point2D> base = m_points.empty() ? std::nullopt
+                                                         : std::optional<Point2D>(m_points.back());
+    const std::optional<Point2D> point = parsePointInput(text, base);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawCircleTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    if (!m_hasCursor) return;
+
+    switch (m_mode) {
+    case Mode::CenterRadius:
+        if (m_points.size() == 1) {
+            const double radius = m_points.front().distanceTo(m_cursor.position);
+            if (radius > kGeomTol) {
+                CircleEntity preview(m_points.front(), radius);
+                drawPreviewEntity(painter, preview, context);
+            }
+            drawRubberBand(painter, context, m_points.front(), m_cursor.position);
+        }
+        break;
+
+    case Mode::TwoPoint:
+        if (m_points.size() == 1) {
+            const Point2D center((m_points[0].x + m_cursor.position.x) * 0.5,
+                                 (m_points[0].y + m_cursor.position.y) * 0.5);
+            const double radius = m_points[0].distanceTo(m_cursor.position) * 0.5;
+            if (radius > kGeomTol) {
+                CircleEntity preview(center, radius);
+                drawPreviewEntity(painter, preview, context);
+            }
+        }
+        break;
+
+    case Mode::ThreePoint:
+        if (m_points.size() == 2) {
+            const auto arc = ArcEntity::fromThreePoints(m_points[0], m_points[1], m_cursor.position);
+            if (arc) {
+                CircleEntity preview(arc->center(), arc->radius());
+                drawPreviewEntity(painter, preview, context);
+            }
+        } else if (m_points.size() == 1) {
+            drawRubberBand(painter, context, m_points.front(), m_cursor.position);
+        }
+        break;
+
+    case Mode::DiameterTyped:
+        break;
+    }
+}
+
+void DrawCircleTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
+//  圆弧
+// =============================================================================
+DrawArcTool::DrawArcTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawArcTool::name() const { return QStringLiteral("ARC"); }
+QString DrawArcTool::displayName() const { return QStringLiteral("圆弧"); }
+
+QString DrawArcTool::prompt() const
+{
+    if (m_mode == Mode::ThreePoint) {
+        static const char* kNames[3] = { "起点", "圆弧上的第二点", "终点" };
+        return QStringLiteral("指定%1 [圆心(C)]:")
+            .arg(QString::fromUtf8(kNames[std::min<std::size_t>(m_points.size(), 2)]));
+    }
+    static const char* kCenterNames[3] = { "圆心", "起点", "终点" };
+    return QStringLiteral("指定%1:")
+        .arg(QString::fromUtf8(kCenterNames[std::min<std::size_t>(m_points.size(), 2)]));
+}
+
+void DrawArcTool::reset()
+{
+    m_points.clear();
+    notifyPromptChanged();
+    repaint();
+}
+
+void DrawArcTool::commit()
+{
+    if (m_points.size() != 3) return;
+
+    std::optional<ArcEntity> arc;
+    if (m_mode == Mode::ThreePoint) {
+        arc = ArcEntity::fromThreePoints(m_points[0], m_points[1], m_points[2]);
+        if (!arc) {
+            message(QStringLiteral("三点共线，无法确定圆弧。请重新指定。"));
+            reset();
+            return;
+        }
+    } else {
+        arc = ArcEntity::fromCenterStartEnd(m_points[0], m_points[1], m_points[2]);
+        if (!arc) {
+            message(QStringLiteral("半径为零，无法确定圆弧。请重新指定。"));
+            reset();
+            return;
+        }
+    }
+
+    auto entity = std::make_unique<ArcEntity>(std::move(*arc));
+    applyDefaults(*entity, ctx());
+    ctx().document->addEntity(std::move(entity));
+
+    message(QStringLiteral("已创建圆弧：半径 %1，包角 %2°")
+                .arg(arc->radius(), 0, 'g', 6)
+                .arg(radToDeg(arc->spanAngle()), 0, 'f', 2));
+    reset();
+}
+
+bool DrawArcTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const std::optional<Point2D> base = m_points.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_points.back());
+    const ResolvedPoint resolved = resolve(event.worldPos, base);
+
+    m_points.push_back(resolved.position);
+    if (m_points.size() == 3) commit();
+
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+bool DrawArcTool::mouseMove(const CanvasEvent& event)
+{
+    const std::optional<Point2D> base = m_points.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_points.back());
+    m_cursor = resolve(event.worldPos, base);
+    m_hasCursor = true;
+
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                                                        : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawArcTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return
+        || event->key() == Qt::Key_Enter) {
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool DrawArcTool::textInput(const QString& text)
+{
+    if (m_points.empty() && matchesOption(text, QStringLiteral("C"))) {
+        m_mode = Mode::CenterStartEnd;
+        notifyPromptChanged();
+        return true;
+    }
+
+    const std::optional<Point2D> base = m_points.empty() ? std::nullopt
+                                                         : std::optional<Point2D>(m_points.back());
+    const std::optional<Point2D> point = parsePointInput(text, base);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawArcTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    if (!m_hasCursor) return;
+
+    if (m_points.size() == 2) {
+        std::optional<ArcEntity> preview;
+        if (m_mode == Mode::ThreePoint) {
+            preview = ArcEntity::fromThreePoints(m_points[0], m_points[1], m_cursor.position);
+        } else {
+            preview = ArcEntity::fromCenterStartEnd(m_points[0], m_points[1], m_cursor.position);
+        }
+        if (preview) drawPreviewEntity(painter, *preview, context);
+    } else if (m_points.size() == 1) {
+        drawRubberBand(painter, context, m_points.front(), m_cursor.position);
+    }
+}
+
+void DrawArcTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
+//  多段线
+// =============================================================================
+DrawPolylineTool::DrawPolylineTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawPolylineTool::name() const { return QStringLiteral("PLINE"); }
+QString DrawPolylineTool::displayName() const { return QStringLiteral("多段线"); }
+
+QString DrawPolylineTool::prompt() const
+{
+    if (m_vertices.empty()) return QStringLiteral("指定起点:");
+    return QStringLiteral("指定下一点 [闭合(C)/放弃(U)] <回车结束>:");
+}
+
+void DrawPolylineTool::commit(bool closed)
+{
+    if (m_vertices.size() < 2) {
+        message(QStringLiteral("至少需要两个点才能构成多段线。"));
+        return;
+    }
+
+    auto polyline = std::make_unique<PolylineEntity>(m_vertices, closed);
+    applyDefaults(*polyline, ctx());
+    ctx().document->addEntity(std::move(polyline));
+
+    message(QStringLiteral("已创建多段线：%1 个顶点%2")
+                .arg(m_vertices.size())
+                .arg(closed ? QStringLiteral("（闭合）") : QString()));
+    m_vertices.clear();
+}
+
+bool DrawPolylineTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const std::optional<Point2D> base = m_vertices.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_vertices.back());
+    const ResolvedPoint resolved = resolve(event.worldPos, base);
+
+    m_vertices.push_back(resolved.position);
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+bool DrawPolylineTool::mouseMove(const CanvasEvent& event)
+{
+    const std::optional<Point2D> base = m_vertices.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_vertices.back());
+    m_cursor = resolve(event.worldPos, base);
+    m_hasCursor = true;
+
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                                                        : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawPolylineTool::keyPress(QKeyEvent* event)
+{
+    switch (event->key()) {
+    case Qt::Key_Escape:
+        m_vertices.clear();
+        finish();
+        return true;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+        commit(false);
+        finish();
+        return true;
+    case Qt::Key_U:
+        if (!m_vertices.empty()) m_vertices.pop_back();
+        notifyPromptChanged();
+        repaint();
+        return true;
+    case Qt::Key_C:
+        if (m_vertices.size() >= 3) {
+            commit(true);
+            finish();
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool DrawPolylineTool::textInput(const QString& text)
+{
+    if (matchesOption(text, QStringLiteral("C"))) {
+        if (m_vertices.size() >= 3) {
+            commit(true);
+            finish();
+        } else {
+            message(QStringLiteral("闭合多段线至少需要 3 个顶点。"));
+        }
+        return true;
+    }
+    if (matchesOption(text, QStringLiteral("U"))) {
+        if (!m_vertices.empty()) m_vertices.pop_back();
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    const std::optional<Point2D> base = m_vertices.empty() ? std::nullopt
+                                                           : std::optional<Point2D>(m_vertices.back());
+    const std::optional<Point2D> point = parsePointInput(text, base);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawPolylineTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    if (m_vertices.size() < 2) {
+        if (!m_vertices.empty() && m_hasCursor) {
+            drawRubberBand(painter, context, m_vertices.front(), m_cursor.position);
+        }
+        return;
+    }
+
+    std::vector<Point2D> preview = m_vertices;
+    if (m_hasCursor) preview.push_back(m_cursor.position);
+
+    QPainterPath path;
+    const Point2D first = context.view->toDevice(preview.front());
+    path.moveTo(first.x, first.y);
+    for (std::size_t i = 1; i < preview.size(); ++i) {
+        const Point2D d = context.view->toDevice(preview[i]);
+        path.lineTo(d.x, d.y);
+    }
+
+    QPen pen(kPreviewColor);
+    pen.setWidthF(1.2);
+    pen.setStyle(Qt::DashLine);
+    pen.setCosmetic(true);
+
+    painter.save();
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawPath(path);
+    painter.restore();
+}
+
+void DrawPolylineTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
+//  点
+// =============================================================================
+DrawPointTool::DrawPointTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawPointTool::name() const { return QStringLiteral("POINT"); }
+QString DrawPointTool::displayName() const { return QStringLiteral("点"); }
+
+QString DrawPointTool::prompt() const
+{
+    return QStringLiteral("指定点位置 <回车结束>%1:")
+        .arg(m_placed > 0 ? QStringLiteral("（已放置 %1 个）").arg(m_placed) : QString());
+}
+
+bool DrawPointTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const ResolvedPoint resolved = resolve(event.worldPos);
+
+    auto point = std::make_unique<PointEntity>(resolved.position);
+    applyDefaults(*point, ctx());
+    ctx().document->addEntity(std::move(point));
+    ++m_placed;
+
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+bool DrawPointTool::mouseMove(const CanvasEvent& event)
+{
+    m_cursor = resolve(event.worldPos);
+    m_hasCursor = true;
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                                                        : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawPointTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return
+        || event->key() == Qt::Key_Enter) {
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool DrawPointTool::textInput(const QString& text)
+{
+    const std::optional<Point2D> point = parsePointInput(text, std::nullopt);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawPointTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+    if (m_placed > 0) message(QStringLiteral("已放置 %1 个点。").arg(m_placed));
+}
+
+// =============================================================================
+//  矩形
+// =============================================================================
+DrawRectangleTool::DrawRectangleTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawRectangleTool::name() const { return QStringLiteral("RECTANGLE"); }
+QString DrawRectangleTool::displayName() const { return QStringLiteral("矩形"); }
+
+QString DrawRectangleTool::prompt() const
+{
+    return m_first ? QStringLiteral("指定另一个角点 <回车结束>:")
+                   : QStringLiteral("指定第一个角点:");
+}
+
+bool DrawRectangleTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const ResolvedPoint resolved = resolve(event.worldPos, m_first);
+
+    if (!m_first) {
+        m_first = resolved.position;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    const Point2D& a = *m_first;
+    const Point2D& b = resolved.position;
+
+    if (std::abs(a.x - b.x) <= kGeomTol || std::abs(a.y - b.y) <= kGeomTol) {
+        message(QStringLiteral("退化的矩形（宽或高为零），已忽略。"));
+        m_first.reset();
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    auto rectangle = std::make_unique<PolylineEntity>(
+        PolylineEntity::makeRectangle(a, b));
+    applyDefaults(*rectangle, ctx());
+    ctx().document->addEntity(std::move(rectangle));
+
+    message(QStringLiteral("已创建矩形：%1 × %2")
+                .arg(std::abs(b.x - a.x), 0, 'g', 6)
+                .arg(std::abs(b.y - a.y), 0, 'g', 6));
+
+    m_first.reset();
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+bool DrawRectangleTool::mouseMove(const CanvasEvent& event)
+{
+    m_cursor = resolve(event.worldPos, m_first);
+    m_hasCursor = true;
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                                                        : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawRectangleTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return
+        || event->key() == Qt::Key_Enter) {
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool DrawRectangleTool::textInput(const QString& text)
+{
+    const std::optional<Point2D> point = parsePointInput(text, m_first);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawRectangleTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    if (!m_first || !m_hasCursor) return;
+    PolylineEntity preview = PolylineEntity::makeRectangle(*m_first, m_cursor.position);
+    drawPreviewEntity(painter, preview, context);
+}
+
+void DrawRectangleTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+} // namespace lycad
