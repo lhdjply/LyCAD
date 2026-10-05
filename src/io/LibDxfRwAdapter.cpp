@@ -686,6 +686,35 @@ void Builder::addTrace(const DRW_Trace& data)
 /// 清理 MTEXT 的内联格式码：\P（段落）→ 空格；{…} 分组括号剥除；
 /// \W/\H/\A/\C/\c/\f/\F/\T/\Q/\S…; 这类「到分号为止」的控制串整段剥除；
 /// \\ 与 \{、\} 是转义字面量，还原后保留。
+/// MTEXT 的内联字体码：\f<字体名>|b<粗>|i<斜>|c<字符集>|p<pitch>;
+/// AutoCAD 把「这一段用哪款字体」直接写在文字里（优先级高于图元的样式）。
+struct MTextFontOverride {
+    QString name;        ///< 字体名（TrueType 族名，或 .shx 文件名）
+    int charset = 0;     ///< c 值（134 = GB2312）
+    int pitch = 0;       ///< p 值
+};
+
+bool mtextFontOverride(const QString& raw, MTextFontOverride& out)
+{
+    for (int i = 0; i + 2 < raw.size(); ++i) {
+        if (raw.at(i) != QLatin1Char('\\') || raw.at(i + 1) != QLatin1Char('f')) continue;
+        int end = i + 2;
+        while (end < raw.size() && raw.at(end) != QLatin1Char(';')) ++end;
+        const QString spec = raw.mid(i + 2, end - i - 2);
+        const QStringList parts = spec.split(QLatin1Char('|'));
+        if (parts.isEmpty() || parts.first().trimmed().isEmpty()) { i = end; continue; }
+        out = MTextFontOverride();
+        out.name = parts.first().trimmed();
+        for (int k = 1; k < parts.size(); ++k) {
+            const QString token = parts.at(k).trimmed();
+            if (token.startsWith(QLatin1Char('c'))) out.charset = token.mid(1).toInt();
+            else if (token.startsWith(QLatin1Char('p'))) out.pitch = token.mid(1).toInt();
+        }
+        return true;
+    }
+    return false;
+}
+
 /// 从 MTEXT 的内联格式码里取出**段落对齐**。
 ///
 /// AutoCAD 的段落码形如 \pxql;（左）/ \pxqc;（中）/ \pxqr;（右）/ \pxqj;（两端）/
@@ -924,6 +953,28 @@ void Builder::addMText(const DRW_MText& data)
     plain.textgen = 0;
     plain.widthscale = 1.0;
     plain.style = data.style;
+
+    // 内联字体码（\fSimSun|b0|i0|c134|p2;）：MTEXT 的字体写在文字里，**优先于**
+    // 图元的样式；剥码时把它一并丢掉，导出后整段字就退回样式里的字体——实测某图纸
+    // 的英文 "KC-DZS05"/"JK" 因此从宋体变成了单线笔画字体。这里把它还原成一条文字
+    // 样式（TrueType 族名 + 字符集标志，或 .shx 文件名），图元挂到该样式上：本软件
+    // 的显示和导出到别的 CAD 都能还原原本的字体。
+    MTextFontOverride inlineFont;
+    if (mtextFontOverride(rawText, inlineFont) && !inlineFont.name.isEmpty()) {
+        const QString styleName = inlineFont.name;
+        TextStyle& style = m_doc.textStyles().ensure(styleName);
+        if (!style.hasFontInfo()) {
+            if (styleName.endsWith(QLatin1String(".shx"), Qt::CaseInsensitive)) {
+                style.setFontFile(styleName);
+            } else {
+                style.setTtfName(styleName);
+                // 字符集与 pitch 打包进字体族标志（AutoCAD 的 1071 组码）：
+                // 高字节是字符集（134 = GB2312），低字节是 pitch
+                style.setTtfFlags((inlineFont.charset << 8) | (inlineFont.pitch & 0xFF));
+            }
+        }
+        plain.style = styleName.toStdString();
+    }
     auto entity = makeText(plain);
     if (entity) {
         applyCommon(*entity, data);

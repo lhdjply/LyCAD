@@ -154,6 +154,7 @@ private slots:
     void outOfRangeCoordinatesAreSkipped();
     void writtenHatchBoundaryKeepsBulgeSlots();
     void mtextParagraphAlignmentAndRectAnchor();
+    void mtextInlineFontBecomesTextStyle();
     void writtenHatchPatternDefinitionRoundTrips();
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
@@ -681,6 +682,61 @@ void TestLibDxfRw::mtextParagraphAlignmentAndRectAnchor()
             QVERIFY(std::abs(text->effectivePosition().x - 200.0) < 1e-6);
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+//  MTEXT 的内联字体码 \f<字体>|...; 必须还原成文字样式。
+//
+//  内联字体的优先级高于图元样式；剥码时把它一并丢掉，导出后整段字退回样式里的
+//  字体——实测某图纸的英文 "KC-DZS05"/"JK" 因此从宋体变成单线笔画字体（浩辰里
+//  一眼就能看出）。还原方式：按字体名建一条文字样式（TrueType 族名 + 字符集标志，
+//  或 .shx 文件名），图元挂到该样式上，显示与导出都能还原原字体。
+void TestLibDxfRw::mtextInlineFontBecomesTextStyle()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("mtext_font.dxf"));
+
+    const QByteArray content =
+        "0\nSECTION\n2\nENTITIES\n"
+        "0\nMTEXT\n5\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n10.0\n20\n20.0\n40\n2.5\n41\n40.0\n71\n5\n72\n5\n"
+        "1\n{\\fSimSun|b0|i0|c134|p2;KC-DZS05}\n"
+        "0\nENDSEC\n0\nEOF\n";
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(content);
+    file.close();
+
+    Document document;
+    const IoResult result = readDxfWithLibDxfRw(path, document);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(document.entityCount(), std::size_t(1));
+
+    const auto* text = static_cast<const TextEntity*>(
+        document.entity(document.drawOrder().front()));
+    QVERIFY(text != nullptr);
+    QCOMPARE(text->content(), QStringLiteral("KC-DZS05"));
+    QCOMPARE(text->fontStyle(), QStringLiteral("SimSun"));
+
+    const TextStyle* style = document.textStyles().find(QStringLiteral("SimSun"));
+    QVERIFY2(style != nullptr, "内联字体没有变成文字样式");
+    QCOMPARE(style->ttfName(), QStringLiteral("SimSun"));
+    // 字符集 134（GB2312）与 pitch 2 打包进字体族标志（AutoCAD 的 1071 组码）
+    QCOMPARE(style->ttfFlags(), (134 << 8) | 2);
+
+    // 写出：图元引用该样式，且样式记录带上 TrueType 扩展数据
+    const QString out = dir.filePath(QStringLiteral("mtext_font_out.dxf"));
+    DxfCodec dxf;
+    QVERIFY(dxf.write(out, document, r2000Options()).ok);
+    QFile written(out);
+    QVERIFY(written.open(QIODevice::ReadOnly));
+    const QString text2 = QString::fromLatin1(written.readAll());
+    written.close();
+    QVERIFY2(text2.contains(QStringLiteral("\n  2\nSimSun\n")), "样式表里没有 SimSun");
+    QVERIFY2(text2.contains(QStringLiteral("\n1000\nSimSun\n")), "缺少 TrueType 族名扩展数据");
+    QVERIFY2(text2.contains(QStringLiteral("\n1071\n34306\n")), "缺少字体族标志");
 }
 
 void TestLibDxfRw::readsDwgSample()
