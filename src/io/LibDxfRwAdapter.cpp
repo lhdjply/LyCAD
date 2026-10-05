@@ -74,6 +74,11 @@ namespace {
 /// 块引用递归展开的深度上限（防止自引用块造成无限递归）
 constexpr int kMaxBlockDepth = 16;
 
+/// 图元坐标的合理上限（世界单位）。真实图纸——哪怕以毫米计的超大总图——都远小于
+/// 它；而二进制格式里读错一个字节造出的天文数字（实测 1e36、1e101）会被挡住。
+/// 见 Builder::place() 的坐标体检。
+constexpr double kMaxCoordinate = 1e12;
+
 inline Point2D toPoint(const DRW_Coord& c) noexcept
 {
     return Point2D(c.x, c.y);
@@ -350,6 +355,21 @@ void Builder::applyCommon(Entity& entity, const DRW_Entity& source)
 void Builder::place(std::unique_ptr<Entity> entity)
 {
     if (!entity) return;
+
+    // 坐标体检：二进制格式里读错一个字节就能造出 1e100 这种坐标，混进来会把
+    // 全图范围撑到天文数字——用户看到的又是「打开是空白」（缩放范围失效），
+    // 拾取与包围盒判断也跟着失真。实测某 2007 版 DWG 有 2 条样条各一个控制点
+    // 如此，几何已不可用。这里挡在入口：非有限值、或超出任何真实图纸量级的一律
+    // 跳过并计数上报，不静默丢弃（与 README 的约定一致）。
+    const Box2D box = entity->boundingBox();
+    const auto outOfRange = [](double v) {
+        return !std::isfinite(v) || std::abs(v) > kMaxCoordinate;
+    };
+    if (!box.isValid() || outOfRange(box.minX) || outOfRange(box.minY)
+        || outOfRange(box.maxX) || outOfRange(box.maxY)) {
+        skip(QStringLiteral("坐标超出范围（文件数据异常，已跳过）"));
+        return;
+    }
 
     if (m_currentBlock) {
         m_currentBlock->entities.push_back(std::move(entity));

@@ -93,7 +93,11 @@ bool dwgReader21::parseDataPage(dwgSectionInfo si, duint8 *dData){
     #endif
 
         duint8 *tmpPageRS = new duint8[pi.size];
-        duint8 chunks =pi.size / 255;
+        // RS 块数必须用够宽的整型。一页最多 257 块（65535 字节 / 255），
+        // 上游写成 duint8 会截断：257 → 1，于是整页只有第一块被纠错，
+        // 其余数据仍是 RS 编码 —— 解压出来是乱码，表段解析失败，整个文件
+        // 被判为「已损坏」。实测一个 2007 版 DWG（对象区 47MB）正是如此。
+        duint32 chunks = pi.size / 255;
         dwgRSCodec::decode251I(tmpPageRaw, tmpPageRS, chunks);
     #ifdef DRW_DBG_DUMP
         DRW_DBG("\nSection OBJECTS RS data=\n");

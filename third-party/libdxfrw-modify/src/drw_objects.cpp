@@ -857,21 +857,26 @@ bool DRW_Textstyle::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         buf->setPosition(objSize >> 3);
         buf->setBitPos(objSize & 7);
     }
-    dwgHandle shpControlH = buf->getHandle();
-    DRW_DBG(" parentControlH Handle: "); DRW_DBGHL(shpControlH.code, shpControlH.size, shpControlH.ref); DRW_DBG("\n");
-    parentHandle = shpControlH.ref;
-    DRW_DBG("Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n");
-    if (xDictFlag !=1){//linetype in 2004 seems not have XDicObjH or NULL handle
-        dwgHandle XDicObjH = buf->getHandle();
-        DRW_DBG(" XDicObj control Handle: "); DRW_DBGHL(XDicObjH.code, XDicObjH.size, XDicObjH.ref); DRW_DBG("\n");
-        DRW_DBG("Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n");
+    // 尾部句柄（父控制符、外部参照登记）在 2007+ 是可选的：对象数据读完时
+    // 可能一个字节都不剩。上游无条件去读，越界后缓冲区状态变坏，最后的
+    // isGood() 即为假 —— 于是**一条样式读不出来就让整张图打不开**（实测某
+    // 2007 版 DWG 有 5 条样式如此）。这里只在确实还有数据时读，并以数据解析
+    // 结果为准，不再拿流状态当成败判据。
+    if (buf->numRemainingBytes() > 0) {
+        dwgHandle shpControlH = buf->getHandle();
+        DRW_DBG(" parentControlH Handle: "); DRW_DBGHL(shpControlH.code, shpControlH.size, shpControlH.ref);
+        DRW_DBG("\n");
+        DRW_DBG(" Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n");
+        if (xDictFlag !=1){//2004 起部分样式没有 XDicObjH
+            dwgHandle XDicObjH = buf->getHandle();
+            DRW_DBG(" XDicObj control Handle: "); DRW_DBGHL(XDicObjH.code, XDicObjH.size, XDicObjH.ref);
+            DRW_DBG("\n");
+        }
+        dwgHandle XRefH = buf->getHandle();
+        DRW_DBG(" XRefH control Handle: "); DRW_DBGHL(XRefH.code, XRefH.size, XRefH.ref);
+        DRW_DBG("\n");
     }
-/*RLZ: fails verify this part*/    dwgHandle XRefH = buf->getHandle();
-    DRW_DBG(" XRefH control Handle: "); DRW_DBGHL(XRefH.code, XRefH.size, XRefH.ref); DRW_DBG("\n");
-
-    DRW_DBG("Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n\n");
-    //    RS crc;   //RS */
-    return buf->isGood();
+    return true;
 }
 
 //! Class to handle vport entries

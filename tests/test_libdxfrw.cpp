@@ -151,6 +151,7 @@ private slots:
     void readsTextRotationAsDegrees();
     void readsPolylineBulge();
     void readsDimensionDefinitionPoints();
+    void outOfRangeCoordinatesAreSkipped();
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
     void writtenActiveViewportCoversDrawing();
@@ -492,6 +493,39 @@ void TestLibDxfRw::writtenTextStylesRoundTrip()
         if (name == QLatin1String("HZLZB") || name == QLatin1String("PaperStyle")) ++styled;
     }
     QCOMPARE(styled, 2);
+}
+
+// -----------------------------------------------------------------------------
+//  坐标体检：天文数字坐标不能进模型。
+//
+//  二进制格式里读错一个字节就能造出 1e100 这种坐标（实测某 2007 版 DWG 有两条
+//  样条各一个控制点如此，数据本身不可用）。放进来会把全图范围撑爆——用户看到的
+//  又是「打开是空白」（缩放范围失效），拾取与包围盒判断也跟着失真。
+//  适配层在入口挡掉这类图元并计数上报，不静默丢弃。
+void TestLibDxfRw::outOfRangeCoordinatesAreSkipped()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // 先写出两份「文件」：一份正常，一份含 1e30 的坐标
+    Document source;
+    source.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 0.0), Point2D(10.0, 10.0)));
+    source.addEntity(std::make_unique<LineEntity>(Point2D(1e30, 0.0), Point2D(1e30, 10.0)));
+
+    const QString path = dir.filePath(QStringLiteral("wild.dxf"));
+    DxfCodec dxf;
+    QVERIFY(dxf.write(path, source, r2000Options()).ok);
+
+    Document loaded;
+    const IoResult result = readDxfWithLibDxfRw(path, loaded);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(loaded.entityCount(), std::size_t(1));
+
+    bool reported = false;
+    for (const QString& warning : result.warnings) {
+        if (warning.contains(QStringLiteral("坐标超出范围"))) reported = true;
+    }
+    QVERIFY2(reported, "跳过了坐标异常的图元却没有如实上报");
 }
 
 void TestLibDxfRw::readsDwgSample()
