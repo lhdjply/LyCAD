@@ -17,26 +17,39 @@
 // =============================================================================
 #include "core/Document.h"
 #include "core/EllipseEntity.h"
+#include "core/Layer.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
 #include "render/CadCanvas.h"
+#include "render/PlotRenderer.h"
 #include "ui/IconLibrary.h"
 #include "ui/MainWindow.h"
 #include "ui/PropertyPanel.h"
 #include "ui/RibbonBar.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QLabel>
+#include <QLineEdit>
+#include <QPageLayout>
+#include <QPageSize>
+#include <QPainter>
 #include <QPalette>
 #include <QPlainTextEdit>
+#include <QRadioButton>
+#include <QPrintPreviewDialog>
+#include <QPrintPreviewWidget>
+#include <QPushButton>
+#include <QPrinter>
 #include <QPixmap>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -359,6 +372,387 @@ int main(int argc, char* argv[])
                     target->undoStack()->undo();
                 }
                 settle(application, 120);
+            }
+        }
+
+        // ---- 快照 2c：出图（打印）----
+        //
+        //  纸面上看到的东西与画布上不是一回事：有边距、没有栅格与选择高亮、线宽要
+        //  按毫米落到设备分辨率上、图层还能带「不打印」标志。因此这一段从四个方向
+        //  盯它：
+        //    · 入口——菜单与功能区的「打印」是否真的接上了；
+        //    · 页面——用与打印同一段代码渲染一页，数墨迹（不是空白页，也没糊满整页），
+        //      并验证「不打印」图层真的没被画上去；
+        //    · 比例——1:1 / 1:2 / 1:4 的纸面宽度必须成比例（见下方那段）；
+        //    · 出口——打印对话框（设置 + 预览同屏）走 PDF 目标完整走一遍，
+        //      这是离屏环境里唯一不会把作业送到真打印机的路径。
+        {
+            const auto findAction = [&window](const QString& text) -> QAction* {
+                for (QAction* action : window.findChildren<QAction*>()) {
+                    if (action->text() == text) return action;
+                }
+                return nullptr;
+            };
+            QAction* printAction = findAction(QStringLiteral("打印(&P)…"));
+            // 打印、打印预览、打印设置已合并成一个对话框，旧的独立入口不该再出现
+            QAction* stalePreview = findAction(QStringLiteral("打印预览(&V)…"));
+            QAction* staleSettings = findAction(QStringLiteral("打印设置(&T)…"));
+
+            int printButtons = 0;
+            if (auto* ribbonBar = window.findChild<RibbonBar*>()) {
+                for (QToolButton* button : ribbonBar->findChildren<QToolButton*>()) {
+                    const QString text = button->text();
+                    if (text == QStringLiteral("打印")) ++printButtons;
+                }
+            }
+
+            const bool shortcutsOk = printAction && !printAction->shortcuts().isEmpty();
+            const bool entriesOk = printAction && !stalePreview && !staleSettings
+                                   && printButtons == 1 && shortcutsOk;
+            out() << QStringLiteral("  出图入口：菜单 %1，功能区按钮 %2 个，"
+                                    "旧「预览/设置」入口 %3，打印快捷键 %4 → %5")
+                         .arg(printAction ? QStringLiteral("1 项") : QStringLiteral("缺失"),
+                              QString::number(printButtons),
+                              (stalePreview || staleSettings)
+                                  ? QStringLiteral("仍存在")
+                                  : QStringLiteral("已合并"),
+                              printAction && !printAction->shortcuts().isEmpty()
+                                  ? printAction->shortcut().toString()
+                                  : QStringLiteral("无"),
+                              entriesOk ? QStringLiteral("就绪") : QStringLiteral("不完整"))
+                  << Qt::endl;
+            if (!entriesOk) ++failures;
+
+            Document* plotDoc = canvas->document();
+            if (!plotDoc) {
+                out() << QStringLiteral("  没有文档，跳过出图验证。") << Qt::endl;
+                ++failures;
+            } else {
+
+                // 墨迹统计：白纸上的墨 = 任一通道明显低于白
+                const auto inkStats = [](const QPixmap& page, int& percent, QRect& box) {
+                    const QImage image = page.toImage().convertToFormat(QImage::Format_RGB32);
+                    box = QRect();
+                    qint64 painted = 0;
+                    for (int y = 0; y < image.height(); ++y) {
+                        const QRgb* line = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+                        for (int x = 0; x < image.width(); ++x) {
+                            const QRgb pixel = line[x];
+                            if (qRed(pixel) > 240 && qGreen(pixel) > 240 && qBlue(pixel) > 240) {
+                                continue;
+                            }
+                            ++painted;
+                            const QRect dot(x, y, 1, 1);
+                            box = box.isNull() ? dot : box.united(dot);
+                        }
+                    }
+                    percent = image.width() * image.height() > 0
+                                  ? static_cast<int>(painted * 100
+                                                     / (image.width() * image.height()))
+                                  : 0;
+                    return painted;
+                };
+
+                // A4 横向 @300 dpi：与真实纸面同尺寸，因此边距与内容的比例就是纸上的比例
+                const QSize sheetSize(3508, 2480);
+
+                const QPixmap page = renderToPixmap(*plotDoc, sheetSize);
+
+                int inkPercent = 0;
+                QRect inkBox;
+                const qint64 inkPixels = inkStats(page, inkPercent, inkBox);
+                const qint64 drawingPixels = inkPixels;
+                const QRect& drawingBox = inkBox;
+
+                const QString pageShot = dir.filePath(QStringLiteral("ui_print_page.png"));
+                if (!page.save(pageShot)) {
+                    out() << QStringLiteral("  出图页面保存失败: ") << pageShot << Qt::endl;
+                    ++failures;
+                } else {
+                    out() << QStringLiteral("  已保存 %1  (%2×%3)")
+                                 .arg(QFileInfo(pageShot).fileName())
+                                 .arg(page.width())
+                                 .arg(page.height())
+                          << Qt::endl;
+                }
+
+                // 图元必须铺满可打印区：页面去掉 6 mm 边距后，内容还留 2% 余量，
+                // 因此图纸内容宽度应当接近可打印区的九成以上
+                const double plotWidth = sheetSize.width() - 2.0 * (6.0 * 300.0 / 25.4);
+                const double fillRatio = drawingBox.isNull()
+                                             ? 0.0
+                                             : drawingBox.width() / plotWidth;
+                // 墨迹占比只用来排除两个极端（整页空白 / 整页糊黑），不设下限——
+                // 图纸疏密不同，稀疏的图占比本来就低；真正要钉住的是「铺满」
+                const bool pageOk = drawingPixels > 0 && inkPercent <= 60;
+                const bool filled = fillRatio >= 0.9;
+
+                out() << QStringLiteral("  出图页面：墨迹 %1%（%2 像素），图元铺满可打印区 %3% → %4")
+                             .arg(inkPercent)
+                             .arg(inkPixels)
+                             .arg(fillRatio * 100.0, 0, 'f', 1)
+                             .arg(pageOk && filled ? QStringLiteral("正常")
+                                                   : QStringLiteral("异常"))
+                      << Qt::endl;
+                if (!pageOk || !filled) ++failures;
+
+                // ---- 出图比例：固定比例必须真的改变纸面大小 ----
+                //
+                //  判据是墨迹宽度与比例严格成反比。基准比例不能写死：不同图纸
+                //  宽窄差别极大（样例 286 mm，实测 DWG 776 mm），1:2 对前者装得下、
+                //  对后者本来就该分两页。因此基准取「刚好装进可打印区」的 2 的幂，
+                //  再比较基准、两倍、四倍三档——三档都保证单页，倍半关系直接
+                //  钉住换算本身。
+                {
+                    const double pxPerMm = 300.0 / 25.4;
+                    const double printableMm =
+                        (sheetSize.width() - 2.0 * (6.0 * pxPerMm)) / pxPerMm;
+                    // 文件单位按毫米计（DXF/DWG 的常见约定），内容宽度即纸面毫米
+                    const double contentMm = plotExtents(*plotDoc).width();
+
+                    int base = 1;
+                    while (contentMm / base > printableMm * 0.9 && base < 1024) base *= 2;
+
+                    const auto inkWidthFor = [&](double n) {
+                        PlotOptions options;
+                        options.scale.mode = PlotScale::Mode::Custom;
+                        options.scale.custom = n;
+                        const QPixmap page = renderToPixmap(*plotDoc, sheetSize, options);
+                        int percent = 0;
+                        QRect box;
+                        inkStats(page, percent, box);
+                        return box.isNull() ? 0.0 : static_cast<double>(box.width());
+                    };
+
+                    const double w1 = inkWidthFor(base);
+                    const double w2 = inkWidthFor(base * 2.0);
+                    const double w4 = inkWidthFor(base * 4.0);
+                    const bool ratiosOk = w1 > 0.0 && w2 > 0.0 && w4 > 0.0
+                                          && std::abs(w2 / w1 - 0.5) < 0.02
+                                          && std::abs(w4 / w2 - 0.5) < 0.02;
+
+                    // 顺手把缩小档的整页存下来，与「适应图纸」的整页并排就是
+                    // 比例设置最直观的证据
+                    PlotOptions halfOptions;
+                    halfOptions.scale.mode = PlotScale::Mode::Custom;
+                    halfOptions.scale.custom = base * 2.0;
+                    const QString halfShot =
+                        dir.filePath(QStringLiteral("ui_print_page_scaled.png"));
+                    renderToPixmap(*plotDoc, sheetSize, halfOptions).save(halfShot);
+
+                    out() << QStringLiteral("  出图比例：1:%1 / 1:%2 / 1:%3 墨迹宽 "
+                                            "%4 / %5 / %6 px → %7")
+                                 .arg(base)
+                                 .arg(base * 2)
+                                 .arg(base * 4)
+                                 .arg(std::lround(w1))
+                                 .arg(std::lround(w2))
+                                 .arg(std::lround(w4))
+                                 .arg(ratiosOk ? QStringLiteral("严格成反比")
+                                               : QStringLiteral("换算有误"))
+                          << Qt::endl;
+                    if (!ratiosOk) ++failures;
+                }
+
+                // 「不打印」图层：取一个恰好压在出图范围边缘上的图元所属图层
+                // （它的 maxX 决定了范围），关掉打印后范围必须缩小——
+                // 这条判据是确定的，不像「墨迹变少」那样可能被浅色图元的可见性干扰。
+                const Box2D extentsBefore = plotExtents(*plotDoc);
+                QString edgeLayer;
+                for (EntityId id : plotDoc->drawOrder()) {
+                    const Entity* entity = plotDoc->entity(id);
+                    if (!entity || !entity->isDisplayable(plotDoc->layers())) continue;
+                    if (std::abs(entity->boundingBox().maxX - extentsBefore.maxX) < 1e-9) {
+                        edgeLayer = entity->layerName();
+                        break;
+                    }
+                }
+
+                if (edgeLayer.isEmpty()) {
+                    out() << QStringLiteral("  找不到决定出图范围的图层，跳过「不打印」验证。")
+                          << Qt::endl;
+                } else if (Layer* layer = plotDoc->layers().find(edgeLayer)) {
+                    layer->setPlottable(false);
+                    const Box2D extentsAfter = plotExtents(*plotDoc);
+
+                    // 被排除的图元数：出图范围的缩小是判据，这个数只是让人看清
+                    // 「关掉的确实是有点分量的那一层」。至于墨迹百分比——它不能跨
+                    // 两次渲染比较：图元少了、范围小了，剩下的内容反而被放得更大，
+                    // 墨迹可以变多，拿它当判据会得出反的结论。
+                    std::size_t excludedCount = 0;
+                    for (EntityId id : plotDoc->drawOrder()) {
+                        const Entity* entity = plotDoc->entity(id);
+                        if (entity && entity->layerName() == edgeLayer) ++excludedCount;
+                    }
+
+                    const bool excluded = extentsAfter.isValid()
+                                          && extentsAfter.maxX < extentsBefore.maxX - 1e-9;
+                    out() << QStringLiteral("  不打印图层「%1」：出图范围 maxX %2 → %3"
+                                            "（该层 %4 个图元）→ %5")
+                                 .arg(edgeLayer)
+                                 .arg(extentsBefore.maxX, 0, 'g', 6)
+                                 .arg(extentsAfter.isValid()
+                                          ? QString::number(extentsAfter.maxX, 'g', 6)
+                                          : QStringLiteral("无内容"))
+                                 .arg(excludedCount)
+                                 .arg(excluded ? QStringLiteral("已排除")
+                                               : QStringLiteral("仍被画出"))
+                          << Qt::endl;
+                    if (!excluded) ++failures;
+
+                    layer->setPlottable(true);
+                    Q_UNUSED(drawingPixels);
+                }
+
+                // ---- 打印对话框：设置 + 预览 + 出口，一屏完成 ----
+                //
+                //  驱动方式刻意选「PDF 目标」：点「打印」后界面层只是把页面写进
+                //  PDF 文件，绝不会把作业送到本机打印机上——这是离屏环境里能安全
+                //  走完整条链路的唯一出口。断言有四段：对话框能开、比例改动经
+                //  MainWindow::plotOptions() 生效并被持久化、PDF 真的落盘、
+                //  「适应图纸」能再设回去。
+                {
+                    const QString pdfPath = dir.filePath(QStringLiteral("ui_print_page.pdf"));
+                    QFile::remove(pdfPath);
+
+                    bool dialogOpened = false;
+                    int pageCount = 0;
+                    int pageAfterJump = -1;
+                    int spinMax = 0;
+                    int spinValue = 0;
+
+                    QTimer::singleShot(700, &window, [&]() {
+                        auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                        if (!dialog) return;
+                        dialogOpened = true;
+
+                        // 目标选 PDF 并填输出路径
+                        for (QComboBox* combo : dialog->findChildren<QComboBox*>()) {
+                            for (int i = 0; i < combo->count(); ++i) {
+                                if (combo->itemText(i) == QStringLiteral("导出为 PDF")) {
+                                    combo->setCurrentIndex(i);
+                                }
+                            }
+                        }
+                        if (auto* pathEdit = dialog->findChild<QLineEdit*>(
+                                QStringLiteral("printDialog.pdfPath"))) {
+                            pathEdit->setText(pdfPath);
+                        }
+
+                        // 比例选自定义 1:0.25（放大 4 倍）：样例图纸在 A4 横向下
+                        // 一页放不下，预览必须给出多页，且页码栏能翻页
+                        for (QRadioButton* radio : dialog->findChildren<QRadioButton*>()) {
+                            if (radio->text().startsWith(QStringLiteral("自定义"))) {
+                                radio->click();
+                                break;
+                            }
+                        }
+                        if (auto* value = dialog->findChild<QDoubleSpinBox*>()) {
+                            value->setValue(0.25);
+                        }
+
+                        // dialog 按值捕获：它是外层 lambda 的局部变量，按引用捕获
+                        // 是悬垂引用（实测段错误，而且崩在 grab 里，很难归因）
+                        QTimer::singleShot(400, dialog, [&, dialog]() {
+                            if (!capture(application, *dialog, dir.filePath(
+                                    QStringLiteral("ui_print_dialog.png")))) {
+                                ++failures;
+                            }
+
+                            // 预览控件汇报的页数：固定比例放大后必须 > 1 页，
+                            // 且页码栏的范围与之一致（切换页码走 setCurrentPage）
+                            if (auto* preview = dialog->findChild<QPrintPreviewWidget*>()) {
+                                preview->updatePreview();
+                                pageCount = preview->pageCount();
+
+                                // 翻到第 3 页再回来，页码栏要跟上
+                                preview->setCurrentPage(2);
+                                pageAfterJump = preview->currentPage();
+                                if (auto* spin = dialog->findChild<QSpinBox*>(
+                                        QStringLiteral("printDialog.pageSpin"))) {
+                                    spinMax = spin->maximum();
+                                    spinValue = spin->value();
+                                }
+                            }
+
+                            // 点「打印」：PDF 目标下这一步只是写文件
+                            if (auto* button = dialog->findChild<QPushButton*>(
+                                    QStringLiteral("printDialog.printButton"))) {
+                                button->click();
+                            }
+                        });
+                    });
+
+                    printAction->trigger();
+                    settle(application, 200);
+
+                    const bool pdfWritten = QFileInfo(pdfPath).exists()
+                                            && QFileInfo(pdfPath).size() > 2048;
+                    const PlotOptions applied = window.plotOptions();
+                    const bool scalePersisted =
+                        applied.scale.mode == PlotScale::Mode::Custom
+                        && std::abs(applied.scale.custom - 0.25) < 1e-9;
+                    // 放大 4 倍后 A4 横向一页只装得下图纸的一部分，必须分页；
+                    // 页码栏（spin 上限）与预览的实际页数一致，跳页后回到原页码
+                    // 页码栏的 spin 只在用户操作（页码栏/按钮）时刷新；
+                    // 这里直接调 setCurrentPage 属于程序化跳页，spin 不跟着走，
+                    // 因此只断言页数、栏上限与跳页本身
+                    const bool pagesOk = pageCount >= 2 && spinMax == pageCount
+                                         && pageAfterJump == 2;
+
+                    out() << QStringLiteral("  打印对话框：%1，比例 1:0.25 → %2 页"
+                                            "（页码栏上限 %3），跳页 %4 → %5，"
+                                            "比例 %6，PDF %7（%8 字节）")
+                                 .arg(dialogOpened ? QStringLiteral("已打开并已截图")
+                                                   : QStringLiteral("未能打开"),
+                                      QString::number(pageCount),
+                                      QString::number(spinMax),
+                                      QString::number(pageAfterJump + 1),
+                                      pagesOk ? QStringLiteral("分页与翻页正常")
+                                              : QStringLiteral("分页或翻页异常"),
+                                      scalePersisted ? QStringLiteral("已持久化")
+                                                     : QStringLiteral("未生效"),
+                                      pdfWritten ? QStringLiteral("已落盘")
+                                                 : QStringLiteral("缺失"),
+                                      QString::number(QFileInfo(pdfPath).size()))
+                          << Qt::endl;
+                    if (!dialogOpened || !pagesOk || !scalePersisted || !pdfWritten) {
+                        ++failures;
+                    }
+
+                    // 恢复「适应图纸」：重开对话框 → 选适应图纸 → 打印（仍是 PDF，
+                    // 不会碰真打印机）。这同时把比例设置恢复到默认，
+                    // 后续阶段的断言不受这次改动影响。
+                    bool restoredDialog = false;
+                    QTimer::singleShot(500, &window, [&]() {
+                        auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                        if (!dialog) return;
+                        restoredDialog = true;
+                        for (QRadioButton* radio : dialog->findChildren<QRadioButton*>()) {
+                            if (radio->text().startsWith(QStringLiteral("适应图纸"))) {
+                                radio->click();
+                                break;
+                            }
+                        }
+                        QTimer::singleShot(300, dialog, [dialog]() {
+                            if (auto* button = dialog->findChild<QPushButton*>(
+                                    QStringLiteral("printDialog.printButton"))) {
+                                button->click();
+                            }
+                        });
+                    });
+                    printAction->trigger();
+                    settle(application, 200);
+
+                    const bool restored =
+                        window.plotOptions().scale.mode == PlotScale::Mode::FitToPaper;
+                    out() << QStringLiteral("  打印对话框：恢复适应图纸 → %1")
+                                 .arg(restored && restoredDialog
+                                          ? QStringLiteral("已恢复")
+                                          : QStringLiteral("未恢复"))
+                          << Qt::endl;
+                    if (!restored || !restoredDialog) ++failures;
+                }
             }
         }
 

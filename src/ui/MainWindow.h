@@ -11,6 +11,7 @@
 #pragma once
 
 #include "io/CadCodec.h"
+#include "render/PlotRenderer.h"
 
 #include <QMainWindow>
 #include <QStringList>
@@ -68,6 +69,16 @@ private:
     bool maybeSaveChanges();
     void reportIoResult(const QString& title, const IoResult& result);
 
+    // ---- 出图 ----
+    /// 打印对话框：目标（打印机 / PDF）、纸张、出图比例与预览在一屏内完成
+    void printDocument();
+
+public:
+    /// 当前出图参数（比例来自打印设置；验证工具也用它核对设置是否生效）
+    PlotOptions plotOptions() const;
+
+private:
+
     // ---- 界面同步 ----
     void updateWindowTitle();
     void updateStatusModes();
@@ -89,6 +100,8 @@ private:
 
     // ---- 数据成员 ----------------------------------------------------------
     Document*       m_document = nullptr;
+    /// 出图比例（适应图纸 / 1:1 / 自定义 1:n），构造时从 QSettings 恢复
+    PlotScale       m_plotScale;
     CadCanvas*      m_canvas = nullptr;
     ToolManager*    m_toolManager = nullptr;
     LayerPanel*     m_layerPanel = nullptr;

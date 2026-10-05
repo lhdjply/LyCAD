@@ -70,7 +70,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 #  下都清晰，矢量源 + 按需渲染比预置多套 PNG 更简单，也更省资源。
 #  Debian/Ubuntu 上对应包名为 qt6-base-dev 与 qt6-svg-dev。
 # =============================================================================
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg PrintSupport)
 qt_standard_project_setup()          # 打开 AUTOMOC / AUTOUIC
 
 # 撤销栈 (QUndoStack) 与颜色 (QColor) 位于 QtGui，全工程都会用到
@@ -212,13 +212,17 @@ set(LYCAD_DXFRW_INCLUDES
 #  9. 可执行程序
 #
 #  这里只定义随软件发布的主程序；开发期工具在 tools/ 下。
-#  它们都用全部源码，因此 Qt 依赖取最高一层需要的：Widgets（画布与界面）
-#  与 Svg（图标栅格化）。
+#  它们都用全部源码，因此 Qt 依赖取最高一层需要的：Widgets（画布与界面）、
+#  Svg（图标栅格化）与 PrintSupport（打印与打印预览）。
+#
+#  PrintSupport 只在界面层出现（打印对话框与 QPrinter 都在 ui/MainWindow）：
+#  render/PlotRenderer 只认 QPainter 与目标矩形，不认识打印设备，因此
+#  「到 interact 为止」的单元测试不必链接它——依赖方向仍然只有一条。
 #
 #  凡是编入了 io 源码的目标，都要一并带上 libdxfrw 的对象文件与头文件目录——
 #  io 的 DWG 解析依赖它。
 # =============================================================================
-set(LYCAD_QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg)
+set(LYCAD_QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::PrintSupport)
 
 # ---------------------------------------------------------------- 主程序
 add_executable(lycad

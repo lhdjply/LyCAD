@@ -12,8 +12,10 @@
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
 #include "render/CadCanvas.h"
+#include "render/PlotRenderer.h"
 #include "ui/CommandLineEdit.h"
 #include "ui/LayerPanel.h"
+#include "ui/PrintDialog.h"
 #include "ui/PropertyChoices.h"
 #include "ui/PropertyPanel.h"
 #include "ui/RibbonBar.h"
@@ -41,7 +43,9 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPainter>
 #include <QPlainTextEdit>
+#include <QPrinter>
 #include <QSettings>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -53,6 +57,8 @@
 #include <QTextCursor>
 #include <QUrl>
 #include <QVBoxLayout>
+
+#include <algorithm>
 
 namespace lycad {
 
@@ -109,6 +115,13 @@ MainWindow::MainWindow(QWidget* parent)
                                             m_writeOptions.version).toString();
     m_lastDirectory = settings.value(QStringLiteral("path/lastDirectory"),
                                      QDir::homePath()).toString();
+
+    // 出图比例：适应图纸 / 1:1 / 自定义 1:n（见 render/PlotRenderer.h 的约定）
+    m_plotScale.mode = static_cast<PlotScale::Mode>(
+        settings.value(QStringLiteral("plot/scaleMode"),
+                       static_cast<int>(PlotScale::Mode::FitToPaper)).toInt());
+    m_plotScale.custom = settings.value(QStringLiteral("plot/customScale"), 1.0).toDouble();
+    if (m_plotScale.custom <= 0.0) m_plotScale.custom = 1.0;
 
     // 深色主题覆盖界面与画布两部分，统一由一个设置决定。
     // 旧版本只持久化了画布，因此这里回退读取旧键名，升级后维持原有外观。
@@ -233,6 +246,15 @@ void MainWindow::createMenus()
                             .arg(WriteOptions::versionDisplayName(m_writeOptions.version)));
         }
     });
+
+    fileMenu->addSeparator();
+
+    // ---- 出图 ----
+    // 打印与打印预览共用同一份页面设置与同一段绘制代码（render/PlotRenderer），
+    // 因此「预览上是什么样，纸上就是什么样」不是靠两处代码写得一样来保证的。
+    QAction* printAction = fileMenu->addAction(QStringLiteral("打印(&P)…"));
+    printAction->setShortcut(QKeySequence::Print);
+    connect(printAction, &QAction::triggered, this, &MainWindow::printDocument);
 
     fileMenu->addSeparator();
     QAction* quitAction = fileMenu->addAction(QStringLiteral("退出(&Q)"));
@@ -464,6 +486,11 @@ void MainWindow::createRibbon()
                                                   QStringLiteral("重做 (Ctrl+Y)"));
         connect(redoButton, &QToolButton::clicked, m_redoAction, &QAction::trigger);
         connect(m_redoAction, &QAction::enabledChanged, redoButton, &QWidget::setEnabled);
+
+        panel->addSeparator();
+        connect(panel->addSmall(QStringLiteral("print"), QStringLiteral("打印"),
+                                QStringLiteral("打印（设置与预览在同一对话框，Ctrl+P）")),
+                &QToolButton::clicked, this, &MainWindow::printDocument);
     }
 
     // ---- 绘图 ----
@@ -1096,6 +1123,56 @@ bool MainWindow::exportDrawing()
     if (path.isEmpty()) return false;
 
     return writeToPath(path);
+}
+
+PlotOptions MainWindow::plotOptions() const
+{
+    PlotOptions options;
+    options.scale = m_plotScale;
+    return options;
+}
+
+void MainWindow::printDocument()
+{
+    if (!m_document || m_document->entityCount() == 0) {
+        pushMessage(QStringLiteral("图纸为空，没有可打印的内容。"));
+        return;
+    }
+
+    // 一个对话框同时完成三件事：选目标（打印机 / PDF）、设纸张与出图比例、
+    // 看预览——右边预览用的就是将要打印的那台 QPrinter 与同一段绘制代码。
+    PrintDialog dialog(m_document, m_plotScale, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    // 出图比例是文档级设置，随对话框确认持久化（预览与下次打印沿用）
+    m_plotScale = dialog.selectedScale();
+    QSettings settings;
+    settings.setValue(QStringLiteral("plot/scaleMode"),
+                      static_cast<int>(m_plotScale.mode));
+    settings.setValue(QStringLiteral("plot/customScale"), m_plotScale.custom);
+
+    QPainter painter;
+    if (!painter.begin(dialog.printer())) {
+        QMessageBox::warning(this, QStringLiteral("打印"),
+                             dialog.destination() == PrintDialog::Destination::PdfFile
+                                 ? QStringLiteral("无法写入所选的 PDF 文件。")
+                                 : QStringLiteral("无法在选定的打印设备上开始绘制。"));
+        return;
+    }
+    // 固定比例下图纸可能超出一张纸：分页逻辑在 PlotRenderer 里，
+    // 预览与打印都走它，页数与每页内容天然一致
+    renderAllPages(painter, *m_document,
+                   dialog.printer()->pageLayout().paintRectPixels(
+                       dialog.printer()->resolution()),
+                   dialog.printer()->resolution() / 25.4, dialog.plotOptions(),
+                   [printer = dialog.printer()]() { return printer->newPage(); });
+    painter.end();
+
+    if (dialog.destination() == PrintDialog::Destination::PdfFile) {
+        pushMessage(QStringLiteral("已导出 PDF：%1").arg(dialog.pdfFilePath()));
+    } else {
+        pushMessage(QStringLiteral("已提交打印：%1 份。").arg(dialog.printer()->copyCount()));
+    }
 }
 
 bool MainWindow::writeToPath(const QString& path)

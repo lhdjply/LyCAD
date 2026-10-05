@@ -28,6 +28,7 @@
         <file alias="ortho.svg">icons/ortho.svg</file>
         <file alias="point.svg">icons/point.svg</file>
         <file alias="polyline.svg">icons/polyline.svg</file>
+        <file alias="print.svg">icons/print.svg</file>
         <file alias="properties.svg">icons/properties.svg</file>
         <file alias="rectangle.svg">icons/rectangle.svg</file>
         <file alias="redo.svg">icons/redo.svg</file>
