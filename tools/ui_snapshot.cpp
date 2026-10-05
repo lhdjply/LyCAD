@@ -29,10 +29,13 @@
 #include <QDialog>
 #include <QDir>
 #include <QElapsedTimer>
-#include <QInputDialog>
+#include <QFileInfo>
 #include <QPalette>
+#include <QPlainTextEdit>
+#include <QPixmap>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QTextCursor>
 #include <QToolButton>
 #include <QUndoStack>
 #include <QTest>
@@ -171,14 +174,19 @@ int main(int argc, char* argv[])
 
         // ---- 快照 4：双击文字 → 编辑对话框 → 内容修改（可撤销） ----
         Document* doc = canvas->document();
+        // 优先挑一条**多行**文字：MTEXT 降级导入的文字内容里带换行，双击后编辑框
+        // 必须把每一行都显示出来——这正是「双击多行文字点开没有多行」要盯的场景。
+        // 文档里没有多行文字时退回第一条，至少验证单行的编辑链路。
         const EntityId textId = [doc]() -> EntityId {
             if (!doc) return kInvalidEntityId;
+            EntityId first = kInvalidEntityId;
             for (EntityId id : doc->drawOrder()) {
-                if (doc->entity(id) && doc->entity(id)->type() == EntityType::Text) {
-                    return id;
-                }
+                const Entity* entity = doc->entity(id);
+                if (!entity || entity->type() != EntityType::Text) continue;
+                if (first == kInvalidEntityId) first = id;
+                if (static_cast<const TextEntity*>(entity)->lineCount() > 1) return id;
             }
-            return kInvalidEntityId;
+            return first;
         }();
 
         if (textId == kInvalidEntityId || !doc) {
@@ -204,12 +212,38 @@ int main(int argc, char* argv[])
                 }
             }
 
-            // 预约自动应答：对话框弹出后在原有内容后追加后缀并确认
-            QTimer::singleShot(250, []() {
-                if (auto* modal = qobject_cast<QInputDialog*>(QApplication::activeModalWidget())) {
-                    modal->setTextValue(modal->textValue() + QStringLiteral("-已编辑"));
-                    modal->accept();
-                }
+            // 预约自动应答：先把「刚打开的样子」截下来，再追加后缀 → Alt+Enter 换行
+            // → 写第二行 → 再截一张 → 回车确认。截图是必需的：多行文字双击后必须
+            // **看得见多行**、Alt+Enter 必须**看得见换行**，这两点无法从文档内容断言
+            // 出来，只能看图。
+            const QString dialogShot = dir.filePath(QStringLiteral("ui_text_dialog.png"));
+            const QString editedShot = dir.filePath(QStringLiteral("ui_text_dialog_edit.png"));
+            QTimer::singleShot(250, [dialogShot, editedShot]() {
+                auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                if (!modal) return;
+
+                const auto saveShot = [](QWidget& widget, const QString& path) {
+                    const QPixmap pixmap = widget.grab();
+                    if (pixmap.isNull() || !pixmap.save(path)) return;
+                    out() << QStringLiteral("  已保存 %1  (%2×%3)")
+                                 .arg(QFileInfo(path).fileName())
+                                 .arg(pixmap.width())
+                                 .arg(pixmap.height())
+                          << Qt::endl;
+                };
+
+                saveShot(*modal, dialogShot);
+
+                auto* edit = modal->findChild<QPlainTextEdit*>();
+                if (!edit) return;
+
+                edit->setPlainText(edit->toPlainText() + QStringLiteral("-已编辑"));
+                edit->moveCursor(QTextCursor::End);
+                QTest::keyClick(edit, Qt::Key_Return, Qt::AltModifier);   // 换行
+                edit->insertPlainText(QStringLiteral("第二行"));
+                QApplication::processEvents();
+                saveShot(*modal, editedShot);
+                QTest::keyClick(edit, Qt::Key_Return, Qt::NoModifier);    // 确认
             });
 
             QTest::mouseDClick(canvas, Qt::LeftButton, Qt::NoModifier, screen);
@@ -220,13 +254,18 @@ int main(int argc, char* argv[])
                 ++failures;
             } else {
                 const QString before = contentsBefore.value(editTarget);
-                const QString after =
-                    static_cast<const TextEntity*>(doc->entity(editTarget))->content();
+                const QString expected =
+                    before + QStringLiteral("-已编辑\n第二行");
+                const auto* edited =
+                    static_cast<const TextEntity*>(doc->entity(editTarget));
+                const QString after = edited->content();
 
-                if (after == before + QStringLiteral("-已编辑")) {
-                    out() << QStringLiteral("  双击编辑链路：命中文字 #%1，\"%2\" → \"%3\"")
-                                     .arg(editTarget)
-                                     .arg(before, after)
+                if (after == expected) {
+                    out() << QStringLiteral("  双击编辑链路：命中文字 #%1，"
+                                            "原文 %2 行 → 编辑后 %3 行")
+                                 .arg(editTarget)
+                                 .arg(before.count(QLatin1Char('\n')) + 1)
+                                 .arg(edited->lineCount())
                           << Qt::endl;
 
                     // 撤销应还原原文，重做应再次生效
@@ -236,7 +275,7 @@ int main(int argc, char* argv[])
                     doc->undoStack()->redo();
                     const bool redoOk =
                         static_cast<const TextEntity*>(doc->entity(editTarget))->content()
-                            == before + QStringLiteral("-已编辑");
+                            == expected;
                     out() << QStringLiteral("  撤销/重做: %1 / %2")
                                  .arg(undoOk ? QStringLiteral("通过")
                                              : QStringLiteral("失败"),
@@ -251,7 +290,12 @@ int main(int argc, char* argv[])
                         ++failures;
                     }
                 } else {
-                    out() << QStringLiteral("  双击后文字内容未变化，编辑链路失效。") << Qt::endl;
+                    // 期望值里那半行「第二行」是 Alt+Enter 换行后才有的：内容对不上
+                    // 就意味着多行编辑或 Alt+Enter 换行失效了。
+                    out() << QStringLiteral("  双击后文字内容与预期不符（Alt+Enter 换行未生效？）"
+                                            "\n    期望: %1\n    实际: %2")
+                                 .arg(expected, after)
+                          << Qt::endl;
                     ++failures;
                 }
             }

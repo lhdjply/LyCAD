@@ -17,6 +17,7 @@
 #include "ui/PropertyChoices.h"
 #include "ui/PropertyPanel.h"
 #include "ui/RibbonBar.h"
+#include "ui/TextEditDialog.h"
 #include "ui/Theme.h"
 
 #include <QAbstractButton>
@@ -838,31 +839,36 @@ void MainWindow::connectSignals()
         refreshPanels();
     });
 
-    // ---- 双击文字 -> 就地编辑 ----
+    // ---- 双击文字 -> 编辑内容 ----
     connect(m_toolManager, &ToolManager::textEditRequested, this, [this](EntityId id) {
         Entity* entity = m_document->entity(id);
         if (!entity || entity->type() != EntityType::Text) return;
         auto* text = static_cast<TextEntity*>(entity);
 
-        bool ok = false;
-        const QString input = QInputDialog::getText(
-            this, QStringLiteral("编辑文字"),
-            QStringLiteral("内容（字高/旋转等几何属性在属性面板修改）:"),
-            QLineEdit::Normal, text->content(), &ok);
-        if (!ok) return;
+        // 多行编辑：MTEXT 降级导入的文字内容里带 '\n'，单行输入框会把它们吃掉，
+        // 而回车又直接提交，用户补不出换行。对话框内 Enter 确认、Alt+Enter 换行。
+        TextEditDialog dialog(text->content(), this);
+        if (dialog.exec() != QDialog::Accepted) return;
 
-        const QString newContent = input.trimmed();
+        // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留。
+        const QString newContent = dialog.content().trimmed();
         if (newContent.isEmpty()) {
             pushMessage(QStringLiteral("文字内容不能为空，编辑已取消。"));
             return;
         }
         if (newContent == text->content()) return;   // 未变化不产生撤销记录
 
+        // 行数会随内容变化（也可能从单行变成多行，版面与包围盒都不一样），
+        // 命令行里说清楚结果，用户不必自己数。
         auto replacement = text->clone();
-        static_cast<TextEntity*>(replacement.get())->setContent(newContent);
+        auto* edited = static_cast<TextEntity*>(replacement.get());
+        edited->setContent(newContent);
+        const int lines = edited->lineCount();
         if (m_document->replaceEntity(id, std::move(replacement),
                                       QStringLiteral("编辑文字"))) {
-            pushMessage(QStringLiteral("已编辑文字。"));
+            pushMessage(lines > 1
+                            ? QStringLiteral("已编辑文字（%1 行）。").arg(lines)
+                            : QStringLiteral("已编辑文字。"));
             refreshPanels();
         }
     });
