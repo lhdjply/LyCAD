@@ -16,6 +16,7 @@
 //  用法： lycad_ui_snapshot <输入.dxf|.dwg> <输出目录>
 // =============================================================================
 #include "core/Document.h"
+#include "core/EllipseEntity.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
@@ -176,6 +177,190 @@ int main(int argc, char* argv[])
 
         tools->cancel();
         settle(application, 120);
+
+        // ---- 快照 2b：椭圆 —— 从功能区的真实按钮进入，再用坐标落一个椭圆 ----
+        //
+        // 盯的是「工具栏里到底有没有椭圆入口」：椭圆的实体、渲染、读写都齐了，
+        // 唯独绘图面板上没有按钮时，用户看到的和「没实现」没有区别——而这类
+        // 缺口不会让任何单元测试变红，只有把按钮点一遍才暴露得出来。
+        {
+            auto* ribbonBar = window.findChild<RibbonBar*>();
+            QToolButton* ellipseButton = nullptr;
+            if (ribbonBar) {
+                for (QToolButton* button : ribbonBar->findChildren<QToolButton*>()) {
+                    if (button->text() == QStringLiteral("椭圆")) {
+                        ellipseButton = button;
+                        break;
+                    }
+                }
+            }
+
+            if (!ellipseButton) {
+                out() << QStringLiteral("  功能区「绘图」面板上没有椭圆按钮。") << Qt::endl;
+                ++failures;
+            } else if (!tools->hasCommand(QStringLiteral("ELLIPSE"))) {
+                out() << QStringLiteral("  椭圆按钮存在，但 ELLIPSE 命令没有注册。") << Qt::endl;
+                ++failures;
+            } else if (canvas->document()) {
+                Document* target = canvas->document();
+
+                // 本段要按精确坐标断言几何，先关掉对象捕捉——否则坐标点会被吸到
+                // 附近图元上，断言随即变成随机失败。用完恢复。
+                const SnapSettings savedSnap = tools->snapSettings();
+                tools->snapSettings().enabled = false;
+
+                // ① 只走视觉与方向反馈：按钮 → 定轴的第一点 → 在正方向附近移动光标
+                //    → 两点定轴 → 移动光标预览 → 截图
+                ellipseButton->click();
+                settle(application, 150);
+
+                // 光标移动直接送进工具管理器，而不是走 QTest::mouseMove：
+                // 离屏平台下合成移动会被合并/丢弃（实测三次里只有一次到达），
+                // 而这一段考察的是「工具是否把方向吸到正方向」，与事件投递无关。
+                const auto moveTo = [&](const QPoint& p) {
+                    CanvasEvent event;
+                    event.devicePos = Point2D(p.x(), p.y());
+                    event.devicePosRounded = p;
+                    event.worldPos = canvas->view().toWorld(event.devicePos);
+                    tools->handleMouseMove(event);
+                };
+
+                // 画布控件本身只有 752×754，坐标要留在画布内，预览与追踪线才完整
+                const QPoint firstPoint(150, 170);
+                QTest::mouseClick(canvas, Qt::LeftButton, Qt::NoModifier, firstPoint);
+                settle(application, 120);
+
+                // 定轴方向上「快摆平了」时应当吸附到水平/竖直，并给出文字指示。
+                // 判据是到正方向射线的**像素**垂距落在光圈（12 px）内，所以这里
+                // 特意只偏 6 px：再差一点就不该吸。
+                const auto directionSnapLabel = [&canvas]() -> QString {
+                    const std::optional<SnapResult>& snap = canvas->snapResult();
+                    if (!snap || !snap->isValid()) return QString();
+                    return snap->kind == SnapKind::Ortho ? snap->label : QString();
+                };
+
+                moveTo(QPoint(firstPoint.x() + 430, firstPoint.y() + 6));
+                settle(application, 60);
+                const QString horizontalLabel = directionSnapLabel();
+                // 抓一张「方向已吸附」的画面：过基点的长追踪线 + 「水平」标记
+                if (!capture(application, window,
+                             dir.filePath(QStringLiteral("ui_ellipse_direction.png")))) {
+                    ++failures;
+                }
+
+                moveTo(QPoint(firstPoint.x() + 6, firstPoint.y() + 430));
+                settle(application, 60);
+                const QString verticalLabel = directionSnapLabel();
+
+                // 反例：方向偏离正方向 200 px（远超光圈），不得吸附
+                moveTo(QPoint(firstPoint.x() + 430, firstPoint.y() + 200));
+                settle(application, 60);
+                const QString freeLabel = directionSnapLabel();
+
+                const bool snapOk = horizontalLabel == QStringLiteral("水平")
+                                    && verticalLabel == QStringLiteral("竖直")
+                                    && freeLabel.isEmpty();
+                out() << QStringLiteral("  椭圆轴方向吸附：偏 6 px →「%1」/「%2」，"
+                                        "偏 200 px →%3")
+                             .arg(horizontalLabel.isEmpty() ? QStringLiteral("未吸附")
+                                                            : horizontalLabel,
+                                  verticalLabel.isEmpty() ? QStringLiteral("未吸附")
+                                                          : verticalLabel,
+                                  freeLabel.isEmpty() ? QStringLiteral("未吸附（正确）")
+                                                      : freeLabel)
+                      << Qt::endl;
+                if (!snapOk) ++failures;
+
+                // 顺着水平吸附落第二点，预览就是一条水平的轴 + 竖直的短轴
+                QTest::mouseClick(canvas, Qt::LeftButton, Qt::NoModifier,
+                                  QPoint(firstPoint.x() + 430, firstPoint.y() + 6));
+                settle(application, 120);
+                moveTo(QPoint(firstPoint.x() + 180, firstPoint.y() + 130));
+                settle(application, 200);
+                if (!capture(application, window, dir.filePath(QStringLiteral("ui_ellipse_preview.png")))) {
+                    ++failures;
+                }
+                tools->cancel();
+                settle(application, 120);
+
+                // ② 按坐标精确落一个椭圆：轴端点 (100000,100000)-(100300,100000)，
+                //    另一条半轴 90 → 中心 (100150,100000)、长半轴 150、比值 0.6
+                const int undoBefore = target->undoStack()->index();
+
+                ellipseButton->click();
+                settle(application, 120);
+                tools->submitText(QStringLiteral("100000,100000"));
+                tools->submitText(QStringLiteral("100300,100000"));
+                tools->submitText(QStringLiteral("90"));
+                settle(application, 150);
+
+                const EllipseEntity* createdEllipse = nullptr;
+                for (EntityId id : target->drawOrder()) {
+                    const Entity* entity = target->entity(id);
+                    if (!entity || entity->type() != EntityType::Ellipse) continue;
+                    const auto* candidate = static_cast<const EllipseEntity*>(entity);
+                    if (std::abs(candidate->center().x - 100150.0) < 1.0) {
+                        createdEllipse = candidate;
+                    }
+                }
+
+                if (!createdEllipse) {
+                    out() << QStringLiteral("  点击椭圆按钮并输入坐标后没有生成椭圆。") << Qt::endl;
+                    ++failures;
+                } else {
+                    // 中心 / 长半轴 / 比值 / 闭合 四项各自能独立出错：
+                    // 中心错说明轴向取反，比值错说明长短轴挑错了那个，
+                    // 不闭合则说明副主轴比没被正确换算成整椭圆。
+                    const bool centerOk =
+                        std::abs(createdEllipse->center().y - 100000.0) < 1.0;
+                    const bool majorOk = std::abs(createdEllipse->majorRadius() - 150.0) < 1.0;
+                    const bool ratioOk = std::abs(createdEllipse->ratio() - 0.6) < 1e-3;
+                    const bool closedOk = createdEllipse->isClosed();
+                    const bool recordsOk = target->undoStack()->index() == undoBefore + 1;
+
+                    out() << QStringLiteral("  椭圆工具：中心 %1 / 长半轴 %2 / 副主轴比 %3 / 整椭圆 %4 "
+                                            "/ 撤销记录 %5")
+                                 .arg(centerOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      majorOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      ratioOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      closedOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      recordsOk ? QStringLiteral("+1")
+                                                : QStringLiteral("异常"))
+                          << Qt::endl;
+                    if (!centerOk || !majorOk || !ratioOk || !closedOk || !recordsOk) {
+                        ++failures;
+                    }
+                }
+
+                // ③ 退化输入（轴的两个端点重合）必须被拦下，且不留下撤销记录
+                const std::size_t beforeDegenerate = target->entityCount();
+                const int undoAtDegenerate = target->undoStack()->index();
+                tools->submitText(QStringLiteral("200000,200000"));
+                tools->submitText(QStringLiteral("200000,200000"));
+                tools->submitText(QStringLiteral("90"));
+                settle(application, 120);
+
+                const bool degenerateRejected =
+                    target->entityCount() == beforeDegenerate
+                    && target->undoStack()->index() == undoAtDegenerate;
+                out() << QStringLiteral("  椭圆退化输入（轴端点重合）：%1")
+                             .arg(degenerateRejected ? QStringLiteral("已拦下")
+                                                     : QStringLiteral("产生了图元"))
+                      << Qt::endl;
+                if (!degenerateRejected) ++failures;
+
+                tools->cancel();
+                tools->snapSettings() = savedSnap;
+                settle(application, 120);
+
+                // 后面几条链路（双击编辑、面板自检）都会数撤销记录，先把命令状态
+                // 清干净，再撤掉这个测试用的椭圆，保证后续断言不受影响
+                while (target->undoStack()->index() > undoBefore) {
+                    target->undoStack()->undo();
+                }
+                settle(application, 120);
+            }
+        }
 
         // ---- 快照 3：全选以显示高亮与夹点 ----
         if (canvas->document()) {

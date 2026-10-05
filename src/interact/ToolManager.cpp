@@ -93,6 +93,10 @@ void ToolManager::registerBuiltinTools()
                  QStringLiteral("绘制圆弧（三点 / 圆心起点终点）"),
                  [](ToolContext& c) { return std::make_unique<DrawArcTool>(c); });
 
+    registerTool(QStringLiteral("ELLIPSE"), { QStringLiteral("EL") },
+                 QStringLiteral("绘制椭圆（轴端点 [+ 另一条半轴长度] / 中心点 C）"),
+                 [](ToolContext& c) { return std::make_unique<DrawEllipseTool>(c); });
+
     registerTool(QStringLiteral("PLINE"), { QStringLiteral("PL"), QStringLiteral("POLYLINE") },
                  QStringLiteral("绘制多段线（C 闭合 / U 放弃）"),
                  [](ToolContext& c) { return std::make_unique<DrawPolylineTool>(c); });

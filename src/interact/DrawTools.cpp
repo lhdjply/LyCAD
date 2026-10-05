@@ -6,6 +6,7 @@
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
 #include "core/Document.h"
+#include "core/EllipseEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace lycad {
 
@@ -71,6 +73,85 @@ void applyDefaults(T& entity, const ToolContext& context)
 bool cursorAvailable(bool hasCursor)
 {
     return hasCursor;
+}
+
+/// 过基点的一条长虚线：用于「方向已吸附到正方向」时的追踪线。
+/// 长度取满视口对角线，两端各伸出视口外，看起来就是一条贯穿屏幕的导轨。
+void drawTrackingLine(QPainter& painter, const EntityRenderer::DrawContext& context,
+                      const Point2D& from, const Point2D& towards)
+{
+    if (!context.view) return;
+
+    const Point2D a = context.view->toDevice(from);
+    const Point2D b = context.view->toDevice(towards);
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double length = std::hypot(dx, dy);
+    if (length <= 1e-9) return;
+
+    const double span = std::hypot(context.viewport.width(), context.viewport.height());
+    const double ux = dx / length;
+    const double uy = dy / length;
+
+    QPen pen(kPreviewColor);
+    pen.setWidthF(1.0);
+    pen.setStyle(Qt::DotLine);
+    pen.setCosmetic(true);
+
+    painter.save();
+    painter.setPen(pen);
+    painter.drawLine(QPointF(a.x - ux * span, a.y - uy * span),
+                     QPointF(a.x + ux * span, a.y + uy * span));
+    painter.restore();
+}
+
+/// 半轴端点的落点标记：实心小方块（固定像素，不随缩放变化）
+void drawTipMarker(QPainter& painter, const EntityRenderer::DrawContext& context,
+                   const Point2D& world)
+{
+    if (!context.view) return;
+
+    const Point2D device = context.view->toDevice(world);
+    painter.save();
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(kPreviewColor);
+    painter.drawRect(QRectF(device.x - 2.5, device.y - 2.5, 5.0, 5.0));
+    painter.restore();
+}
+
+/// 把 base → raw 的方向吸附到四个正方向（右 / 上 / 左 / 下）。
+///
+/// 只在**光圈内**才吸：判据是光标到那条射线的垂直距离（世界单位），
+/// 光圈由像素换算而来，因此缩放多少都不影响手感——这与对象捕捉同一口径。
+/// 命中时通过 directionOut 返回吸附到的方向单位向量。
+std::optional<Point2D> snapToCardinalDirection(const Point2D& base, const Point2D& raw,
+                                               double apertureWorld, Vector2D& directionOut)
+{
+    static const Vector2D kCardinals[4] = { Vector2D(1.0, 0.0), Vector2D(0.0, 1.0),
+                                            Vector2D(-1.0, 0.0), Vector2D(0.0, -1.0) };
+
+    const Vector2D delta = raw - base;
+    // 光标贴着基点时「方向」没有意义，此时吸附等于把点钉死在基点上，反而更糟
+    if (delta.length() <= apertureWorld) return std::nullopt;
+
+    double bestOffset = std::numeric_limits<double>::max();
+    Vector2D bestDirection = kCardinals[0];
+    double bestAlong = 0.0;
+    for (const Vector2D& direction : kCardinals) {
+        const double along = dot(delta, direction);
+        if (along <= 0.0) continue;                        // 反方向的射线够不到
+        const double offset = std::abs(cross(delta, direction));   // 到该射线的垂直距离
+        if (offset < bestOffset) {
+            bestOffset = offset;
+            bestDirection = direction;
+            bestAlong = along;
+        }
+    }
+
+    if (bestOffset > apertureWorld) return std::nullopt;
+
+    directionOut = bestDirection;
+    return base + bestDirection * bestAlong;
 }
 
 } // namespace
@@ -941,6 +1022,281 @@ void DrawRectangleTool::paintOverlay(QPainter& painter, const EntityRenderer::Dr
 }
 
 void DrawRectangleTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
+//  椭圆
+// =============================================================================
+DrawEllipseTool::DrawEllipseTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawEllipseTool::name() const { return QStringLiteral("ELLIPSE"); }
+QString DrawEllipseTool::displayName() const { return QStringLiteral("椭圆"); }
+
+QString DrawEllipseTool::prompt() const
+{
+    switch (m_points.size()) {
+    case 0:
+        return m_mode == Mode::AxisEnds
+                   ? QStringLiteral("指定椭圆的轴端点 [中心(C)]:")
+                   : QStringLiteral("指定椭圆的中心点:");
+    case 1:
+        return m_mode == Mode::AxisEnds ? QStringLiteral("指定轴的另一个端点:")
+                                        : QStringLiteral("指定轴的端点:");
+    default:
+        return QStringLiteral("指定另一条半轴长度 <回车结束>:");
+    }
+}
+
+std::optional<DrawEllipseTool::Axis> DrawEllipseTool::currentAxis() const
+{
+    if (m_points.size() < 2) return std::nullopt;
+
+    Axis axis;
+    if (m_mode == Mode::AxisEnds) {
+        // 两个轴端点：中心取中点，半轴取两端点之差的一半
+        axis.center = Point2D((m_points[0].x + m_points[1].x) * 0.5,
+                              (m_points[0].y + m_points[1].y) * 0.5);
+        axis.halfAxis = Vector2D((m_points[1].x - m_points[0].x) * 0.5,
+                                 (m_points[1].y - m_points[0].y) * 0.5);
+    } else {
+        axis.center = m_points[0];
+        axis.halfAxis = Vector2D(m_points[1].x - m_points[0].x,
+                                 m_points[1].y - m_points[0].y);
+    }
+
+    if (!(axis.halfAxis.length() > kGeomTol)) return std::nullopt;   // 两点重合
+    return axis;
+}
+
+std::optional<double> DrawEllipseTool::otherHalfLengthFrom(const Point2D& reference) const
+{
+    const std::optional<Axis> axis = currentAxis();
+    if (!axis) return std::nullopt;
+
+    // 参考点到轴线的垂直距离就是「另一条半轴长度」
+    const Vector2D direction = axis->halfAxis.normalizedOr(Vector2D(1.0, 0.0));
+    const double other = std::abs(cross(reference - axis->center, direction));
+    if (!(other > kGeomTol)) return std::nullopt;
+    return other;
+}
+
+DrawEllipseTool::StepPoint DrawEllipseTool::resolveStep(const Point2D& raw) const
+{
+    StepPoint step;
+    const std::optional<Point2D> base = m_points.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_points.back());
+    step.point = resolve(raw, base);
+
+    // 正在定这条轴的方向（轴端点法的第二个点，或中心点法里从中心出发的那个点）：
+    // 方向吸附到上下左右，用户不必靠肉眼把轴摆平
+    if (m_points.size() == 1) {
+        Vector2D direction;
+        if (const std::optional<Point2D> snapped =
+                snapToCardinalDirection(m_points.front(), step.point.position,
+                                        ctx().apertureWorld(), direction)) {
+            step.point.position = *snapped;
+            step.point.kind = SnapKind::Ortho;
+            step.point.label = std::abs(direction.x) > 0.5 ? QStringLiteral("水平")
+                                                           : QStringLiteral("竖直");
+            step.directionSnapped = true;
+        }
+    }
+    return step;
+}
+
+std::unique_ptr<Entity> DrawEllipseTool::makePreview(const Point2D& reference) const
+{
+    const std::optional<Axis> axis = currentAxis();
+    const std::optional<double> other = otherHalfLengthFrom(reference);
+    if (!axis || !other) return nullptr;
+
+    const EllipseEntity::HalfAxes axes =
+        EllipseEntity::normalizeHalfAxes(axis->halfAxis, *other);
+    return std::make_unique<EllipseEntity>(axis->center,
+                                           Point2D(axes.majorAxisEnd.x, axes.majorAxisEnd.y),
+                                           axes.ratio, 0.0, kTwoPi);
+}
+
+void DrawEllipseTool::commit(const Point2D& reference)
+{
+    const std::optional<Axis> axis = currentAxis();
+    if (!axis) {
+        message(QStringLiteral("轴的两个端点重合，无法确定椭圆，已取消。"));
+        reset();
+        return;
+    }
+
+    const std::optional<double> other = otherHalfLengthFrom(reference);
+    if (!other) {
+        message(QStringLiteral("另一条半轴长度为 0（椭圆退化成线段），已忽略。"));
+        reset();
+        return;
+    }
+
+    // 用户先画的那条轴未必是长轴，交给实体的归一化助手决定谁当主轴
+    const EllipseEntity::HalfAxes axes =
+        EllipseEntity::normalizeHalfAxes(axis->halfAxis, *other);
+    auto ellipse = std::make_unique<EllipseEntity>(axis->center,
+                                                   Point2D(axes.majorAxisEnd.x,
+                                                           axes.majorAxisEnd.y),
+                                                   axes.ratio, 0.0, kTwoPi);
+    applyDefaults(*ellipse, ctx());
+    ctx().document->addEntity(std::move(ellipse));
+
+    message(QStringLiteral("已创建椭圆：长半轴 %1，短半轴 %2")
+                .arg(axes.majorAxisEnd.length(), 0, 'g', 6)
+                .arg(axes.majorAxisEnd.length() * axes.ratio, 0, 'g', 6));
+
+    reset();
+}
+
+void DrawEllipseTool::reset()
+{
+    // 与圆工具一致：一次绘制结束后回到默认方式，选项 C 只对本次生效
+    m_mode = Mode::AxisEnds;
+    m_points.clear();
+    m_directionSnapped = false;
+    notifyPromptChanged();
+    repaint();
+}
+
+bool DrawEllipseTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const ResolvedPoint resolved = resolveStep(event.worldPos).point;
+
+    if (m_points.size() < 2) {
+        m_points.push_back(resolved.position);
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    commit(resolved.position);   // 第三点只用来量长度，不落在图上
+    return true;
+}
+
+bool DrawEllipseTool::mouseMove(const CanvasEvent& event)
+{
+    const StepPoint step = resolveStep(event.worldPos);
+    m_cursor = step.point;
+    m_hasCursor = true;
+    m_directionSnapped = step.directionSnapped;
+
+    std::optional<SnapResult> marker;
+    if (step.directionSnapped || m_cursor.isObjectSnap()) {
+        marker = m_cursor.toSnapResult();          // 「水平 / 竖直」或对象捕捉
+    } else if (const std::optional<Axis> axis = currentAxis()) {
+        // 定另一条半轴时，把光标沿垂直方向投到该轴上并标出来：
+        // 这一步量的是「垂距」，光标本身可以离得很远，投影点才是真正在量的位置
+        const Vector2D normal = axis->halfAxis.normalizedOr(Vector2D(1.0, 0.0)).perpendicular();
+        const double along = dot(m_cursor.position - axis->center, normal);
+        marker = SnapResult{ axis->center + normal * along, SnapKind::Perpendicular,
+                             QStringLiteral("半轴") };
+    }
+    ctx().setSnapMarker(marker);
+
+    repaint();
+    return true;
+}
+
+bool DrawEllipseTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return
+        || event->key() == Qt::Key_Enter) {
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool DrawEllipseTool::textInput(const QString& text)
+{
+    // 第一步的选项：C 改用中心点方式
+    if (m_points.empty() && matchesOption(text, QStringLiteral("C"))) {
+        m_mode = Mode::Center;
+        message(QStringLiteral("中心点方式：先指定中心，再指定一个轴的端点。"));
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    const std::optional<Point2D> base = m_points.empty()
+        ? std::nullopt
+        : std::optional<Point2D>(m_points.back());
+
+    if (m_points.size() < 2) {
+        const std::optional<Point2D> point = parsePointInput(text, base);
+        if (!point) return true;
+
+        // 直接收下这个点，不走 mousePress：键盘输入的数字是「我要这个精确值」
+        // 的意思，不该被方向吸附改掉（吸附只服务于鼠标的模糊指向）
+        m_points.push_back(*point);
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    // 第三步是长度而不是点：把长度折成「沿垂直方向偏移该长度的一点」
+    const std::optional<double> length =
+        parseScalarInput(text, QStringLiteral("另一条半轴长度"));
+    if (!length) return true;
+
+    const std::optional<Axis> axis = currentAxis();
+    if (!axis) {
+        message(QStringLiteral("轴的两个端点重合，无法确定椭圆，已取消。"));
+        reset();
+        return true;
+    }
+    const Vector2D normal = axis->halfAxis.normalizedOr(Vector2D(1.0, 0.0)).perpendicular();
+    commit(axis->center + normal * (*length));
+    return true;
+}
+
+void DrawEllipseTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    if (!m_hasCursor || m_points.empty()) return;
+
+    // 轴还没定：橡皮筋 + （吸附到正方向时）过基点的长追踪线
+    if (m_points.size() == 1) {
+        drawRubberBand(painter, context, m_points.front(), m_cursor.position);
+        if (m_directionSnapped) {
+            drawTrackingLine(painter, context, m_points.front(), m_cursor.position);
+        }
+        return;
+    }
+
+    const std::optional<Axis> axis = currentAxis();
+    if (!axis) return;
+
+    // 轴已定：整条轴画全（中心 ± 半轴），中心点法下这样才对称
+    const Vector2D direction = axis->halfAxis.normalizedOr(Vector2D(1.0, 0.0));
+    const Vector2D normal = direction.perpendicular();
+    drawRubberBand(painter, context, axis->center - direction * axis->halfAxis.length(),
+                   axis->center + direction * axis->halfAxis.length());
+
+    // 另一条半轴：端点标出来，让人一眼看清椭圆会伸到哪里
+    if (const std::optional<double> other = otherHalfLengthFrom(m_cursor.position)) {
+        const Point2D tipA = axis->center - normal * (*other);
+        const Point2D tipB = axis->center + normal * (*other);
+        drawRubberBand(painter, context, tipA, tipB);
+        drawTipMarker(painter, context, tipA);
+        drawTipMarker(painter, context, tipB);
+    }
+
+    if (std::unique_ptr<Entity> preview = makePreview(m_cursor.position)) {
+        drawPreviewEntity(painter, *preview, context);
+    }
+}
+
+void DrawEllipseTool::deactivate()
 {
     ctx().setSnapMarker(std::nullopt);
 }

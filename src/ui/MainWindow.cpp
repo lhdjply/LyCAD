@@ -267,6 +267,7 @@ void MainWindow::createMenus()
         { "多段线(&P)", "PLINE" },
         { "圆(&C)", "CIRCLE" },
         { "圆弧(&A)", "ARC" },
+        { "椭圆(&E)", "ELLIPSE" },
         { "矩形(&R)", "RECTANGLE" },
         { "点(&O)", "POINT" },
         { nullptr, "" },                    // 分隔线
@@ -476,6 +477,8 @@ void MainWindow::createRibbon()
                                QStringLiteral("CIRCLE"), QStringLiteral("圆 (CIRCLE / C)"));
         panel->addLargeCommand(QStringLiteral("arc"), QStringLiteral("圆弧"),
                                QStringLiteral("ARC"), QStringLiteral("圆弧 (ARC / A)"));
+        panel->addLargeCommand(QStringLiteral("ellipse"), QStringLiteral("椭圆"),
+                               QStringLiteral("ELLIPSE"), QStringLiteral("椭圆 (ELLIPSE / EL)"));
         panel->addSeparator();
         panel->addSmallCommand(QStringLiteral("rectangle"), QStringLiteral("矩形"),
                                QStringLiteral("RECTANGLE"), QStringLiteral("矩形 (RECTANGLE / REC)"));

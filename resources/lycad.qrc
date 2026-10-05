@@ -12,6 +12,7 @@
         <file alias="dim-diameter.svg">icons/dim-diameter.svg</file>
         <file alias="dim-linear.svg">icons/dim-linear.svg</file>
         <file alias="dim-radius.svg">icons/dim-radius.svg</file>
+        <file alias="ellipse.svg">icons/ellipse.svg</file>
         <file alias="erase.svg">icons/erase.svg</file>
         <file alias="grid.svg">icons/grid.svg</file>
         <file alias="hatch.svg">icons/hatch.svg</file>

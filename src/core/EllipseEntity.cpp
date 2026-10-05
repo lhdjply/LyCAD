@@ -24,6 +24,25 @@ int segmentCountForEllipse(double majorRadius, double span, double sagitta) noex
 
 } // namespace
 
+EllipseEntity::HalfAxes EllipseEntity::normalizeHalfAxes(const Vector2D& halfAxis,
+                                                        double otherHalfLength)
+{
+    const double a = halfAxis.length();
+    const double b = std::abs(otherHalfLength);
+
+    if (!(a > 0.0) || !(b > 0.0) || !std::isfinite(a) || !std::isfinite(b)) {
+        return HalfAxes{};
+    }
+    if (a >= b) {
+        return HalfAxes{ halfAxis, b / a };
+    }
+    // 用户指定的那条轴其实更短：主轴换成与它垂直的那条（长度 b），
+    // 方向取指定轴的逆时针 90°——椭圆是中心对称的，两个方向等价
+    const Vector2D perpendicular = halfAxis.perpendicular();
+    const Vector2D major = perpendicular.normalizedOr(Vector2D(1.0, 0.0)) * b;
+    return HalfAxes{ major, a / b };
+}
+
 EllipseEntity::EllipseEntity() : Entity(EntityType::Ellipse) {}
 
 EllipseEntity::EllipseEntity(const Point2D& center, const Point2D& majorAxisEnd,

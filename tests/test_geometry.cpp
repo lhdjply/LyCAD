@@ -7,6 +7,7 @@
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
+#include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
 #include "core/LineEntity.h"
 #include "core/PolylineEntity.h"
@@ -42,6 +43,10 @@ private slots:
     void polylineMirrorFlipsBulgeSign();
     void rectangleIsClosedPolyline();
     void polylineWidthSemantics();
+
+    // ---- 椭圆 ---------------------------------------------------------------
+    void ellipseHalfAxesNormalization();
+    void ellipseBoundsAndSnapPoints();
 
     // ---- 文字 / 填充 / 标注 ---------------------------------------------------
     void textBoundingBoxAndAlignment();
@@ -457,6 +462,75 @@ void TestGeometry::polylineWidthSemantics()
     const Box2D taperBox = taper.boundingBox();
     QVERIFY(std::abs(taperBox.minY - (-1.5)) < 1e-9);
     QVERIFY(std::abs(taperBox.maxY - 1.5) < 1e-9);
+}
+
+// -----------------------------------------------------------------------------
+//  椭圆
+// -----------------------------------------------------------------------------
+void TestGeometry::ellipseHalfAxesNormalization()
+{
+    // 先画的那条轴是长轴：主轴就是它，比值 = 短/长
+    EllipseEntity::HalfAxes axes =
+        EllipseEntity::normalizeHalfAxes(Vector2D(50.0, 0.0), 30.0);
+    QVERIFY(std::abs(axes.majorAxisEnd.x - 50.0) < 1e-12);
+    QVERIFY(std::abs(axes.majorAxisEnd.y) < 1e-12);
+    QVERIFY(std::abs(axes.ratio - 0.6) < 1e-12);
+
+    // 先画的那条轴反而是短轴：主轴要换成与它垂直的那条，比值 < 1
+    //（漏掉这一步会让 40 组码 > 1 被夹成 1，椭圆退化成一条线段）
+    axes = EllipseEntity::normalizeHalfAxes(Vector2D(30.0, 0.0), 50.0);
+    QVERIFY(std::abs(axes.majorAxisEnd.x) < 1e-12);
+    QVERIFY(std::abs(axes.majorAxisEnd.y - 50.0) < 1e-12);
+    QVERIFY(std::abs(axes.ratio - 0.6) < 1e-12);
+
+    // 指定的轴是斜的：主轴方向随之旋转，而不是回到坐标轴
+    axes = EllipseEntity::normalizeHalfAxes(Vector2D(3.0, 4.0), 100.0);
+    QVERIFY(std::abs(axes.majorAxisEnd.length() - 100.0) < 1e-9);
+    QVERIFY(std::abs(axes.ratio - 0.05) < 1e-12);
+    // 垂直关系：主轴与指定的轴点积为 0
+    QVERIFY(std::abs(dot(axes.majorAxisEnd, Vector2D(3.0, 4.0))) < 1e-9);
+
+    // 退化输入：任一半轴为 0 时不给出可用的椭圆（调用方负责拦下并提示）
+    axes = EllipseEntity::normalizeHalfAxes(Vector2D(0.0, 0.0), 30.0);
+    QVERIFY(axes.majorAxisEnd.length() == 0.0);
+    axes = EllipseEntity::normalizeHalfAxes(Vector2D(50.0, 0.0), 0.0);
+    QVERIFY(axes.majorAxisEnd.length() == 0.0);
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::ellipseBoundsAndSnapPoints()
+{
+    // 长半轴 50 沿 +x、比值 0.5（短半轴 25）的整椭圆
+    const EllipseEntity ellipse(Point2D(10.0, 20.0), Point2D(50.0, 0.0),
+                                0.5, 0.0, kTwoPi);
+
+    QVERIFY(ellipse.isClosed());
+    QVERIFY(std::abs(ellipse.majorRadius() - 50.0) < 1e-12);
+    QVERIFY(std::abs(ellipse.minorRadius() - 25.0) < 1e-12);
+    QVERIFY(std::abs(ellipse.majorAxisAngle()) < 1e-12);
+
+    const Box2D box = ellipse.boundingBox();
+    QVERIFY(std::abs(box.minX - (-40.0)) < 1e-9);
+    QVERIFY(std::abs(box.maxX - 60.0) < 1e-9);
+    QVERIFY(std::abs(box.minY - (-5.0)) < 1e-9);
+    QVERIFY(std::abs(box.maxY - 45.0) < 1e-9);
+
+    // 捕捉点：中心 + 长短轴四个端点
+    const std::vector<Point2D> snaps = ellipse.snapPoints();
+    QCOMPARE(snaps.size(), std::size_t(5));
+    QVERIFY(snaps.front() == Point2D(10.0, 20.0));
+    QVERIFY(std::abs(snaps[1].x - 60.0) < 1e-9);      // +主轴
+    QVERIFY(std::abs(snaps[2].x - (-40.0)) < 1e-9);   // −主轴
+    QVERIFY(std::abs(snaps[3].y - 45.0) < 1e-9);      // +副轴
+    QVERIFY(std::abs(snaps[4].y - (-5.0)) < 1e-9);    // −副轴
+
+    // 边界上的点距离为 0（容差取 2e-3：椭圆没有解析的最近点，走的是基类按
+    // 弦高 1e-3 离散后的折线求最近点，误差就是这个量级），
+    // 中心到边界即短半轴
+    const double onCurveTol = 2e-3;
+    QVERIFY(ellipse.distanceTo(Point2D(60.0, 20.0)) < onCurveTol);
+    QVERIFY(ellipse.distanceTo(Point2D(10.0, 45.0)) < onCurveTol);
+    QVERIFY(std::abs(ellipse.distanceTo(Point2D(10.0, 20.0)) - 25.0) < onCurveTol);
 }
 
 // -----------------------------------------------------------------------------
