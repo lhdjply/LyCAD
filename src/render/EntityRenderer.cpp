@@ -351,15 +351,13 @@ void drawPolylineWithVaryingWidth(QPainter& painter, const PolylineEntity& polyl
             const Point2D endDevice = context.view->toDevice(seg.end);
             segPath.lineTo(endDevice.x, endDevice.y);
         } else {
-            // 与 flatten 同策略：按 bulge 符号决定行进方向
-            double a0 = seg.startAngle;
-            double a1 = seg.endAngle;
-            if (seg.bulge < 0.0) std::swap(a0, a1);
+            // 与 flatten 同策略：自起始角出发，按 bulge 的符号决定推进方向
             const double span = seg.spanAngle();
+            const double direction = (seg.bulge >= 0.0) ? 1.0 : -1.0;
             const int steps = std::max(2, segmentCountForArc(seg.radius, span, sagitta));
             const double step = span / steps;
             for (int k = 1; k <= steps; ++k) {
-                const double a = a0 + step * k;
+                const double a = seg.startAngle + direction * step * k;
                 const Point2D world(seg.center.x + seg.radius * std::cos(a),
                                     seg.center.y + seg.radius * std::sin(a));
                 const Point2D d = context.view->toDevice(world);

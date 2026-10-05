@@ -38,6 +38,7 @@ private slots:
 
     // ---- 多段线与凸度 -------------------------------------------------------
     void polylineBulgeSemicircle();
+    void polylineClockwiseBulgeIsNotMirrored();
     void polylineMirrorFlipsBulgeSign();
     void rectangleIsClosedPolyline();
     void polylineWidthSemantics();
@@ -282,6 +283,94 @@ void TestGeometry::polylineBulgeSemicircle()
     for (const Point2D& p : points) {
         QVERIFY(std::abs(p.distanceTo(Point2D(1.0, 0.0)) - 1.0) < 1e-6);
     }
+}
+
+// 顺时针圆弧（负凸度）的圆心必须在弦的**右侧**。
+//
+// 这里曾用一个看似等价的式子算圆心：h = R·cos(θ/2)。半径是按 |sin| 算的，
+// 而 cos 是偶函数，于是负 θ 时 h 符号相反——圆心落到弦的另一侧，画出来正好是
+// 正确圆弧的补弧：顺时针 90° 的圆角变成 270° 的大弧，看上去就是「圆弧反了」
+// （PCB 图纸里电容/器件的圆角、键帽轮廓最容易看出来）。
+// 半圆与逆时针圆弧都不受影响，所以这个错误只在部分圆弧上露头。
+void TestGeometry::polylineClockwiseBulgeIsNotMirrored()
+{
+    // 自 (0,0) 到 (1,0) 的顺时针 90° 圆弧：bulge = tan(θ/4) = tan(-22.5°)
+    // （PCB 图纸里器件的圆角就是这个形状，bulge ≈ -0.414）
+    PolylineEntity polyline;
+    polyline.appendVertex(Point2D(0.0, 0.0), -std::tan(kPi / 8.0));
+    polyline.appendVertex(Point2D(1.0, 0.0));
+
+    const auto segment = polyline.segment(0);
+    QVERIFY(segment.has_value());
+    QVERIFY(segment->isArc);
+
+    // θ = -90°，R = 弦长 / (2·sin(45°))
+    const double radius = 1.0 / (2.0 * std::sin(kPi / 4.0));
+    QVERIFY(std::abs(segment->radius - radius) < 1e-9);
+
+    // 圆心在弦的右侧（y 为负）：到弦中点的有向距离 = (L/2)·cot(θ/2)
+    const double expectedOffset = 0.5 / std::tan(-kPi / 4.0);
+    QVERIFY2(segment->center.distanceTo(Point2D(0.5, expectedOffset)) < 1e-9,
+             qPrintable(QStringLiteral("圆心 (\%1, \%2)，期望 (0.5, \%3)")
+                            .arg(segment->center.x).arg(segment->center.y)
+                            .arg(expectedOffset)));
+
+    // 弧顶在弦上方 0.2071（顺时针弧朝上鼓）；若圆心算反，弧顶会跑到下方
+    const Point2D middle = segment->middlePoint();
+    QVERIFY(std::abs(middle.y - (expectedOffset + radius)) < 1e-9);
+    QVERIFY(middle.y > 0.0);
+
+    // 包围盒必须罩住真实圆弧，而不是它的补弧
+    const Box2D box = polyline.boundingBox();
+    QVERIFY(std::abs(box.minY - 0.0) < 1e-9);
+    QVERIFY(std::abs(box.maxY - (expectedOffset + radius)) < 1e-9);
+    QVERIFY(std::abs(box.minX - 0.0) < 1e-9);
+    QVERIFY(std::abs(box.maxX - 1.0) < 1e-9);
+
+    // 弧长 = R·|θ|；起止点仍落在弦的两端
+    QVERIFY(std::abs(polyline.length() - radius * kPi / 2.0) < 1e-9);
+
+    const std::vector<Point2D> points = polyline.flatten(1e-4);
+    QVERIFY(points.size() > 4);
+    QVERIFY(points.front().distanceTo(Point2D(0.0, 0.0)) < 1e-9);
+    QVERIFY(points.back().distanceTo(Point2D(1.0, 0.0)) < 1e-9);
+    for (const Point2D& p : points) {
+        QVERIFY(std::abs(p.distanceTo(segment->center) - radius) < 1e-6);
+    }
+
+    // 多段线的链条不能断：把直线段接在圆弧后面，离散点必须仍按顶点顺序前进。
+    // （曾经「交换起止角再逆时针走」的写法会让圆弧段的点序从终点折回起点，
+    //  于是相邻两段之间会多出一条横穿的直线。）
+    {
+        PolylineEntity chained;
+        chained.appendVertex(Point2D(0.0, 0.0), -std::tan(kPi / 8.0));
+        chained.appendVertex(Point2D(1.0, 0.0));
+        chained.appendVertex(Point2D(1.0, -1.0));
+
+        const std::vector<Point2D> path = chained.flatten(1e-4);
+        QVERIFY(path.size() > 5);
+        QVERIFY(path.front().distanceTo(Point2D(0.0, 0.0)) < 1e-9);
+        QVERIFY(path.back().distanceTo(Point2D(1.0, -1.0)) < 1e-9);
+
+        double walked = 0.0;
+        for (std::size_t i = 1; i < path.size(); ++i) {
+            walked += path[i - 1].distanceTo(path[i]);
+        }
+        QVERIFY2(std::abs(walked - chained.length()) < 1e-3,
+                 qPrintable(QStringLiteral("离散路径长度 %1，折线长度 %2（链条断开）")
+                                .arg(walked).arg(chained.length())));
+    }
+
+    // 离散点必须沿顺时针方向自起点走到终点（总转角为 -90°）
+    const Vector2D startAnglePoint = points.front() - segment->center;
+    const Vector2D endAnglePoint = points.back() - segment->center;
+    double sweep = std::atan2(endAnglePoint.y, endAnglePoint.x)
+                   - std::atan2(startAnglePoint.y, startAnglePoint.x);
+    while (sweep > kPi) sweep -= 2.0 * kPi;
+    while (sweep < -kPi) sweep += 2.0 * kPi;
+    QVERIFY2(std::abs(sweep + kPi / 2.0) < 1e-6,
+             qPrintable(QStringLiteral("实际跨度 %1°，期望 -90°")
+                            .arg(sweep * 180.0 / kPi)));
 }
 
 void TestGeometry::polylineMirrorFlipsBulgeSign()

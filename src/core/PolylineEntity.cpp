@@ -38,7 +38,12 @@ void expandBoxWithArc(Box2D& box, const PolylineSegment& seg)
 double PolylineSegment::spanAngle() const
 {
     if (!isArc) return 0.0;
-    const double span = normalizeAngle(endAngle - startAngle);
+    // 逆时针圆弧（正凸度）：跨度就是 start→end 的逆时针角。
+    // 顺时针圆弧（负凸度）：真实跨度是它的**补角**——start→end 的逆时针角此时
+    // 是「绕远路」的那一段（例如顺时针 90° 量出来是 270°）。
+    // 漏掉这一步会让顺时针圆弧按补弧绘制，也就是常见的「圆弧反了」。
+    const double counterClockwise = normalizeAngle(endAngle - startAngle);
+    const double span = (bulge >= 0.0) ? counterClockwise : (kTwoPi - counterClockwise);
     return span <= kEpsilon ? kTwoPi : span;
 }
 
@@ -152,9 +157,14 @@ PolylineSegment PolylineEntity::makeSegment(const Point2D& start, const Point2D&
 
     seg.radius = chord / (2.0 * sinHalf);
 
-    // 圆心到弦中点的有向距离 h = R·cos(θ/2)，沿弦的左法向度量。
-    // 已由 bulge 的符号约定保证：正 bulge（逆时针）时圆心位于弦的左侧。
-    const double h = seg.radius * std::cos(theta * 0.5);
+    // 圆心到弦中点的有向距离 h = (L/2)·cot(θ/2)，沿弦的左法向度量。
+    // 符号由 θ 的符号定：θ>0（逆时针）时圆心在弦左侧，θ<0（顺时针）时在右侧。
+    //
+    // 这里**不能**写成 R·cos(θ/2)：半径是按 |sin| 算的，而 cos 是偶函数，
+    // 于是负 θ 会得到相反的符号——圆心跑到弦的另一侧，画出来正好是正确圆弧的
+    // 补弧（顺时针 90° 的圆角变成 270° 的大弧，看上去就是「圆弧反了」）。
+    // 半圆（|θ|=180°）与逆时针圆弧不受影响，所以这种错只在一部分圆弧上露头。
+    const double h = (chord * 0.5) / std::tan(theta * 0.5);
     const Vector2D dir = (seg.end - seg.start) / chord;
     const Vector2D normal = dir.perpendicular();
     const Point2D mid((seg.start.x + seg.end.x) * 0.5, (seg.start.y + seg.end.y) * 0.5);
@@ -444,17 +454,16 @@ std::vector<Point2D> PolylineEntity::flatten(double sagitta) const
             continue;
         }
 
-        // 圆弧段：按 bulge 符号决定行进方向
-        double a0 = seg->startAngle;
-        double a1 = seg->endAngle;
-        if (seg->bulge < 0.0) std::swap(a0, a1);
-
+        // 圆弧段：自**起始角**出发，按 bulge 的符号决定推进方向
+        // （正=逆时针，负=顺时针）。不能写成「交换起止角再逆时针走」——
+        // 那样点序会从终点走回起点，多段线的链条在段与段之间就断了。
         const double span = seg->spanAngle();
+        const double direction = (seg->bulge >= 0.0) ? 1.0 : -1.0;
         const int n = segmentCountForArc(seg->radius, span, sagitta);
         const double step = span / n;
         const int beginIdx = firstSegment ? 0 : 1;   // 避免与上一段末点重复
         for (int k = beginIdx; k <= n; ++k) {
-            const double a = a0 + step * k;
+            const double a = seg->startAngle + direction * step * k;
             pts.push_back(Point2D(seg->center.x + seg->radius * std::cos(a),
                                   seg->center.y + seg->radius * std::sin(a)));
         }

@@ -234,16 +234,14 @@ std::vector<Point2D> HatchEntity::flatten(double sagitta) const
 
         if (!seg.isArc) continue;
 
-        // 与多段线离散同策略：按 bulge 符号决定行进方向
-        double a0 = seg.startAngle;
-        double a1 = seg.endAngle;
-        if (seg.bulge < 0.0) std::swap(a0, a1);
-
+        // 与多段线离散同策略：自起始角出发，按 bulge 的符号决定推进方向。
+        // 不能「交换起止角再逆时针走」——那会让点序从终点折回起点，边界自交。
         const double span = seg.spanAngle();
+        const double direction = (seg.bulge >= 0.0) ? 1.0 : -1.0;
         const int steps = segmentCountForArc(seg.radius, span, sagg);
         const double step = span / steps;
         for (int k = 1; k < steps; ++k) {
-            const double a = a0 + step * k;
+            const double a = seg.startAngle + direction * step * k;
             pts.push_back(Point2D(seg.center.x + seg.radius * std::cos(a),
                                   seg.center.y + seg.radius * std::sin(a)));
         }
