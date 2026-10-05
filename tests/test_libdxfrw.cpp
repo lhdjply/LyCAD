@@ -152,6 +152,8 @@ private slots:
     void readsPolylineBulge();
     void readsDimensionDefinitionPoints();
     void outOfRangeCoordinatesAreSkipped();
+    void writtenHatchBoundaryKeepsBulgeSlots();
+    void writtenHatchPatternDefinitionRoundTrips();
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
     void writtenActiveViewportCoversDrawing();
@@ -526,6 +528,101 @@ void TestLibDxfRw::outOfRangeCoordinatesAreSkipped()
         if (warning.contains(QStringLiteral("坐标超出范围"))) reported = true;
     }
     QVERIFY2(reported, "跳过了坐标异常的图元却没有如实上报");
+}
+
+// -----------------------------------------------------------------------------
+//  填充写出：带凸度的边界必须「每个顶点都写 42 组码」。
+//
+//  只给非零凸度的顶点写 42 的稀疏写法，会让 GstarCAD 的填充边界解析错位：
+//  实测同一份文件只把零凸度的 42 组码删掉，打开就是一大片乱纹盖住整张图
+//  （选中它时属性面板显示面积为 0）。无凸度时（72=0）不写 42，与 AutoCAD 一致。
+void TestLibDxfRw::writtenHatchBoundaryKeepsBulgeSlots()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // 一个带圆角的四边形：第 1、3 段是圆弧，其余是直线
+    std::vector<Point2D> boundary{{0.0, 0.0}, {20.0, 0.0}, {20.0, 10.0}, {0.0, 10.0}};
+    std::vector<double> bulges{0.0, 0.4142135623730951, 0.0, 0.4142135623730951};
+    Document source;
+    auto hatch = std::make_unique<HatchEntity>(boundary, bulges);
+    hatch->setPatternName(QStringLiteral("ANSI31"));
+    hatch->setPatternScale(0.5);
+    source.addEntity(std::move(hatch));
+
+    const QString path = dir.filePath(QStringLiteral("hatch.dxf"));
+    DxfCodec dxf;
+    QVERIFY(dxf.write(path, source, r2000Options()).ok);
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QString text = QString::fromLatin1(file.readAll());
+    file.close();
+
+    // 取出 HATCH 记录里边界那一段（91 之后、97 之前）
+    const int hatchAt = text.indexOf(QStringLiteral("AcDbHatch"));
+    QVERIFY(hatchAt > 0);
+    const int boundaryAt = text.indexOf(QStringLiteral("\n 93\n"), hatchAt);
+    QVERIFY(boundaryAt > 0);
+    const int endAt = text.indexOf(QStringLiteral("\n 97\n"), boundaryAt);
+    QVERIFY(endAt > boundaryAt);
+    const QString section = text.mid(boundaryAt, endAt - boundaryAt);
+
+    // 93 = 顶点数；42 的个数必须与它相等（不能只写非零的那几个）
+    const QRegularExpression vertexCount(QStringLiteral("\\n 93\\n\\s*(\\d+)"));
+    const QRegularExpressionMatch match = vertexCount.match(section);
+    QVERIFY(match.hasMatch());
+    const int declared = match.captured(1).toInt();
+    QCOMPARE(section.count(QStringLiteral("\n 42\n")), declared);
+}
+
+// -----------------------------------------------------------------------------
+//  填充图案定义：文件里带来的定义（角度 + 间距）必须随文件走完一个来回。
+//
+//  只写图案名、不写定义（78 组码为 0）时，实测 GstarCAD 会把填充画成一大片
+//  乱纹；定义里的偏移还必须换算到「图案线坐标系」，并且写出的间距要乘回比例，
+//  否则密度与原图不符。模型内部统一按「已经乘过比例的最终间距」保存。
+void TestLibDxfRw::writtenHatchPatternDefinitionRoundTrips()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const std::vector<Point2D> boundary{{0.0, 0.0}, {40.0, 0.0}, {40.0, 20.0}, {0.0, 20.0}};
+    Document source;
+    auto hatch = std::make_unique<HatchEntity>(boundary);
+    hatch->setPatternName(QStringLiteral("ANSI31"));
+    hatch->setPatternScale(0.5);
+
+    HatchEntity::PatternLine line;
+    line.angle = kPi / 4.0;
+    line.offset = Point2D(0.0, 3.175);        // 最终间距 3.175（比例之外的部分由文件携带）
+    line.base = Point2D(-12392.0, -720.0);    // 远基点：写出时必须归零
+    hatch->setPatternLines({line});
+    source.addEntity(std::move(hatch));
+
+    const QString path = dir.filePath(QStringLiteral("hatch_pattern.dxf"));
+    DxfCodec dxf;
+    QVERIFY(dxf.write(path, source, r2000Options()).ok);
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QString text = QString::fromLatin1(file.readAll());
+    file.close();
+    QVERIFY2(text.contains(QStringLiteral("\n 78\n    1\n")), "没有写出图案定义线条数");
+    QVERIFY2(text.contains(QStringLiteral("\n 53\n45\n")), "没有写出图案线角度");
+    // 偏移必须是图案线坐标系里的 (0, 间距/比例)
+    QVERIFY2(text.contains(QStringLiteral("\n 45\n0\n")), "偏移没有落在图案线坐标系里");
+    QVERIFY2(text.contains(QStringLiteral("\n 46\n6.35\n")), "偏移没有按比例换算");
+
+    Document loaded;
+    QVERIFY(readDxfWithLibDxfRw(path, loaded).ok);
+    QCOMPARE(loaded.entityCount(), std::size_t(1));
+    const auto* readBack = static_cast<const HatchEntity*>(loaded.entity(loaded.drawOrder().front()));
+    QVERIFY(readBack != nullptr);
+    QCOMPARE(readBack->patternLines().size(), std::size_t(1));
+    // 读回来仍是「最终间距」：定义偏移 6.35 × 比例 0.5 = 3.175
+    QVERIFY(std::abs(readBack->patternLines().front().angle - kPi / 4.0) < kTol);
+    QVERIFY(std::abs(readBack->definedSpacing() - 3.175) < 1e-9);
 }
 
 void TestLibDxfRw::readsDwgSample()

@@ -71,14 +71,32 @@ void HatchEntity::setPatternScale(double scale)
     m_scale = scale > kGeomTol ? scale : 1.0;
 }
 
+double HatchEntity::definedSpacing() const noexcept
+{
+    // 定义线的偏移是向量，相邻平行线的间距就是它的长度（垂直于线方向量取）。
+    // 约定：存进来的偏移是**已经乘过比例的最终间距**，与 m_scale 无关，
+    // 两条读取路径都换算到这个口径（见 LibDxfRwAdapter 的读取处）。
+    for (const PatternLine& line : m_patternLines) {
+        const double spacing = std::hypot(line.offset.x, line.offset.y);
+        if (spacing > kGeomTol) return spacing;
+    }
+    return 0.0;
+}
+
 double HatchEntity::patternSpacing() const noexcept
 {
+    // 文件带着图案定义时按源图的间距画（保真），否则退回内置的 ANSI31 间距
+    const double defined = definedSpacing();
+    if (defined > kGeomTol) return defined;
     return kAnsi31BaseSpacing * m_scale;
 }
 
 double HatchEntity::patternLineAngle() const noexcept
 {
-    // 目前内置的平行线图案（ANSI31 系）基准方向均为 45°
+    // 有定义线时用它的角度；否则按内置的 ANSI31 系（基准方向均为 45°）
+    if (!m_patternLines.empty()) {
+        return normalizeAngle(m_patternLines.front().angle + m_angle);
+    }
     return normalizeAngle(kAnsi31BaseAngle + m_angle);
 }
 
@@ -127,6 +145,7 @@ std::unique_ptr<Entity> HatchEntity::clone() const
     copy->m_patternName  = m_patternName;
     copy->m_scale        = m_scale;
     copy->m_angle        = m_angle;
+    copy->m_patternLines = m_patternLines;
     copyCommonPropertiesTo(*copy);
     return copy;
 }

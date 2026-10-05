@@ -947,7 +947,11 @@ bool dxfRW::writeHatch(DRW_Hatch *ent){
                         DRW_Vertex2D *v = pl->vertlist.at(i);
                         writer->writeDouble(10, v->x);
                         writer->writeDouble(20, v->y);
-                        if (v->bulge != 0.0)
+                        // 有凸度时**每个**顶点都要带 42 组码（无凸度写 0），不能只写
+                        // 非零的那几个：实测 GstarCAD 的填充边界解析会因此错位，把
+                        // 填充画成一大片乱纹盖住整张图（同一文件只删掉这些 0 值 42
+                        // 组码即可复现）。无凸度时（72=0）则不写 42，与 AutoCAD 一致。
+                        if (hasBulge)
                             writer->writeDouble(42, v->bulge);
                     }
                     writer->writeInt16(97, 0);
@@ -1006,11 +1010,26 @@ bool dxfRW::writeHatch(DRW_Hatch *ent){
             writer->writeDouble(52, ent->angle);
             writer->writeDouble(41, ent->scale);
             writer->writeInt16(77, ent->doubleflag);
+            // 图案定义线：78 组码的条数必须与随后真正写出的定义一致。
+            // 上游只写条数、内容一律不写（下面那段是注释掉的），于是文件里的
+            // 非实体填充成了「有图案名、无定义」——实测 GstarCAD 会把它画成
+            // 一片乱纹盖住整张图，点一下重生成才恢复。
+            ent->deflines = static_cast<int>(ent->deflist.size());
             writer->writeInt16(78, ent->deflines);
+            for (std::vector<DRW_HatchDefLine>::const_iterator it = ent->deflist.begin();
+                 it != ent->deflist.end(); ++it) {
+                writer->writeDouble(53, it->angle * ARAD);   // 弧度 → 度
+                writer->writeDouble(43, it->base.x);
+                writer->writeDouble(44, it->base.y);
+                writer->writeDouble(45, it->offset.x);
+                writer->writeDouble(46, it->offset.y);
+                writer->writeInt16(79, static_cast<int>(it->dashes.size()));
+                for (std::vector<double>::const_iterator d = it->dashes.begin();
+                     d != it->dashes.end(); ++d) {
+                    writer->writeDouble(49, *d);
+                }
+            }
         }
-/*        if (ent->deflines > 0){
-            writer->writeInt16(78, ent->deflines);
-        }*/
         writer->writeInt32(98, 0);
     } else {
         //RLZ: TODO verify in acad12

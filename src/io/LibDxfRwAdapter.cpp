@@ -919,6 +919,27 @@ void Builder::applyHatchBoundary(const DRW_Hatch& data)
     entity->setPatternName(data.solid ? QStringLiteral("SOLID") : toQString(data.name));
     if (data.scale > kGeomTol) entity->setPatternScale(data.scale);
     entity->setPatternAngle(degToRad(data.angle));      // 图案角在两条路径下都是度
+
+    // 图案定义线（53/43/44/45/46/49）原样带走：导出时必须写回，
+    // 只给图案名不给定义的话，别的 CAD（实测 GstarCAD）会把填充画成一片乱纹。
+    std::vector<HatchEntity::PatternLine> patternLines;
+    patternLines.reserve(data.deflist.size());
+    const double readScale = data.scale > kGeomTol ? data.scale : 1.0;
+    for (const DRW_HatchDefLine& src : data.deflist) {
+        HatchEntity::PatternLine line;
+        line.angle  = src.angle;                        // libdxfrw 内部统一用弧度
+        line.base   = Point2D(src.base.x, src.base.y);
+        // 偏移换算成「已经乘过比例的最终间距」：DXF 的图案定义是乘比例之前的，
+        // DWG 的则是最终值（实测本图 45° 定义偏移 1.5875 = 内置 ANSI31 间距
+        // 3.175 × 比例 0.5）。统一口径后，显示与写出才能对得上。
+        const bool fromDxf = (m_source == Source::Dxf);
+        line.offset = fromDxf ? Point2D(src.offset.x * readScale, src.offset.y * readScale)
+                              : Point2D(src.offset.x, src.offset.y);
+        line.dashes = src.dashes;
+        patternLines.push_back(std::move(line));
+    }
+    entity->setPatternLines(std::move(patternLines));
+
     applyCommon(*entity, data);
     place(std::move(entity));
 }
@@ -1888,7 +1909,38 @@ private:
         record.hpattern = 1;                      // 预定义图案
         record.angle = hatch.patternAngle() * kRadToDeg;
         record.scale = hatch.patternScale();
-        record.deflines = 0;                      // 预定义图案由读取端自带的定义生成
+
+        // 图案定义线：一条都不能少。上游写出侧只写条数（78 组码）而不写内容，
+        // 于是非实体填充成了「有图案名、无定义」，实测 GstarCAD 会把它画成一大片
+        // 乱纹盖住整张图（点一下重生成才恢复）。这里按图元保存的定义如实回写；
+        // 文件里本来就没带定义的（例如本软件自己新建的填充），补一条与自身渲染
+        // 一致的 45° 平行线，保证导出的文件在任何 CAD 里都画得出来。
+        // 定义线按 DXF 的约定改写两处，实测量产 CAD（GstarCAD）只认这种写法：
+        //   · 基点写原点——它只决定图案相位；照抄源图的远基点会被画成一大片乱纹。
+        //   · 偏移写进「图案线坐标系」（X 轴沿图案线方向），也就是 AutoCAD 写
+        //     ANSI31 时的 (0, 间距) 形式。源文件里的偏移是世界坐标下的垂直向量
+        //     （例如 45° 线上的 (-1.1225, 1.1225)），照抄同样会让 GstarCAD 把
+        //     填充画成乱纹：删掉全部填充就恢复正常，补上这处换算也恢复正常。
+        const double writeScale = hatch.patternScale() > kGeomTol ? hatch.patternScale() : 1.0;
+        for (const HatchEntity::PatternLine& line : hatch.patternLines()) {
+            DRW_HatchDefLine def;
+            def.angle  = line.angle;
+            def.base   = DRW_Coord(0.0, 0.0, 0.0);
+            // 写出的偏移是「图案线坐标系」里的 (0, 间距/比例)：模型里存的是最终
+            // 间距，而 DXF 的 41 组码会把定义整体缩放，所以这里先除掉比例。
+            // 直接照抄源文件的世界坐标偏移（斜向向量）同样会让 GstarCAD 画成乱纹。
+            def.offset = DRW_Coord(0.0, hatch.definedSpacing() / writeScale, 0.0);
+            def.dashes = line.dashes;
+            record.deflist.push_back(std::move(def));
+        }
+        if (!hatch.isSolid() && record.deflist.empty()) {
+            DRW_HatchDefLine def;
+            def.angle  = HatchEntity::kAnsi31BaseAngle;
+            def.base   = DRW_Coord(0.0, 0.0, 0.0);
+            def.offset = DRW_Coord(0.0, hatch.patternSpacing() / writeScale, 0.0);
+            record.deflist.push_back(std::move(def));
+        }
+        record.deflines = static_cast<int>(record.deflist.size());
 
         DRW_HatchLoop* loop = new DRW_HatchLoop(1 | 2);   // 外部环 + 多段线路径
         DRW_LWPolyline* boundary = new DRW_LWPolyline;

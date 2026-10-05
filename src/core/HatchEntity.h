@@ -64,6 +64,24 @@ public:
     /// 图案线方向（弧度）
     double patternLineAngle() const noexcept;
 
+    // ---- 图案定义线（DXF 53/43/44/45/46/79/49） -------------------------------
+    //
+    //  图案本质上是「若干条基准平行线 + 偏移」的定义。文件里带着这份定义，
+    //  别的 CAD 才能正确画出填充——只写图案名、不写定义时，实测 GstarCAD 会把
+    //  整块画成一片乱纹。这里随图元原样保存，导出时如实回写。
+    struct PatternLine {
+        double  angle = 0.0;            ///< 图案线角度（弧度）
+        Point2D base;                   ///< 基点
+        Point2D offset;                 ///< 相邻平行线的偏移
+        std::vector<double> dashes;     ///< 虚线段长度；空 = 实线
+    };
+
+    const std::vector<PatternLine>& patternLines() const noexcept { return m_patternLines; }
+    void setPatternLines(std::vector<PatternLine> lines) { m_patternLines = std::move(lines); }
+
+    /// 定义线给出的相邻线间距（|offset|），无定义时返回 0
+    double definedSpacing() const noexcept;
+
     /// 点是否位于边界内部（射线法）
     bool containsPoint(const Point2D& p) const;
 
@@ -92,6 +110,7 @@ private:
     QString  m_patternName = QStringLiteral("ANSI31");
     double   m_scale = 1.0;
     double   m_angle = 0.0;                 ///< 弧度
+    std::vector<PatternLine> m_patternLines;  ///< 文件带来的图案定义（可为空）
 };
 
 } // namespace lycad

@@ -934,6 +934,22 @@ public:
     std::vector<DRW_Entity *> objlist;      /*!< entities list */
 };
 
+//! 填充图案的一条定义线（DXF 53/43/44/45/46/79/49）
+/*!
+*  图案由若干条「基准线 + 偏移」定义：沿着 angle 方向的平行线族，
+*  相邻两条的位移是 offset（在图案线坐标系里度量）。dashes 为该线的
+*  虚线段长度序列，空表示实线。
+*  角度内部一律用弧度；写出 DXF 时 53 组码按规范换算成度。
+*/
+class DRW_HatchDefLine {
+public:
+    DRW_HatchDefLine() { angle = 0.0; }
+    double angle;                   /*!< 图案线角度（弧度），code 53（写为度） */
+    DRW_Coord base;                 /*!< 基点，code 43/44 */
+    DRW_Coord offset;               /*!< 相邻平行线的偏移，code 45/46 */
+    std::vector<double> dashes;     /*!< 虚线段长度，code 49 */
+};
+
 //! Class to handle hatch entity
 /*!
 *  Class to handle hatch entity
@@ -981,6 +997,11 @@ public:
     double angle;              /*!< hatch pattern angle, code 52 */
     double scale;              /*!< hatch pattern scale, code 41 */
     int deflines;              /*!< number of pattern definition lines, code 78 */
+
+    /*! 图案定义线。上游只保留条数、内容读完即弃，写出侧更是一个字都不写：
+     *  于是「有图案名、无定义」的填充落到别的 CAD（实测 GstarCAD）手里会画成
+     *  一片乱纹，把整张图盖住。这里把内容留下来，并在写出时如实补上。 */
+    std::vector<DRW_HatchDefLine> deflist;
 
     std::vector<DRW_HatchLoop *> looplist;  /*!< polyline list */
 

@@ -1773,6 +1773,25 @@ void DRW_Hatch::parseCode(int code, dxfReader *reader){
     case 52:
         angle = reader->getDouble();
         break;
+    case 53:        /*图案定义线：一条线以 53 开始，随后是基点/偏移/虚线*/
+        deflist.push_back(DRW_HatchDefLine());
+        deflist.back().angle = reader->getDouble()/ARAD;
+        break;
+    case 43:
+        if (!deflist.empty()) deflist.back().base.x = reader->getDouble();
+        break;
+    case 44:
+        if (!deflist.empty()) deflist.back().base.y = reader->getDouble();
+        break;
+    case 45:
+        if (!deflist.empty()) deflist.back().offset.x = reader->getDouble();
+        break;
+    case 46:
+        if (!deflist.empty()) deflist.back().offset.y = reader->getDouble();
+        break;
+    case 49:
+        if (!deflist.empty()) deflist.back().dashes.push_back(reader->getDouble());
+        break;
     case 73:
         if (arc) arc->isccw = reader->getInt32();
         else if (pline) pline->flags = reader->getInt32();
@@ -1966,19 +1985,22 @@ bool DRW_Hatch::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         doubleflag = buf->getBit();
         deflines = buf->getBitShort();
         for (dint32 i = 0 ; i < deflines; ++i){
-            DRW_Coord ptL, offL;
-            double angleL = buf->getBitDouble();
-            ptL.x = buf->getBitDouble();
-            ptL.y = buf->getBitDouble();
-            offL.x = buf->getBitDouble();
-            offL.y = buf->getBitDouble();
+            DRW_HatchDefLine defLine;   // 上游读完成员的局部量就扔，这里留下来
+            defLine.angle = buf->getBitDouble();
+            defLine.base.x = buf->getBitDouble();
+            defLine.base.y = buf->getBitDouble();
+            defLine.offset.x = buf->getBitDouble();
+            defLine.offset.y = buf->getBitDouble();
             duint16 numDashL = buf->getBitShort();
-            DRW_DBG("\ndef line: "); DRW_DBG(angleL); DRW_DBG(","); DRW_DBG(ptL.x); DRW_DBG(","); DRW_DBG(ptL.y);
-            DRW_DBG(","); DRW_DBG(offL.x); DRW_DBG(","); DRW_DBG(offL.y); DRW_DBG(","); DRW_DBG(angleL);
-            for (duint16 i = 0 ; i < numDashL; ++i){
-                double lenghtL = buf->getBitDouble();
+            DRW_DBG("\ndef line: "); DRW_DBG(defLine.angle); DRW_DBG(","); DRW_DBG(defLine.base.x);
+            DRW_DBG(","); DRW_DBG(defLine.base.y);
+            DRW_DBG(","); DRW_DBG(defLine.offset.x); DRW_DBG(","); DRW_DBG(defLine.offset.y);
+            for (duint16 j = 0 ; j < numDashL; ++j){
+                const double lenghtL = buf->getBitDouble();
+                defLine.dashes.push_back(lenghtL);
                 DRW_DBG(","); DRW_DBG(lenghtL);
             }
+            deflist.push_back(defLine);
         }//end deflines
     } //end not solid
 
