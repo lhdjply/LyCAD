@@ -12,7 +12,8 @@
 //    ARC 起止角          /ARAD（得弧度）        不换算          两者都是弧度，直接用
 //    HATCH 边界弧角       同上                  不换算          两者都是弧度，直接用
 //    INSERT 旋转         /ARAD（得弧度）        不换算          两者都是弧度，直接用
-//    TEXT/MTEXT 旋转     不换算（度）           不换算          **单位不同，需按来源换算**
+//    TEXT 旋转          不换算（度）           不换算（弧度）   **单位不同，按来源换算**
+//    MTEXT 旋转         取自 11 组码方向向量    同左            由方向向量算 atan2，不用 angle
 //    DIMENSION 角度      不换算（度）           ×ARAD（得度）    两者都是度，需转为弧度
 //
 //  实测依据（720 个真实 DWG 文件，共 29018 个弧角度样本）：
@@ -22,8 +23,12 @@
 //    · 文字旋转在 DWG 中恰为 1.570796(π/2)，在 DXF 中则为 90.0 —— 两者单位不同。
 //    · INSERT 旋转出现 6.021386，正好是 23π/12（即 345.000°）—— 弧度。
 //
-//  因此 makeText() 里那条按来源分支的换算是必需的，不是保险措施；删掉它会让
-//  DWG 里的文字旋转全部错 57 倍，而 DXF 里的一切正常——这类缺陷很难在使用中归因。
+//  因此 textRotationRadians() 里那条按来源分支的换算是必需的，不是保险措施；
+//  删掉它会让 DWG 里的 TEXT 旋转全部错 57 倍，而 DXF 里的一切正常——这类缺陷很难
+//  在使用中归因。MTEXT 走另一条路：它的旋转只写在 11 组码的 X 轴方向向量里，
+//  与 50 组码的单位之争无关，两条路径都按方向向量算。注意 DWG 的 MTEXT 方向向量
+//  依赖 libdxfrw 置位 haveXAxis——曾漏置，导致 DWG 里旋转过的 MTEXT 全部变水平
+//  （见 addMText 内的说明）。
 //
 //  ── 关于可见性 ────────────────────────────────────────────────────────────
 //
@@ -291,7 +296,19 @@ private:
     /// 套用图层/颜色/线型/线宽等公共属性
     void applyCommon(Entity& entity, const DRW_Entity& source);
 
-    std::unique_ptr<TextEntity> makeText(const DRW_Text& data);
+    /// TEXT 的旋转角（弧度）。
+    ///
+    /// libdxfrw 两条读取路径对同一个 `angle` 字段用的单位不同：DXF 路径原样返回
+    /// 50 组码（度），DWG 路径存的是弧度（见本文件头部实测定标）。这是整个文件里
+    /// 唯一需要按来源分单位的地方。
+    static double textRotationRadians(const DRW_Text& data, Source source)
+    {
+        return (source == Source::Dxf) ? degToRad(data.angle) : data.angle;
+    }
+
+    /// rotationRadians 由调用方给出（弧度）——MTEXT 的旋转不是从 50 组码来的，
+    /// 而是从 11 组码的 X 轴方向向量算出来的，必须由调用方自己决定。
+    std::unique_ptr<TextEntity> makeText(const DRW_Text& data, double rotationRadians);
     void applyHatchBoundary(const DRW_Hatch& data);
 
     void expand(const PendingInsert& insert, const Transform2D& outer,
@@ -777,16 +794,14 @@ QString stripMTextCodes(const QString& raw)
     return out;
 }
 
-std::unique_ptr<TextEntity> Builder::makeText(const DRW_Text& data)
+/// 建立单行文字图元。旋转角由调用方按**弧度**给出——libdxfrw 的两条读取路径
+/// 对角度用的单位不同（见本文件头部说明），换算是调用方的事，这里只认弧度。
+std::unique_ptr<TextEntity> Builder::makeText(const DRW_Text& data, double rotationRadians)
 {
-    // 单位换算：DXF 路径下 libdxfrw 原样返回 50 组码（度），DWG 路径下是弧度。
-    const double rotation = (m_source == Source::Dxf) ? degToRad(data.angle)
-                                                      : data.angle;
-
     const double height = (data.height > kGeomTol) ? data.height : 3.5;
     auto entity = std::make_unique<TextEntity>(toQString(data.text),
                                                toPoint(data.basePoint),
-                                               height, rotation);
+                                               height, rotationRadians);
 
     // 对齐：libdxfrw 的枚举与 DXF 72/73 一致；Aligned(3)/Middle(4)/Fit(5)
     // 只在垂直对齐为基线时出现，这里分别映射到最接近的语义。
@@ -877,7 +892,7 @@ void Builder::addSpline(const DRW_Spline* data)
 
 void Builder::addText(const DRW_Text& data)
 {
-    auto entity = makeText(data);
+    auto entity = makeText(data, textRotationRadians(data, m_source));
     applyCommon(*entity, data);
     place(std::move(entity));
 }
@@ -895,13 +910,24 @@ void Builder::addMText(const DRW_MText& data)
     //   · 72/73 是流向与行距，被读进了 alignH/alignV；
     //   · 11 组码是**X 轴方向向量**，被读进了 secPoint（对齐点）；
     //   · 41 组码是**栏宽**，被读进了 widthscale。
-    // 降级时按 MTEXT 语义重新映射：旋转取自 X 轴方向（度，makeText 会再转弧度），
-    // 对齐由附着点换算，对齐点 = 插入点，宽度因子固定 1。
+    // 降级时按 MTEXT 语义重新映射：旋转取自 X 轴方向向量，对齐由附着点换算，
+    // 对齐点 = 插入点，宽度因子固定 1。
     const QString rawText = toQString(data.text);
     DRW_Text plain;
     plain.text = stripMTextCodes(rawText).toStdString();
     plain.basePoint = data.basePoint;
     plain.height = data.height;
+
+    // 旋转角（弧度）。MTEXT 的旋转写在 11 组码的 X 轴方向向量里——50 组码在
+    // MTEXT 中几乎不出现，只有极少数生成器会直接给角度。因此只要有方向向量就
+    // 按它算 atan2，不依赖 libdxfrw 的 angle 字段。
+    //
+    // 这里曾经踩过一个坑：libdxfrw-modify 原实现在 DWG 路径上没置位 haveXAxis，
+    // hasXAxisDirection() 恒为 false，于是 DWG 里的 MTEXT 一律退回 angle——而 DWG
+    // 路径的 angle 永远是 0，旋转就整体丢了。实测一张 2018 版 DWG（AC1032）：
+    // 272 条文字里 202 条旋转 90° 的 MTEXT 被画成水平，同一张图的 DXF 全部正确。
+    // 库那边已修正，这里同时保留方向向量的优先级。
+    double rotationRad = textRotationRadians(data, m_source);
 
     // 文字 X 轴方向（11 组码）：参考矩形的宽度沿这个方向量
     Point2D dir(1.0, 0.0);
@@ -909,9 +935,7 @@ void Builder::addMText(const DRW_MText& data)
         && std::hypot(data.secPoint.x, data.secPoint.y) > kGeomTol) {
         const double dirLen = std::hypot(data.secPoint.x, data.secPoint.y);
         dir = Point2D(data.secPoint.x / dirLen, data.secPoint.y / dirLen);
-        plain.angle = radToDeg(std::atan2(dir.y, dir.x));
-    } else {
-        plain.angle = data.angle;             // 少数生成器直接写 50 组码（度）
+        rotationRad = std::atan2(dir.y, dir.x);
     }
 
     const int attachment = std::clamp(data.textgen, 1, 9);
@@ -975,7 +999,7 @@ void Builder::addMText(const DRW_MText& data)
         }
         plain.style = styleName.toStdString();
     }
-    auto entity = makeText(plain);
+    auto entity = makeText(plain, rotationRad);
     if (entity) {
         applyCommon(*entity, data);
         place(std::move(entity));

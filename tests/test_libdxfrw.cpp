@@ -136,6 +136,32 @@ const Entity* firstOfType(const Document& document, EntityType type)
     return nullptr;
 }
 
+/// 文字图元的可比指纹：**插入点 + 旋转**。
+///
+/// 用于「同一张图纸的两种格式必须读出同一份文字」这条比对。刻意只收录几何量：
+/// MTEXT 的内容里带内联格式码（\f 字体、\W 宽度、\pxq 段落对），这些码在不同格式
+/// 之间写法可以不同——实测样本的标题文字就是这样：DWG 里是 `\pxqc;{\W1;直流…}`、
+/// DXF 里是 `{\fSimSun|…;\W8.05716;}{\W1.25000x;直流…}`。这类差异会连带改变内容与
+/// 由内容推导出的对齐点，却与「同一张图」并不矛盾；而插入点与旋转是纯粹的几何，
+/// 两条读取路径必须给出同一个值。旋转折成度并截到 1e-4：浮点末位差异不该让测试
+/// 变红，而漏掉单位换算（错 57 倍）或整个丢了旋转（0 对 90）都远远超出这个精度。
+QStringList textFingerprint(const Document& document)
+{
+    QStringList out;
+    for (EntityId id : document.drawOrder()) {
+        const Entity* entity = document.entity(id);
+        if (!entity || entity->type() != EntityType::Text) continue;
+
+        const auto& text = static_cast<const TextEntity&>(*entity);
+        out << QStringLiteral("%1,%2|%3")
+                   .arg(text.position().x, 0, 'f', 6)
+                   .arg(text.position().y, 0, 'f', 6)
+                   .arg(text.rotation() * 180.0 / kPi, 0, 'f', 4);
+    }
+    out.sort();
+    return out;
+}
+
 } // namespace
 
 class TestLibDxfRw : public QObject {
@@ -154,6 +180,7 @@ private slots:
     void outOfRangeCoordinatesAreSkipped();
     void writtenHatchBoundaryKeepsBulgeSlots();
     void mtextParagraphAlignmentAndRectAnchor();
+    void mtextRotationFromXAxisDirection();
     void mtextInlineFontBecomesTextStyle();
     void writtenHatchPatternDefinitionRoundTrips();
 
@@ -165,6 +192,7 @@ private slots:
 
     // ---- DWG 路径（需要外部样本，缺失时跳过）----------------------------------
     void readsDwgSample();
+    void dwgAndDxfAgree();
 };
 
 // -----------------------------------------------------------------------------
@@ -685,6 +713,69 @@ void TestLibDxfRw::mtextParagraphAlignmentAndRectAnchor()
 }
 
 // -----------------------------------------------------------------------------
+//  MTEXT 的旋转取自 11 组码的 X 轴方向向量。
+//
+//  MTEXT 几乎不用 50 组码表达旋转，而是给一个方向向量（11/21）；读成单行文字时
+//  必须按 atan2 把它换算成角度。这里三条对照：方向朝上（90°）、方向朝右（0°）、
+//  以及少数生成器直接给 50 组码的情形。
+//
+//  同一段逻辑在 DWG 路径上还有一道外部依赖：libdxfrw 必须置位 haveXAxis，
+//  否则方向向量根本不会被认出来（见 dwgAndDxfAgree）。
+void TestLibDxfRw::mtextRotationFromXAxisDirection()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("mtext_rotation.dxf"));
+
+    const QByteArray content =
+        "0\nSECTION\n2\nENTITIES\n"
+        // 11/21 = (0,1)：文字沿 Y 轴排 → 90°
+        "0\nMTEXT\n5\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n10.0\n20\n20.0\n40\n2.5\n41\n0.0\n71\n1\n"
+        "11\n0.0\n21\n1.0\n31\n0.0\n"
+        "1\n竖排标签\n"
+        // 11/21 = (1,0)：不旋转
+        "0\nMTEXT\n5\n101\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n30.0\n20\n20.0\n40\n2.5\n41\n0.0\n71\n1\n"
+        "11\n1.0\n21\n0.0\n31\n0.0\n"
+        "1\n水平标签\n"
+        // 没有 11 组码，只有 50 组码（度）
+        "0\nMTEXT\n5\n102\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n50.0\n20\n20.0\n40\n2.5\n41\n0.0\n71\n1\n50\n30.0\n"
+        "1\n按角度写\n"
+        "0\nENDSEC\n0\nEOF\n";
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(content);
+    file.close();
+
+    Document document;
+    const IoResult result = readDxfWithLibDxfRw(path, document);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(document.entityCount(), std::size_t(3));
+
+    const auto rotationOf = [&document](const QString& needle) {
+        bool found = false;
+        double rotation = -1.0;
+        for (EntityId id : document.drawOrder()) {
+            const Entity* e = document.entity(id);
+            if (!e || e->type() != EntityType::Text) continue;
+            const auto& text = static_cast<const TextEntity&>(*e);
+            if (!text.content().contains(needle)) continue;
+            found = true;
+            rotation = text.rotation();
+        }
+        Q_ASSERT(found);
+        return rotation;
+    };
+
+    QVERIFY(std::abs(rotationOf(QStringLiteral("竖排标签")) - kPi / 2.0) < kTol);
+    QVERIFY(std::abs(rotationOf(QStringLiteral("水平标签")) - 0.0) < kTol);
+    QVERIFY(std::abs(rotationOf(QStringLiteral("按角度写")) - degToRad(30.0)) < kTol);
+}
+
+// -----------------------------------------------------------------------------
 //  MTEXT 的内联字体码 \f<字体>|...; 必须还原成文字样式。
 //
 //  内联字体的优先级高于图元样式；剥码时把它一并丢掉，导出后整段字退回样式里的
@@ -769,6 +860,71 @@ void TestLibDxfRw::readsDwgSample()
                      qPrintable(QStringLiteral("文字旋转 %1 超出弧度范围，疑似漏了单位换算")
                                     .arg(text.rotation())));
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  同一张图纸的 DWG 与 DXF 必须读出**同一份文字**。
+//
+//  这条不变量是实测踩出来的（2026-10）：libdxfrw 的 DWG 读取路径在解析 MTEXT 时
+//  没有置位「11 组码是 X 轴方向向量」这个标记，hasXAxisDirection() 恒为 false，
+//  适配层取旋转时只能退回 angle——而 DWG 路径的 MTEXT angle 永远是 0。后果是
+//  实测一张 2018 版 DWG（AC1032）：272 条文字里 202 条旋转 90° 的 MTEXT 被画成
+//  水平，同一张图纸的 DXF 却完全正确，用户看到的就是「好多文字方向错了」。
+//
+//  两条路径的旋转来源不同（TEXT 走 50 组码且单位不同、MTEXT 走 11 组码方向向量），
+//  漏掉任何一边都不会崩溃、只会静静画错，所以这里把「两种格式得到同一份文字」钉死。
+//  比的是几何量（插入点 + 旋转）而不是 MTEXT 的内容：内联格式码在两种格式之间的
+//  写法可以合法地不同，详见 textFingerprint() 的说明。
+//
+//  DWG 样本不随仓库分发（体积大、多为第三方图纸），因此由环境变量驱动：
+//    LYCAD_DWG_SAMPLE=/path/a.dwg LYCAD_DXF_SAMPLE=/path/b.dxf ctest -R test_libdxfrw
+//  未给出 LYCAD_DXF_SAMPLE 时，取与 DWG 主名相同的 .dxf 作为对照。
+void TestLibDxfRw::dwgAndDxfAgree()
+{
+    const QByteArray dwgSample = qgetenv("LYCAD_DWG_SAMPLE");
+    if (dwgSample.isEmpty()) {
+        QSKIP("未设置 LYCAD_DWG_SAMPLE，跳过 DWG/DXF 对照测试");
+    }
+
+    const QFileInfo dwgInfo(QString::fromLocal8Bit(dwgSample));
+    if (!dwgInfo.exists()) {
+        QSKIP("LYCAD_DWG_SAMPLE 指向的文件不存在");
+    }
+
+    const QByteArray dxfSample = qgetenv("LYCAD_DXF_SAMPLE");
+    const QFileInfo dxfInfo = dxfSample.isEmpty()
+                                  ? QFileInfo(dwgInfo.dir(), dwgInfo.completeBaseName()
+                                                                + QStringLiteral(".dxf"))
+                                  : QFileInfo(QString::fromLocal8Bit(dxfSample));
+    if (!dxfInfo.exists()) {
+        QSKIP("找不到与 DWG 对照的 DXF；可用 LYCAD_DXF_SAMPLE 指定");
+    }
+
+    Document fromDwg;
+    const IoResult dwgResult = readDwgWithLibDxfRw(dwgInfo.absoluteFilePath(), fromDwg);
+    QVERIFY2(dwgResult.ok, qPrintable(dwgResult.error));
+
+    Document fromDxf;
+    const IoResult dxfResult = readDxfWithLibDxfRw(dxfInfo.absoluteFilePath(), fromDxf);
+    QVERIFY2(dxfResult.ok, qPrintable(dxfResult.error));
+
+    QCOMPARE(fromDwg.entityCount(), fromDxf.entityCount());
+
+    const QStringList dwgTexts = textFingerprint(fromDwg);
+    const QStringList dxfTexts = textFingerprint(fromDxf);
+    QVERIFY2(!dwgTexts.isEmpty(), "样本里没有文字，这个对照测试失去意义");
+    QCOMPARE(dwgTexts.size(), dxfTexts.size());
+
+    // 逐条给出差异，避免只报「两个 QList 不相等」而看不出是哪一条错了
+    for (int i = 0; i < dwgTexts.size(); ++i) {
+        if (dwgTexts.at(i) == dxfTexts.at(i)) continue;
+        QVERIFY2(false, qPrintable(
+                            QStringLiteral("同一位置的文字旋转不一致（第 %1 条，共 %2 条）：\n"
+                                           "  DWG: %3（插入点 X,Y | 旋转°）\n"
+                                           "  DXF: %4")
+                                .arg(i).arg(dwgTexts.size())
+                                .arg(dwgTexts.at(i), dxfTexts.at(i))));
     }
 }
 

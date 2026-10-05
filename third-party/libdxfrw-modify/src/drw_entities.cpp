@@ -1453,6 +1453,12 @@ bool DRW_MText::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     DRW_DBG("Insertion: "); DRW_DBGPT(basePoint.x, basePoint.y, basePoint.z); DRW_DBG("\n");
     extPoint = buf->get3BitDouble(); /* Extrusion 3BD 210 Undocumented; */
     secPoint = buf->get3BitDouble(); /* X-axis dir 3BD 11 */
+    /* DWG 里 11 组码**总是**「X 轴方向向量」，MTEXT 的旋转只存在这一个字段里
+    （MTEXT 没有 50 组码）。不置位 haveXAxis，紧随其后的 updateAngle() 就是空操作，
+    angle 会一直停在构造时的 0，调用方拿不到任何旋转依据——实测一张 2018 版 DWG
+    （AC1032）：ENTITIES 段的 272 条文字里有 202 条是旋转 90° 的 MTEXT，
+    旋转全部丢失、被画成水平；同一张图纸的 DXF 因为 parseCode(11) 会置位，全部正确。 */
+    haveXAxis = true;
     updateAngle();
     widthscale = buf->getBitDouble(); /* Rect width BD 41 */
     if (version > DRW::AC1018) {//2007+
@@ -1515,6 +1521,9 @@ bool DRW_MText::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
 
 void DRW_MText::updateAngle(){
     if (haveXAxis) {
+            /* 写入的是**度**，与 DRW_Text::angle 声明的单位一致（DXF 的 50 组码单位）。
+            注意：这条换算与调用路径无关——DXF 与 DWG 的 MTEXT 由此得到同一个单位，
+            但和同一条路径上 TEXT 的 DWG 角度（弧度）并不一致。 */
             angle = atan2(secPoint.y, secPoint.x)*180/M_PI;
     }
 }
