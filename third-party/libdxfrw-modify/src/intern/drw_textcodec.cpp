@@ -326,6 +326,36 @@ std::string DRW_ConvDBCSTable::fromUtf8(std::string *s) {
     return result;
 }
 
+
+// 在双字节码表里查一个码位。
+//
+// 上游按「引导字节表」给出的区间去线性扫描，但那份表是手工维护的前缀和，
+// 本身与码表对不上：实测 936 有 3 处、932 有 29 处、949/950 各有几处条目错位。
+// 错位的后果是整段码位被划到邻居名下：落在缝里的字查不到，退化成 "?"。
+// 例如 0xB8F6（"个"）正好落在 0xB8 与 0xB9 的缝里，读出来是 "?"。
+// （查找按完整两字节码位比对，所以只会查不到，不会误命中别的字。）
+//
+// 码表本身按码位严格升序且无重复（已逐表核对），因此这里直接二分查找，
+// 不依赖引导字节表。
+static bool lookupDbcsCode(const int (*table)[2], int length, int code, int *unicode)
+{
+    int lo = 0;
+    int hi = length - 1;
+    while (lo <= hi) {
+        const int mid = lo + (hi - lo) / 2;
+        const int key = table[mid][0];
+        if (key == code) {
+            *unicode = table[mid][1];
+            return true;
+        }
+        if (key < code)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return false;
+}
+
 std::string DRW_ConvDBCSTable::toUtf8(std::string *s) {
     std::string res;
     std::string::iterator it;
@@ -350,14 +380,10 @@ std::string DRW_ConvDBCSTable::toUtf8(std::string *s) {
         } else {//2 bytes
             ++it;
             int code = (c << 8) | (unsigned char )(*it);
-            int sta = leadTable[c-0x81];
-            int end = leadTable[c-0x80];
-            for (int k=sta; k<end; k++){
-                if(doubleTable[k][0] == code) {
-                    res += encodeNum(doubleTable[k][1]); //translate from table
-                    notFound = false;
-                    break;
-                }
+            int unicode = 0;
+            if (lookupDbcsCode(doubleTable, cpLenght, code, &unicode)) {
+                res += encodeNum(unicode); //translate from table
+                notFound = false;
             }
         }
         //not found
@@ -436,23 +462,10 @@ std::string DRW_Conv932Table::toUtf8(std::string *s) {
         } else {//2 bytes
             ++it;
             int code = (c << 8) | (unsigned char )(*it);
-            int sta;
-            int end=0;
-            if (c > 0x80 && c < 0xA0) {
-                sta = DRW_LeadTable932[c-0x81];
-                end = DRW_LeadTable932[c-0x80];
-            } else if (c > 0xDF && c < 0xFD){
-                sta = DRW_LeadTable932[c-0xC1];
-                end = DRW_LeadTable932[c-0xC0];
-            }
-            if (end > 0) {
-                for (int k=sta; k<end; k++){
-                    if(DRW_DoubleTable932[k][0] == code) {
-                        res += encodeNum(DRW_DoubleTable932[k][1]); //translate from table
-                        notFound = false;
-                        break;
-                    }
-                }
+            int unicode = 0;
+            if (lookupDbcsCode(DRW_DoubleTable932, CPLENGHT932, code, &unicode)) {
+                res += encodeNum(unicode); //translate from table
+                notFound = false;
             }
         }
         //not found

@@ -189,7 +189,7 @@ public:
     void addLayer(const DRW_Layer& data) override;
     void addDimStyle(const DRW_Dimstyle&) override {}
     void addVport(const DRW_Vport&) override {}
-    void addTextStyle(const DRW_Textstyle&) override {}
+    void addTextStyle(const DRW_Textstyle& data) override;
     void addAppId(const DRW_AppId&) override {}
     /// 库不认识的实体类型（MLINE、MESH、ACAD_TABLE 等）经此回调计数上报，
     /// 不允许静默丢弃。
@@ -401,6 +401,49 @@ void Builder::addLayer(const DRW_Layer& data)
 
     layer.setLineweightDxf(DRW_LW_Conv::lineWidth2dxfInt(data.lWeight));
     layer.setFlagsFromDxf(data.flags);
+}
+
+void Builder::addTextStyle(const DRW_Textstyle& data)
+{
+    const QString name = toQString(data.name).trimmed();
+    if (name.isEmpty()) return;
+
+    // 整条替换而不是逐字段覆盖：表里预置的 Standard 带中文兜底字体，
+    // 逐字段覆盖会让「文件只写了 TrueType 族名（3 组码为空）」的样式
+    // 白白继承那份兜底字体，导出后字体就不是原文件的了。
+    TextStyle imported(name);
+    imported.setFontFile(toQString(data.font));
+    imported.setBigFontFile(toQString(data.bigFont));
+
+    // TrueType 字体：AutoCAD 把「从字体列表里选中的族名」写进样式的扩展数据
+    // （1001 <应用名> / 1000 <族名> / 1071 <族标志>），此时 3/4 组码都是空的——
+    // 字体信息**只**存在于扩展数据里。中文图纸的 Standard 几乎都是这种形态，
+    // 不读它，导出的汉字就没有字形（CAD 会退回不含汉字的 txt.shx，整片 "?"）。
+    //
+    // 应用名不统一（AutoCAD 写 ACAD，也有写 _APP0 的），所以不认应用名，
+    // 只取**最后一个应用块**里的 1000：注记样式的扩展数据里还夹着一条
+    // AcadAnnotative / "AnnotativeData"，取最后一个块才不会把标记当成字体。
+    // 字体族标志（1071）被 libdxfrw 解析进了 fontFamily 字段，不在 extData 里。
+    QString blockFontName;
+    for (DRW_Variant* variant : data.extData) {
+        if (!variant) continue;
+        if (variant->code() == 1001) {
+            blockFontName.clear();
+        } else if (variant->code() == 1000 && variant->type() == DRW_Variant::STRING) {
+            blockFontName = toQString(*variant->content.s);
+        }
+    }
+    if (!blockFontName.isEmpty()) imported.setTtfName(blockFontName);
+    imported.setTtfFlags(data.fontFamily);
+
+    if (!imported.hasFontInfo()) {
+        // 文件明确给了这条样式，却没给任何字体（既无 3/4 组码，也无 TrueType
+        // 扩展数据）：用中文安全字体兜底，让汉字至少画得出来。
+        imported.setFontFile(TextStyleTable::cjkSafeStandard().fontFile());
+        imported.setBigFontFile(TextStyleTable::cjkSafeStandard().bigFontFile());
+    }
+
+    m_doc.textStyles().ensure(name) = imported;
 }
 
 // -----------------------------------------------------------------------------
@@ -1429,8 +1472,87 @@ public:
         }
     }
 
-    // 库会自动补 Standard 文字样式 / Standard 标注样式 / ACAD 应用程序
-    void writeTextstyles() override {}
+    /// 文字样式表：把文档里的样式**原样写回**。
+    ///
+    /// 字体信息（主字体 3、大字体 4，以及 AutoCAD 记在 ACAD 扩展数据里的
+    /// TrueType 族名）由导入时收集，图元只带样式名——所以这一步落下，
+    /// 图元的 7 组码就成了悬空引用，CAD 只能退回默认的 `txt.shx`：那是没有
+    /// 汉字字形的 SHX 字体，汉字会整片渲染成 `?`（多行文字走另一条取字路径，
+    /// 于是同一张图里 MTEXT 正常、TEXT 全是问号，极易被误判成编码问题）。
+    ///
+    /// 文档没提供字体信息的样式（例如纯新建的图纸，或文件里只写了样式名）
+    /// 一律补上「txt + gbcbig.shx」：两者都随 AutoCAD / GstarCAD 分发，
+    /// 不依赖操作系统装了哪款中文字体；R12 不支持 TrueType，大字体这条路
+    /// 对 R12 与 R2000 同样有效。
+    void writeTextstyles() override
+    {
+        const TextStyleTable& table = m_doc.textStyles();
+
+        std::vector<QString> written;
+        const auto writeStyle = [&](const QString& name) {
+            const TextStyle fallback = TextStyleTable::cjkSafeStandard();
+            const TextStyle* style = table.find(name);
+
+            QString font = style ? style->fontFile() : QString();
+            QString bigFont = style ? style->bigFontFile() : QString();
+            const QString ttfName = style ? style->ttfName() : QString();
+
+            // 需要兜底中文字体的两种情形：
+            //   · 文档里根本没有这条样式，或它没带任何字体信息；
+            //   · R12 不支持 TrueType，而这条样式的字体**只**存在于 TrueType
+            //     扩展数据里（3/4 组码为空）——R12 里没有别的办法表达它。
+            const bool needsFallback =
+                (font.isEmpty() && bigFont.isEmpty())
+                && (ttfName.isEmpty() || !m_r2000);
+            if (needsFallback) {
+                font = fallback.fontFile();
+                bigFont = fallback.bigFontFile();
+            }
+
+            DRW_Textstyle record;
+            record.name = (style ? style->name() : name).toStdString();
+            record.font = font.toStdString();
+            record.bigFont = bigFont.toStdString();
+            if (style && style->ttfName().isEmpty()) {
+                // 只有字体族标志、没有族名（DWG 路径常见）：写在记录本体上
+                record.fontFamily = style->ttfFlags();
+            }
+            // 3 组码为空、字体只存在于扩展数据时，必须把扩展数据一起写回
+            // （libdxfrw-modify 已让写出侧支持表记录的扩展数据）。
+            // R12 不支持 TrueType，上面已经换成大字体，不再写扩展数据。
+            if (m_r2000 && !ttfName.isEmpty()) {
+                record.extData.push_back(new DRW_Variant(1001, std::string("ACAD")));
+                record.extData.push_back(new DRW_Variant(1000, ttfName.toStdString()));
+                if (style->ttfFlags() != 0) {
+                    record.extData.push_back(new DRW_Variant(1071, style->ttfFlags()));
+                }
+            }
+            m_rw->writeTextstyle(&record);
+        };
+
+        for (const TextStyle& style : table.all()) {
+            writeStyle(style.name());
+            written.push_back(style.name());
+        }
+
+        // 图元引用了表里没有的样式（删过样式表、或文件本身不自洽）：
+        // 补一条同名的安全样式，避免图元挂在不存在的样式上。
+        for (EntityId id : m_doc.drawOrder()) {
+            const Entity* entity = m_doc.entity(id);
+            if (!entity || entity->type() != EntityType::Text) continue;
+            const QString name = static_cast<const TextEntity*>(entity)->fontStyle();
+            if (name.isEmpty()) continue;
+            const bool already = std::any_of(
+                written.begin(), written.end(),
+                [&](const QString& n) { return n.compare(name, Qt::CaseInsensitive) == 0; });
+            if (!already) {
+                writeStyle(name);
+                written.push_back(name);
+            }
+        }
+    }
+
+    // 库会自动补 Standard 标注样式 / ACAD 应用程序
     void writeDimstyles() override {}
     void writeAppId() override {}
 
@@ -1659,6 +1781,13 @@ private:
             return;
         }
 
+        // 样式名回写（DXF 7）：字体的全部信息都在 STYLE 表里，图元只写引用，
+        // 由 writeTextstyles() 保证这条样式确实存在于同一文件。
+        // 导入时 Standard 会被清空（那就是默认样式），这里落回 Standard。
+        const std::string styleName =
+            (text.fontStyle().isEmpty() ? QStringLiteral("Standard") : text.fontStyle())
+                .toStdString();
+
         // 多行文字（读侧 MTEXT 降级留下的 \n）写回为**真正的 MTEXT**：
         // DXF 的一个组码值不能跨行，把含 \n 的字符串写进 TEXT 的 1 组码
         // 会产出非法文件（实测 AutoCAD 直接拒绝打开，ezdxf 也报
@@ -1681,7 +1810,7 @@ private:
             record.interlin = 1.0;
             record.widthscale = 0.0;           // 41=0：不按栏宽折行
             record.angle = text.rotation() * kRadToDeg;
-            record.style = "Standard";
+            record.style = styleName;
             m_rw->writeMText(&record);
             return;
         }
@@ -1698,7 +1827,7 @@ private:
         record.height = text.height();
         record.angle = text.rotation() * kRadToDeg;
         record.widthscale = text.widthFactor();
-        record.style = "Standard";
+        record.style = styleName;
         record.textgen = (text.isBackwards() ? 2 : 0) | (text.isUpsideDown() ? 4 : 0);
         if (text.usesAlignmentPoint()) {
             record.alignH = toDrwHAlign(text.hAlign());

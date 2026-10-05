@@ -533,7 +533,10 @@ void Document::clear(bool resetLayers)
     m_selection->clear();
     m_nextId = 1;
 
-    if (resetLayers) m_layers.clear();
+    if (resetLayers) {
+        m_layers.clear();
+        m_textStyles.clear();
+    }
 
     if (!wasBatch) {
         m_undoStack->clear();

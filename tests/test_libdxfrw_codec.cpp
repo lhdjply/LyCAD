@@ -20,6 +20,10 @@
 #include <QtTest>
 
 #include "drw_base.h"      // DRW::Version 枚举（AC1009 / AC1015 / AC1021 …）
+#include "drw_cptable932.h" // 各代码页的双字节码表（逐表核对用）
+#include "drw_cptable936.h"
+#include "drw_cptable949.h"
+#include "drw_cptable950.h"
 #include "drw_textcodec.h"
 
 #include <string>
@@ -41,6 +45,32 @@ const std::string kUtf16Chinese = std::string("\x2D\x4E\x87\x65", 4);
 /// 2000 版 DWG 里「中文」两个字的 GBK 字节（这是老版本文件的真实形态）
 const std::string kGbkChinese = std::string("\xD6\xD0\xCE\xC4", 4);
 
+/// 把一个 16 位码位编码成 UTF-8（四张码表里都是 BMP 字符，最大值 0xFFE6）
+QByteArray utf8Of(int unicode)
+{
+    return QString(QChar(unicode)).toUtf8();
+}
+
+/// 把一张双字节码表整表走一遍，返回前若干条对不上的码位描述。
+///
+/// 表里登记的是「码位 → Unicode」，因此解码每个码位都必须得到那个字。
+QStringList checkDbcsTable(DRW_TextCodec& codec, const int (*table)[2], int length)
+{
+    QStringList problems;
+    for (int i = 0; i < length && problems.size() < 5; ++i) {
+        const int code = table[i][0];
+        std::string raw;
+        raw.push_back(static_cast<char>((code >> 8) & 0xFF));
+        raw.push_back(static_cast<char>(code & 0xFF));
+        if (bytes(codec.toUtf8(raw)) != utf8Of(table[i][1])) {
+            problems << QStringLiteral("0x%1 应为 U+%2")
+                            .arg(code, 4, 16, QLatin1Char('0'))
+                            .arg(table[i][1], 4, 16, QLatin1Char('0'));
+        }
+    }
+    return problems;
+}
+
 } // namespace
 
 class TestLibDxfRwCodec : public QObject
@@ -51,6 +81,7 @@ private slots:
     void decoderDoesNotDependOnFilesReadEarlier();
     void modernDxfTextIsUtf8Verbatim();
     void legacyCodepageStillDecodesChinese();
+    void everyDbcsCodePointDecodesExactly();
 };
 
 /// 解码器的行为只取决于「当前文件」，与同进程中此前读过什么无关。
@@ -114,6 +145,44 @@ void TestLibDxfRwCodec::legacyCodepageStillDecodesChinese()
 
     // 写出方向：中文应当变成 GBK 双字节
     QCOMPARE(bytes(codec.fromUtf8(std::string("中文"))), bytes(kGbkChinese));
+}
+
+/// 逐表核对：每个双字节码位都必须解出码表里登记的那个字。
+///
+/// 这条测试盯的是「引导字节表与码表不一致」这一类缺陷。上游解码时按引导表
+/// （DRW_LeadTable* —— 一份手工维护的前缀和）给出的区间线性扫描，而那份表和
+/// 码表对不上：实测 936 有 3 处、932 有 29 处、949/950 各有几处错位。后果是
+/// 整段码位被划到邻居名下——落在缝里的字查不到，退化成 "?"。例如 GBK 的
+/// 0xB8F6（"个"）正好落在 0xB8 与 0xB9 的缝里，于是「超过 6 个」读出来是
+/// 「超过 6?」。
+///
+/// 修改版改为直接在码表上二分查找（表按码位严格升序、无重复），不再依赖引导表；
+/// 这里把四张表整表走一遍，任何一处对不上都会失败。
+void TestLibDxfRwCodec::everyDbcsCodePointDecodesExactly()
+{
+    DRW_TextCodec codec;
+    codec.setVersion(DRW::AC1015, false);
+
+    const struct {
+        const char* codePage;    ///< DXF $DWGCODEPAGE 里的名字
+        const char* label;       ///< 失败信息里的说明
+        const int (*table)[2];
+        int length;
+    } pages[] = {
+        { "ANSI_936", "ANSI_936 (GBK 简体)", DRW_DoubleTable936, CPLENGHT936 },
+        { "ANSI_949", "ANSI_949 (韩文)",     DRW_DoubleTable949, CPLENGHT949 },
+        { "ANSI_950", "ANSI_950 (繁体中文)", DRW_DoubleTable950, CPLENGHT950 },
+        { "ANSI_932", "ANSI_932 (日文)",     DRW_DoubleTable932, CPLENGHT932 },
+    };
+
+    for (const auto& page : pages) {
+        codec.setCodePage(std::string(page.codePage), false);
+        const QStringList problems = checkDbcsTable(codec, page.table, page.length);
+        QVERIFY2(problems.isEmpty(),
+                 qPrintable(QStringLiteral("%1 解码不一致：%2")
+                                .arg(QLatin1String(page.label))
+                                .arg(problems.join(QLatin1String(", ")))));
+    }
 }
 
 QTEST_MAIN(TestLibDxfRwCodec)

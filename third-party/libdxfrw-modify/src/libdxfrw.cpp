@@ -315,6 +315,14 @@ bool dxfRW::writeTextstyle(DRW_Textstyle *ent){
         writer->writeUtf8Caps(3, ent->font);
         writer->writeUtf8Caps(4, ent->bigFont);
     }
+    // 表记录的扩展数据。AutoCAD 把「从字体列表里选中的 TrueType 字体族名」
+    // 记在样式的 XDATA 里（1001 ACAD / 1000 SimSun / 1071 字体族标志），
+    // 此时 3 组码是空的——字体信息**只**存在于 XDATA。上游写出侧只给图元写
+    // 扩展数据，表记录一律不写，于是这类样式往返后字体丢失：CAD 退回默认的
+    // txt.shx，汉字整片变成 "?"。
+    if (!ent->extData.empty()) {
+        writeExtData(ent->extData);
+    }
     return true;
 }
 

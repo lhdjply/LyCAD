@@ -17,6 +17,7 @@
 #include "core/Entity.h"
 #include "core/Layer.h"
 #include "core/Selection.h"
+#include "core/TextStyle.h"
 #include "core/Types.h"
 
 #include <QObject>
@@ -93,6 +94,11 @@ public:
     // ---- 图层 ----------------------------------------------------------------
     LayerManager& layers() noexcept { return m_layers; }
     const LayerManager& layers() const noexcept { return m_layers; }
+
+    // ---- 文字样式 --------------------------------------------------------------
+    /// 文字样式表：图元只带样式名（DXF 7），字体按名在这里解析
+    TextStyleTable& textStyles() noexcept { return m_textStyles; }
+    const TextStyleTable& textStyles() const noexcept { return m_textStyles; }
 
     bool addLayer(const Layer& layer, QString* error = nullptr);
     bool removeLayer(const QString& name, bool moveEntitiesToDefault = true,
@@ -182,6 +188,7 @@ private:
     EntityId m_nextId = 1;
 
     LayerManager m_layers;
+    TextStyleTable m_textStyles;
     Selection* m_selection = nullptr;
     QUndoStack* m_undoStack = nullptr;
 

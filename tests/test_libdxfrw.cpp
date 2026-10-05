@@ -101,6 +101,31 @@ QHash<int, int> countByType(const Document& document)
     return counts;
 }
 
+/// 取出写出的 DXF 中某条表记录（按 0/类型 + 2/名称 定位）的组码值。
+/// 表记录不参与 LyCAD 的模型，只能按组码核对，故需要这样一个文本级小工具。
+QHash<QString, QString> tableRecord(const QStringList& lines, const QString& type,
+                                    const QString& name)
+{
+    for (int i = 0; i + 3 < lines.size(); ++i) {
+        if (lines.at(i).trimmed() != QLatin1String("0")
+            || lines.at(i + 1).trimmed() != type) {
+            continue;
+        }
+        QHash<QString, QString> fields;
+        int j = i + 2;
+        while (j + 1 < lines.size() && lines.at(j).trimmed() != QLatin1String("0")) {
+            fields.insert(lines.at(j).trimmed(), lines.at(j + 1).trimmed());
+            j += 2;
+        }
+        if (name.isEmpty()
+            || fields.value(QLatin1String("2")).compare(name, Qt::CaseInsensitive) == 0) {
+            return fields;      // 名称大小写不敏感：R12 写出时会整体转大写
+        }
+        i = j - 1;      // 外层循环的 ++i 正好落到下一条记录
+    }
+    return {};
+}
+
 /// 取出第一个指定类型的图元
 const Entity* firstOfType(const Document& document, EntityType type)
 {
@@ -129,6 +154,7 @@ private slots:
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
     void writtenActiveViewportCoversDrawing();
+    void writtenTextStylesRoundTrip();
 
     // ---- 两条独立实现互证 ----------------------------------------------------
 
@@ -314,29 +340,16 @@ void TestLibDxfRw::writtenActiveViewportCoversDrawing()
     QFile file(path);
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QStringList lines = QString::fromLatin1(file.readAll()).split(QLatin1Char('\n'));
+    const QHash<QString, QString> viewport =
+        tableRecord(lines, QStringLiteral("VPORT"), QStringLiteral("*ACTIVE"));
 
-    double centerX = 0.0;
-    double centerY = 0.0;
-    double viewHeight = 0.0;
-    double ratio = 0.0;
-    bool found = false;
-    for (int i = 0; i + 1 < lines.size() && !found; ++i) {
-        if (lines.at(i).trimmed() != QLatin1String("2")
-            || lines.at(i + 1).trimmed() != QLatin1String("*ACTIVE")) {
-            continue;
-        }
-        found = true;
-        for (int j = i + 2; j + 1 < lines.size(); j += 2) {
-            const QString code = lines.at(j).trimmed();
-            if (code == QLatin1String("0")) break;      // 记录结束
-            const double value = lines.at(j + 1).trimmed().toDouble();
-            if (code == QLatin1String("12")) centerX = value;
-            else if (code == QLatin1String("22")) centerY = value;
-            else if (code == QLatin1String("40")) viewHeight = value;
-            else if (code == QLatin1String("41")) ratio = value;
-        }
-    }
-    QVERIFY2(found, "文件里没有 *ACTIVE 视口记录，CAD 打开时会退回自己的默认视图");
+    QVERIFY2(!viewport.isEmpty(),
+             "文件里没有 *ACTIVE 视口记录，CAD 打开时会退回自己的默认视图");
+
+    const double centerX = viewport.value(QLatin1String("12")).toDouble();
+    const double centerY = viewport.value(QLatin1String("22")).toDouble();
+    const double viewHeight = viewport.value(QLatin1String("40")).toDouble();
+    const double ratio = viewport.value(QLatin1String("41")).toDouble();
     QVERIFY2(viewHeight > 0.0 && ratio > 0.0,
              qPrintable(QStringLiteral("视口尺寸非法：视高 %1，纵横比 %2")
                             .arg(viewHeight).arg(ratio)));
@@ -352,6 +365,133 @@ void TestLibDxfRw::writtenActiveViewportCoversDrawing()
              qPrintable(QStringLiteral("视口 x[%1, %2] y[%3, %4] 未覆盖图元范围 "
                                        "x[1000, 1340] y[500, 700]")
                             .arg(minX).arg(maxX).arg(minY).arg(maxY)));
+}
+
+// -----------------------------------------------------------------------------
+//  文字样式的字体必须随文件往返。
+//
+//  字体信息只存在于 STYLE 表里，图元只带样式名（DXF 7）。因此导出必须做两件事：
+//    · 把样式表按原样写回（3/4 组码，以及 AutoCAD 用来记录 TrueType 字体的
+//      ACAD 扩展数据：1001 ACAD / 1000 SimSun / 1071 字体族标志）；
+//    · 给每个文字图元写回它的样式名。
+//  少了任何一半，CAD 都只能退回默认的 txt.shx——那是没有汉字字形的 SHX 字体，
+//  汉字整片变成 "?"。同一张图里 MTEXT 正常、TEXT 全是问号，极易被误判成编码问题。
+void TestLibDxfRw::writtenTextStylesRoundTrip()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    Document source;
+
+    // 三种真实存在的字体描述方式，各来一条
+    TextStyle& bigFont = source.textStyles().ensure(QStringLiteral("HZLZB"));
+    bigFont.setFontFile(QStringLiteral("txt"));
+    bigFont.setBigFontFile(QStringLiteral("hztxt.shx"));
+
+    TextStyle& ttf = source.textStyles().ensure(QStringLiteral("PaperStyle"));
+    ttf.setFontFile(QStringLiteral("simhei.ttf"));
+
+    // 3/4 组码为空，字体**只**在扩展数据里——中文图纸的 Standard 就是这种形态
+    TextStyle& xdata = source.textStyles().ensure(QStringLiteral("Standard"));
+    xdata.setFontFile(QString());
+    xdata.setBigFontFile(QString());
+    xdata.setTtfName(QStringLiteral("SimSun"));
+    xdata.setTtfFlags(34306);
+
+    // 文件没提供任何字体信息的样式：导出时应补上中文兜底字体，而不是写空
+    source.textStyles().ensure(QStringLiteral("NoFontInfo"));
+
+    const auto addText = [&source](const QString& content, const QString& style) {
+        auto text = std::make_unique<TextEntity>(content, Point2D(0.0, 0.0), 3.5, 0.0);
+        text->setFontStyle(style);
+        source.addEntity(std::move(text));
+    };
+    addText(QStringLiteral("大字体"), QStringLiteral("HZLZB"));
+    addText(QStringLiteral("TrueType"), QStringLiteral("PaperStyle"));
+    addText(QStringLiteral("扩展数据字体"), QStringLiteral("Standard"));
+    addText(QStringLiteral("无字体信息"), QStringLiteral("NoFontInfo"));
+
+    const QString path = dir.filePath(QStringLiteral("styles.dxf"));
+    DxfCodec dxf;
+    QVERIFY(dxf.write(path, source, r2000Options()).ok);
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QStringList lines = QString::fromLatin1(file.readAll()).split(QLatin1Char('\n'));
+    const auto style = [&lines](const QString& name) {
+        return tableRecord(lines, QStringLiteral("STYLE"), name);
+    };
+
+    QCOMPARE(style(QStringLiteral("HZLZB")).value(QLatin1String("3")), QStringLiteral("txt"));
+    QCOMPARE(style(QStringLiteral("HZLZB")).value(QLatin1String("4")), QStringLiteral("hztxt.shx"));
+    QCOMPARE(style(QStringLiteral("PaperStyle")).value(QLatin1String("3")), QStringLiteral("simhei.ttf"));
+
+    // TrueType 字体：字体名写在扩展数据里，导出必须原样保留
+    const QHash<QString, QString> standard = style(QStringLiteral("Standard"));
+    QVERIFY2(standard.value(QLatin1String("3")).isEmpty(),
+             "Standard 的主字体应当是空的（字体在扩展数据里）");
+    QCOMPARE(standard.value(QLatin1String("1000")), QStringLiteral("SimSun"));
+    QCOMPARE(standard.value(QLatin1String("1071")), QStringLiteral("34306"));
+
+    // 文件没给字体的样式：补中文兜底字体，否则汉字没有字形
+    QVERIFY2(!style(QStringLiteral("NoFontInfo")).value(QLatin1String("4")).isEmpty(),
+             "缺字体信息的样式未补中文大字体，汉字会被 CAD 渲染成 ?");
+
+    // R12 不支持 TrueType：字体只在扩展数据里的样式必须落到大字体上，
+    // 否则这份 R12 文件里的汉字没有任何字形可用。
+    {
+        const QString r12Path = dir.filePath(QStringLiteral("styles_r12.dxf"));
+        WriteOptions r12;
+        r12.version = QStringLiteral("AC1009");
+        QVERIFY(dxf.write(r12Path, source, r12).ok);
+
+        QFile r12File(r12Path);
+        QVERIFY(r12File.open(QIODevice::ReadOnly));
+        const QStringList r12Lines =
+            QString::fromLatin1(r12File.readAll()).split(QLatin1Char('\n'));
+        const QHash<QString, QString> r12Standard =
+            tableRecord(r12Lines, QStringLiteral("STYLE"), QStringLiteral("Standard"));
+        QVERIFY2(!r12Standard.value(QLatin1String("4")).isEmpty(),
+                 "R12 里的 Standard 未落到中文字体上，汉字会没有字形");
+        QVERIFY2(r12Standard.value(QLatin1String("1000")).isEmpty(),
+                 "R12 不支持 TrueType，不应写 TrueType 扩展数据");
+    }
+
+    // 图元的样式名回写
+    QHash<QString, int> used;
+    for (EntityId id : source.drawOrder()) {
+        const Entity* entity = source.entity(id);
+        if (entity && entity->type() == EntityType::Text) {
+            used[static_cast<const TextEntity*>(entity)->fontStyle()] += 1;
+        }
+    }
+    QCOMPARE(used.value(QStringLiteral("HZLZB")), 1);
+    QCOMPARE(used.value(QStringLiteral("PaperStyle")), 1);
+    QCOMPARE(used.value(QStringLiteral("Standard")), 1);
+    QCOMPARE(used.value(QStringLiteral("NoFontInfo")), 1);
+
+    // 读回来：样式表与图元的样式名都要还在
+    Document loaded;
+    QVERIFY(readDxfWithLibDxfRw(path, loaded).ok);
+
+    const TextStyle* loadedBig = loaded.textStyles().find(QStringLiteral("HZLZB"));
+    QVERIFY(loadedBig != nullptr);
+    QCOMPARE(loadedBig->fontFile(), QStringLiteral("txt"));
+    QCOMPARE(loadedBig->bigFontFile(), QStringLiteral("hztxt.shx"));
+
+    const TextStyle* loadedXdata = loaded.textStyles().find(QStringLiteral("Standard"));
+    QVERIFY(loadedXdata != nullptr);
+    QCOMPARE(loadedXdata->ttfName(), QStringLiteral("SimSun"));
+    QCOMPARE(loadedXdata->ttfFlags(), 34306);
+
+    int styled = 0;
+    for (EntityId id : loaded.drawOrder()) {
+        const Entity* entity = loaded.entity(id);
+        if (!entity || entity->type() != EntityType::Text) continue;
+        const QString name = static_cast<const TextEntity*>(entity)->fontStyle();
+        if (name == QLatin1String("HZLZB") || name == QLatin1String("PaperStyle")) ++styled;
+    }
+    QCOMPARE(styled, 2);
 }
 
 void TestLibDxfRw::readsDwgSample()
