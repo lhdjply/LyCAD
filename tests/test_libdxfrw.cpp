@@ -25,6 +25,7 @@
 #include "io/DxfCodec.h"
 #include "io/LibDxfRwAdapter.h"
 
+#include <QFile>
 #include <QFileInfo>
 #include <QHash>
 #include <QTemporaryDir>
@@ -125,6 +126,9 @@ private slots:
     void readsTextRotationAsDegrees();
     void readsPolylineBulge();
     void readsDimensionDefinitionPoints();
+
+    // ---- 写出后的「打开即见图形」--------------------------------------------
+    void writtenActiveViewportCoversDrawing();
 
     // ---- 两条独立实现互证 ----------------------------------------------------
 
@@ -282,6 +286,72 @@ void TestLibDxfRw::readsDimensionDefinitionPoints()
     QVERIFY(dim.secondPoint().distanceTo(Point2D(80.0, 0.0)) < kTol);
     QVERIFY(dim.dimLinePoint().distanceTo(Point2D(40.0, -15.0)) < kTol);
     QVERIFY(std::abs(dim.measurement() - 80.0) < kTol);
+}
+
+// -----------------------------------------------------------------------------
+//  「打开文件是空白」的回归测试。
+//
+//  AutoCAD 系软件（AutoCAD / GstarCAD）打开图形时，第一眼看到哪里由 DXF 的
+//  `*ACTIVE` 视口记录决定，而不是自动缩放到范围。写出器若把这一步交给
+//  libdxfrw 的默认视口（视图中心 (0.651828, -0.16)、视高 5.13732），
+//  画面就停在原点附近；图元一旦不在原点附近，用户打开后看到的就是一片空白
+//  ——实测 GstarCAD 正是如此。这里把图元有意放在远离原点处，让默认视口必然失败。
+void TestLibDxfRw::writtenActiveViewportCoversDrawing()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    Document source;
+    source.addEntity(std::make_unique<LineEntity>(Point2D(1000.0, 500.0),
+                                                 Point2D(1200.0, 700.0)));
+    source.addEntity(std::make_unique<CircleEntity>(Point2D(1300.0, 600.0), 40.0));
+
+    const QString path = dir.filePath(QStringLiteral("viewport.dxf"));
+    DxfCodec dxf;
+    QVERIFY(dxf.write(path, source, r2000Options()).ok);
+
+    // VPORT 只是表记录，LyCAD 自身不建模它，因此按组码核对原始文本。
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QStringList lines = QString::fromLatin1(file.readAll()).split(QLatin1Char('\n'));
+
+    double centerX = 0.0;
+    double centerY = 0.0;
+    double viewHeight = 0.0;
+    double ratio = 0.0;
+    bool found = false;
+    for (int i = 0; i + 1 < lines.size() && !found; ++i) {
+        if (lines.at(i).trimmed() != QLatin1String("2")
+            || lines.at(i + 1).trimmed() != QLatin1String("*ACTIVE")) {
+            continue;
+        }
+        found = true;
+        for (int j = i + 2; j + 1 < lines.size(); j += 2) {
+            const QString code = lines.at(j).trimmed();
+            if (code == QLatin1String("0")) break;      // 记录结束
+            const double value = lines.at(j + 1).trimmed().toDouble();
+            if (code == QLatin1String("12")) centerX = value;
+            else if (code == QLatin1String("22")) centerY = value;
+            else if (code == QLatin1String("40")) viewHeight = value;
+            else if (code == QLatin1String("41")) ratio = value;
+        }
+    }
+    QVERIFY2(found, "文件里没有 *ACTIVE 视口记录，CAD 打开时会退回自己的默认视图");
+    QVERIFY2(viewHeight > 0.0 && ratio > 0.0,
+             qPrintable(QStringLiteral("视口尺寸非法：视高 %1，纵横比 %2")
+                            .arg(viewHeight).arg(ratio)));
+
+    const double halfWidth = viewHeight * ratio / 2.0;
+    const double halfHeight = viewHeight / 2.0;
+    const double minX = centerX - halfWidth;
+    const double maxX = centerX + halfWidth;
+    const double minY = centerY - halfHeight;
+    const double maxY = centerY + halfHeight;
+
+    QVERIFY2(minX <= 1000.0 && maxX >= 1340.0 && minY <= 500.0 && maxY >= 700.0,
+             qPrintable(QStringLiteral("视口 x[%1, %2] y[%3, %4] 未覆盖图元范围 "
+                                       "x[1000, 1340] y[500, 700]")
+                            .arg(minX).arg(maxX).arg(minY).arg(maxY)));
 }
 
 void TestLibDxfRw::readsDwgSample()

@@ -1229,6 +1229,9 @@ namespace {
 
 constexpr double kRadToDeg = 57.29577951308232;
 
+/// 退化图形（单点、零长度）的兜底尺度：视高为 0 的视口等于没有视图
+constexpr double kMinExtent = 1e-3;
+
 /// 把 LyCAD 实体的公共属性搬到 DRW_Entity（图层/颜色/线型/线宽）
 void applyCommonWrite(DRW_Entity& target, const Entity& source)
 {
@@ -1367,13 +1370,7 @@ public:
         header.addInt("$ATTMODE", 1, 70);
 
         // 全图范围（空图回退到 A4 横向尺寸）
-        Box2D box;
-        for (EntityId id : m_doc.drawOrder()) {
-            if (const Entity* e = m_doc.entity(id)) {
-                if (!e->isDisplayable(m_doc.layers())) continue;
-                box.expand(e->boundingBox());
-            }
-        }
+        const Box2D box = drawingExtents();
         const Point2D extMin = box.isValid() ? box.minCorner() : Point2D(0.0, 0.0);
         const Point2D extMax = box.isValid() ? box.maxCorner() : Point2D(420.0, 297.0);
         DRW_Coord minC; applyCoord(minC, extMin);
@@ -1432,11 +1429,41 @@ public:
         }
     }
 
-    // 库会自动补 Standard 文字样式 / *ACTIVE 视口 / Standard 标注样式 / ACAD 应用程序
+    // 库会自动补 Standard 文字样式 / Standard 标注样式 / ACAD 应用程序
     void writeTextstyles() override {}
-    void writeVports() override {}
     void writeDimstyles() override {}
     void writeAppId() override {}
+
+    /// `*ACTIVE` 视口——它决定 CAD 打开本文件时**第一眼看到哪里**。
+    ///
+    /// 这一段不能省：`writeVports()` 为空时，libdxfrw 会自己补一个内置默认视口
+    /// （视图中心 (0.651828, -0.16)、视高 5.13732），那是一个贴在原点的极小窗口。
+    /// AutoCAD 系软件（含 GstarCAD / 浩辰CAD）打开图形时会直接采用 `*ACTIVE`
+    /// 里记录的视图，于是画面停在原点附近，而图元通常远在视野之外——用户看到
+    /// 的就是「打开是空白的」（实测：别人的文件能正常显示，往往只是因为它
+    /// 的 `*ACTIVE` 视图恰好落在图形上）。
+    /// 因此这里按图元范围写一个能装下全图的视图。
+    void writeVports() override
+    {
+        const Box2D box = drawingExtents();
+        const Point2D min = box.isValid() ? box.minCorner() : Point2D(0.0, 0.0);
+        const Point2D max = box.isValid() ? box.maxCorner() : Point2D(420.0, 297.0);
+
+        // 视口按 3:2 的横向绘图区估算；视高同时保证横竖两个方向都装得下整张图，
+        // 再留 6% 边距——图形贴边和「空白」只有一线之隔，宁松勿紧。
+        constexpr double kAspect = 1.5;
+        constexpr double kMargin = 1.06;
+        const double width = std::max(max.x - min.x, kMinExtent);
+        const double height = std::max(max.y - min.y, kMinExtent);
+
+        DRW_Vport viewport;
+        viewport.name = "*ACTIVE";
+        viewport.center.x = (min.x + max.x) / 2.0;
+        viewport.center.y = (min.y + max.y) / 2.0;
+        viewport.height = std::max(height, width / kAspect) * kMargin;
+        viewport.ratio = kAspect;
+        m_rw->writeVport(&viewport);
+    }
 
     /// R2000 的 BLOCK_RECORD 表：每个匿名块都要在此登记，写出块体时才能对上句柄
     void writeBlockRecords() override
@@ -1844,6 +1871,21 @@ private:
         m_rw->writeDimension(record.release());
     }
 
+    /// 全图图元范围。`$EXTMIN/$EXTMAX` 与 `*ACTIVE` 视口必须用同一个范围，
+    /// 否则「缩放到范围」与实际显示对不上；因此只算一次并缓存。
+    const Box2D& drawingExtents()
+    {
+        if (m_extentsReady) return m_extents;
+        for (EntityId id : m_doc.drawOrder()) {
+            if (const Entity* e = m_doc.entity(id)) {
+                if (!e->isDisplayable(m_doc.layers())) continue;
+                m_extents.expand(e->boundingBox());
+            }
+        }
+        m_extentsReady = true;
+        return m_extents;
+    }
+
     const Document& m_doc;
     dxfRW* m_rw = nullptr;
     bool m_r2000 = false;
@@ -1851,6 +1893,8 @@ private:
     int m_hatchDowngrades = 0;
     int m_splineDowngrades = 0;
     int m_ellipseDowngrades = 0;
+    Box2D m_extents;
+    bool m_extentsReady = false;
 };
 
 } // namespace
