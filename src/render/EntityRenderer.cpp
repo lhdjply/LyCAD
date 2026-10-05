@@ -430,12 +430,19 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
     // 垂直对齐：换算为**首行**基线相对锚点的偏移（设备帧内 y 向下为正）。
     // 单行时与原行为完全一致；多行时块的扩展方向：
     //   顶部对齐 → 块向下长    底部对齐 → 块向上长    中部对齐 → 两头伸
+    //
+    // 换算按 DXF 73 的语义：top/middle/bottom 量的是**字高（大写高度）框**，
+    // 不是字体的行框。QFontMetrics 的 ascent/descent 含字体内部行距，直接拿它
+    // 当字高会把整块文字压低约 0.1~0.4 倍字高——实测圆内的 "JK" 因此在圆里偏下
+    // （AutoCAD/浩辰把字高框的上沿贴在插入点上，字正好落在圆心）。
+    const double capPixels = capHeightPixels;                       // 字高（设备像素）
+    const double descentPixels = capPixels * TextEntity::kDescentRatio;
     double baselineOffset = 0.0;
     switch (text.vAlign()) {
     case TextEntity::VAlign::Baseline: baselineOffset = 0.0; break;
-    case TextEntity::VAlign::Bottom:   baselineOffset = -metrics.descent() - blockSpan; break;
-    case TextEntity::VAlign::Middle:   baselineOffset = (metrics.ascent() - metrics.descent() - blockSpan) * 0.5; break;
-    case TextEntity::VAlign::Top:      baselineOffset = metrics.ascent(); break;
+    case TextEntity::VAlign::Bottom:   baselineOffset = -descentPixels - blockSpan; break;
+    case TextEntity::VAlign::Middle:   baselineOffset = (capPixels - descentPixels - blockSpan) * 0.5; break;
+    case TextEntity::VAlign::Top:      baselineOffset = capPixels; break;
     }
 
     // 水平对齐按**各行**的宽度计算（多行时每行起点不同）

@@ -182,6 +182,9 @@ public:
     /// 未建模的实体类型 -> 个数
     const QHash<QString, int>& skippedTypes() const noexcept { return m_skipped; }
 
+    /// 降级保留的实体类型 -> 个数
+    const QHash<QString, int>& downgradedTypes() const noexcept { return m_downgraded; }
+
     /// 由块引用展开出的图元数
     int expandedCount() const noexcept { return m_expanded; }
 
@@ -281,6 +284,9 @@ private:
     /// 把图元放到正确的位置：块内 or 模型空间
     void place(std::unique_ptr<Entity> entity);
     void skip(const QString& type);
+    /// 降级保留：实体换了形式但内容没丢（如 MTEXT 按单行文字导入），
+    /// 与「跳过」分开计数——否则用户会以为文字被丢掉了。
+    void downgrade(const QString& what);
 
     /// 套用图层/颜色/线型/线宽等公共属性
     void applyCommon(Entity& entity, const DRW_Entity& source);
@@ -302,6 +308,7 @@ private:
     std::vector<PendingInsert> m_modelInserts;
 
     QHash<QString, int> m_skipped;
+    QHash<QString, int> m_downgraded;
     QString m_acadVersion;
     int m_missingBlocks = 0;
     int m_depthExceeded = 0;
@@ -381,6 +388,11 @@ void Builder::place(std::unique_ptr<Entity> entity)
 void Builder::skip(const QString& type)
 {
     m_skipped[type] = m_skipped.value(type, 0) + 1;
+}
+
+void Builder::downgrade(const QString& what)
+{
+    m_downgraded[what] = m_downgraded.value(what, 0) + 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -674,6 +686,38 @@ void Builder::addTrace(const DRW_Trace& data)
 /// 清理 MTEXT 的内联格式码：\P（段落）→ 空格；{…} 分组括号剥除；
 /// \W/\H/\A/\C/\c/\f/\F/\T/\Q/\S…; 这类「到分号为止」的控制串整段剥除；
 /// \\ 与 \{、\} 是转义字面量，还原后保留。
+/// 从 MTEXT 的内联格式码里取出**段落对齐**。
+///
+/// AutoCAD 的段落码形如 \pxql;（左）/ \pxqc;（中）/ \pxqr;（右）/ \pxqj;（两端）/
+/// \pxqd;（分散），见 Autodesk 的 MTEXT 格式码表。段落对齐**优先于**附着点里的
+/// 隐含对齐：实测某图纸的 MTEXT 附着点是「左上」，内容里却写着 \pxqc;，GstarCAD
+/// 按居中绘制——只按附着点换算会把整块文字画成左对齐，正是「文字错位」的来源。
+/// 返回 false 表示文件里没有段落对齐码，沿用附着点的换算结果。
+bool paragraphAlignment(const QString& raw, TextEntity::HAlign& alignment)
+{
+    for (int i = 0; i + 2 < raw.size(); ++i) {
+        if (raw.at(i) != QLatin1Char('\\')) continue;
+        if (raw.at(i + 1) != QLatin1Char('p')) continue;
+        // \p<...>; 里找 xq + 对齐字母
+        int end = i + 2;
+        while (end < raw.size() && raw.at(end) != QLatin1Char(';')) ++end;
+        for (int k = i + 2; k + 1 < end; ++k) {
+            if (raw.at(k) != QLatin1Char('q')) continue;
+            switch (raw.at(k + 1).toLatin1()) {
+            case 'l': alignment = TextEntity::HAlign::Left;   return true;
+            case 'c': alignment = TextEntity::HAlign::Center; return true;
+            case 'r': alignment = TextEntity::HAlign::Right;  return true;
+            // 两端/分散对齐在单行文字上没有对应画法，居中是最接近的近似
+            case 'j':
+            case 'd': alignment = TextEntity::HAlign::Center; return true;
+            default: break;
+            }
+        }
+        i = end;
+    }
+    return false;
+}
+
 QString stripMTextCodes(const QString& raw)
 {
     QString out;
@@ -824,17 +868,25 @@ void Builder::addMText(const DRW_MText& data)
     //   · 41 组码是**栏宽**，被读进了 widthscale。
     // 降级时按 MTEXT 语义重新映射：旋转取自 X 轴方向（度，makeText 会再转弧度），
     // 对齐由附着点换算，对齐点 = 插入点，宽度因子固定 1。
+    const QString rawText = toQString(data.text);
     DRW_Text plain;
-    plain.text = stripMTextCodes(toQString(data.text)).toStdString();
+    plain.text = stripMTextCodes(rawText).toStdString();
     plain.basePoint = data.basePoint;
     plain.height = data.height;
+
+    // 文字 X 轴方向（11 组码）：参考矩形的宽度沿这个方向量
+    Point2D dir(1.0, 0.0);
     if (data.hasXAxisDirection()
         && std::hypot(data.secPoint.x, data.secPoint.y) > kGeomTol) {
-        plain.angle = radToDeg(std::atan2(data.secPoint.y, data.secPoint.x));
+        const double dirLen = std::hypot(data.secPoint.x, data.secPoint.y);
+        dir = Point2D(data.secPoint.x / dirLen, data.secPoint.y / dirLen);
+        plain.angle = radToDeg(std::atan2(dir.y, dir.x));
     } else {
         plain.angle = data.angle;             // 少数生成器直接写 50 组码（度）
     }
+
     const int attachment = std::clamp(data.textgen, 1, 9);
+    const int column = (attachment - 1) % 3;  // 附着点落在矩形哪条竖边：0 左 1 中 2 右
     switch (attachment) {                     // 列：0 左 1 中 2 右
     case 2: case 5: case 8: plain.alignH = DRW_Text::HCenter; break;
     case 3: case 6: case 9: plain.alignH = DRW_Text::HRight;  break;
@@ -845,7 +897,30 @@ void Builder::addMText(const DRW_MText& data)
     case 7: case 8: case 9: plain.alignV = DRW_Text::VBottom; break;
     default:                plain.alignV = DRW_Text::VTop;    break;
     }
-    plain.secPoint = data.basePoint;          // 对齐点 = 插入点
+    // 段落对齐码（\pxqc; 等）覆盖附着点隐含的横向对齐
+    TextEntity::HAlign paragraph = TextEntity::HAlign::Left;
+    if (paragraphAlignment(rawText, paragraph)) {
+        switch (paragraph) {
+        case TextEntity::HAlign::Center: plain.alignH = DRW_Text::HCenter; break;
+        case TextEntity::HAlign::Right:  plain.alignH = DRW_Text::HRight;  break;
+        default:                         plain.alignH = DRW_Text::HLeft;   break;
+        }
+    }
+
+    // MTEXT 的文字是在一个「插入点 + 宽度」的参考矩形里排版的（41 组码 = 矩形宽度，
+    // 11/21 = 文字 X 轴方向）：插入点是附着点所在的那条边/角，行内文字再按对齐方式
+    // 落在矩形里。降级成单行文字时必须把这份「矩形内的对齐」换算成对齐点，否则整块
+    // 文字会偏最多一个矩形宽——实测本文件 "JK" 偏了 40 个单位（矩形宽 79.24）。
+    const double rectWidth = std::abs(data.widthscale) > kGeomTol
+                             ? std::abs(data.widthscale) : 0.0;
+    const double rectLeft = -column * 0.5 * rectWidth;     // 相对插入点，沿文字方向
+    double anchorAlong = rectLeft;
+    if (plain.alignH == DRW_Text::HCenter)      anchorAlong = rectLeft + rectWidth * 0.5;
+    else if (plain.alignH == DRW_Text::HRight)  anchorAlong = rectLeft + rectWidth;
+
+    plain.secPoint = DRW_Coord(data.basePoint.x + dir.x * anchorAlong,
+                               data.basePoint.y + dir.y * anchorAlong,
+                               data.basePoint.z);
     plain.textgen = 0;
     plain.widthscale = 1.0;
     plain.style = data.style;
@@ -853,7 +928,7 @@ void Builder::addMText(const DRW_MText& data)
     if (entity) {
         applyCommon(*entity, data);
         place(std::move(entity));
-        skip(QStringLiteral("MTEXT(按单行文字导入)"));
+        downgrade(QStringLiteral("MTEXT(按单行文字导入)"));
     }
 }
 
@@ -1224,6 +1299,12 @@ IoResult buildResult(Document& document, Builder& builder, int expanded,
     if (expanded > 0) {
         result.addWarning(QStringLiteral("块引用已展开为独立图元（本软件不建模块定义，"
                                          "共 %1 个图元）").arg(expanded));
+    }
+
+    // 降级保留的（换了形式但内容在）与真正跳过的分开报，避免误导
+    for (auto it = builder.downgradedTypes().constBegin();
+         it != builder.downgradedTypes().constEnd(); ++it) {
+        result.addWarning(QStringLiteral("降级 %1 个：%2").arg(it.value()).arg(it.key()));
     }
 
     // 未建模的实体按类型计数上报，绝不静默丢弃

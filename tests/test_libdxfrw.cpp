@@ -153,6 +153,7 @@ private slots:
     void readsDimensionDefinitionPoints();
     void outOfRangeCoordinatesAreSkipped();
     void writtenHatchBoundaryKeepsBulgeSlots();
+    void mtextParagraphAlignmentAndRectAnchor();
     void writtenHatchPatternDefinitionRoundTrips();
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
@@ -623,6 +624,63 @@ void TestLibDxfRw::writtenHatchPatternDefinitionRoundTrips()
     // 读回来仍是「最终间距」：定义偏移 6.35 × 比例 0.5 = 3.175
     QVERIFY(std::abs(readBack->patternLines().front().angle - kPi / 4.0) < kTol);
     QVERIFY(std::abs(readBack->definedSpacing() - 3.175) < 1e-9);
+}
+
+// -----------------------------------------------------------------------------
+//  MTEXT 降级为单行文字：段落对齐码与「插入点 + 参考矩形宽度」都要算进去。
+//
+//  MTEXT 的文字排在一个参考矩形里（10/20 = 附着点，41 = 矩形宽度）：附着点决定
+//  矩形哪条边贴着插入点，段落对齐码（\pxqc; 等）决定行在矩形里的横向位置。
+//  只看附着点、把格式码一律剥掉，整块文字就会错位——实测某图纸的 "JK" 偏了
+//  40 个单位（矩形宽 79.24），中文说明行则从居中变成左对齐。
+void TestLibDxfRw::mtextParagraphAlignmentAndRectAnchor()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("mtext.dxf"));
+
+    // 最小 DXF：一条「左上附着点 + 段落居中 + 矩形宽 40」的 MTEXT，
+    // 和一条同样附着点但没有段落码的 MTEXT（对照）
+    const QByteArray content =
+        "0\nSECTION\n2\nENTITIES\n"
+        "0\nMTEXT\n5\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n100.0\n20\n50.0\n40\n2.5\n41\n40.0\n71\n1\n72\n5\n"
+        "1\n\\pxqc;测试文字\n"
+        "0\nMTEXT\n5\n101\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n200.0\n20\n50.0\n40\n2.5\n41\n40.0\n71\n1\n72\n5\n"
+        "1\n左对齐文字\n"
+        "0\nENDSEC\n0\nEOF\n";
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(content);
+    file.close();
+
+    Document document;
+    const IoResult result = readDxfWithLibDxfRw(path, document);
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(document.entityCount(), std::size_t(2));
+
+    std::vector<const TextEntity*> texts;
+    for (EntityId id : document.drawOrder()) {
+        const Entity* e = document.entity(id);
+        if (e && e->type() == EntityType::Text) texts.push_back(static_cast<const TextEntity*>(e));
+    }
+    QCOMPARE(texts.size(), std::size_t(2));
+
+    for (const TextEntity* text : texts) {
+        if (text->content().contains(QStringLiteral("测试文字"))) {
+            // 段落码 \pxqc; → 居中；锚点 = 矩形中心 = 插入点 + 宽度/2
+            QCOMPARE(text->hAlign(), TextEntity::HAlign::Center);
+            QVERIFY(std::abs(text->effectivePosition().x - (100.0 + 40.0 * 0.5)) < 1e-6);
+            QVERIFY(std::abs(text->effectivePosition().y - 50.0) < 1e-6);
+        } else {
+            QCOMPARE(text->content(), QStringLiteral("左对齐文字"));
+            QCOMPARE(text->hAlign(), TextEntity::HAlign::Left);
+            // 没有段落码：按附着点（左上）左对齐，锚点就是插入点
+            QVERIFY(std::abs(text->effectivePosition().x - 200.0) < 1e-6);
+        }
+    }
 }
 
 void TestLibDxfRw::readsDwgSample()
