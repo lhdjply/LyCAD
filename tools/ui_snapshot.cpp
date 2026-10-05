@@ -33,6 +33,7 @@
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QGroupBox>
+#include <QLabel>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPixmap>
@@ -45,6 +46,7 @@
 #include <QTextStream>
 #include <QTimer>
 
+#include <limits>
 #include <memory>
 
 using namespace lycad;
@@ -494,6 +496,84 @@ int main(int argc, char* argv[])
             ++failures;
         }
 
+        // 面板要能一眼看出「哪里是一块」：面板底色必须与功能区底色有可分辨的差异。
+        // 早先面板与功能区同色，只靠面板之间一条 1px 竖线区分，按钮一多就看不出
+        // 分组了。这里直接取渲染结果的两个像素比对，比核对调色板更接近用户所见。
+        // 深浅两套主题各查一次（深色主题在下面切换）。
+        const auto reportPanelContrast = [&](const QString& theme) {
+            const QList<RibbonPanel*> panels = ribbon->findChildren<RibbonPanel*>();
+            if (panels.size() < 2) return;
+
+            const QImage shot = ribbon->grab().toImage();
+            // 面板左上角往里三个像素：避开 1px 描边，落在面板自身的底色上
+            const QRect first = panels.at(0)->geometry();
+            const QRect second = panels.at(1)->geometry();
+            const QPoint inside(first.left() + first.width() / 2, first.top() + 3);
+            const QPoint gap(second.left() - 2, second.top() + 3);
+
+            const int insideGray = qGray(shot.pixel(inside));
+            const int gapGray = qGray(shot.pixel(gap));
+            const int delta = std::abs(insideGray - gapGray);
+            const bool distinct = delta >= 3;
+
+            out() << QStringLiteral("  面板分块（%1）：面板底色灰度 %2，功能区底色灰度 %3（差 %4）→ %5")
+                         .arg(theme)
+                         .arg(insideGray)
+                         .arg(gapGray)
+                         .arg(delta)
+                         .arg(distinct ? QStringLiteral("看得出分块")
+                                       : QStringLiteral("与背景同色，看不出分块"))
+                  << Qt::endl;
+            if (!distinct) ++failures;
+        };
+        reportPanelContrast(QStringLiteral("浅色"));
+
+        // 同一个面板里，小按钮必须与大按钮**共用一条顶线**：次要命令竖排成列时
+        // 一律靠顶部排列，而不是在面板里垂直居中。
+        //
+        // 这条曾经是错的：每列上下各留一段空白做居中，居中量又随面板不同
+        // （面板里大按钮个数不同，分到的高度不同），结果同一条工具栏上
+        // 「撤销/重做」比「新建/打开/保存」低一大截、「矩形/点」又是另一个高度。
+        // 用坐标钉住它，比看截图可靠。
+        {
+            int worstDelta = 0;
+            QString worstPanel;
+            for (RibbonPanel* panel : ribbon->findChildren<RibbonPanel*>()) {
+                int largeTop = std::numeric_limits<int>::max();
+                int smallTop = std::numeric_limits<int>::max();
+                for (QToolButton* button : panel->findChildren<QToolButton*>()) {
+                    if (button->text().isEmpty()) continue;
+                    const int top = button->mapTo(&window, QPoint(0, 0)).y();
+                    if (button->toolButtonStyle() == Qt::ToolButtonTextUnderIcon) {
+                        largeTop = std::min(largeTop, top);
+                    } else {
+                        smallTop = std::min(smallTop, top);
+                    }
+                }
+                if (largeTop == std::numeric_limits<int>::max()
+                    || smallTop == std::numeric_limits<int>::max()) {
+                    continue;      // 只有大按钮或只有小按钮的面板无需比较
+                }
+                const int delta = std::abs(smallTop - largeTop);
+                if (delta > worstDelta) {
+                    worstDelta = delta;
+                    const auto* label =
+                        panel->findChild<QLabel*>(QStringLiteral("ribbonPanelTitle"));
+                    worstPanel = label ? label->text() : QStringLiteral("?");
+                }
+            }
+
+            const bool aligned = worstDelta <= 3;      // 允许布局取整的几像素误差
+            out() << QStringLiteral("  功能区顶线：小按钮与大按钮顶边最大相差 %1 px%2 → %3")
+                         .arg(worstDelta)
+                         .arg(worstPanel.isEmpty() ? QString()
+                                                   : QStringLiteral("（%1）").arg(worstPanel),
+                              aligned ? QStringLiteral("靠顶对齐")
+                                      : QStringLiteral("有按钮浮在中间"))
+                  << Qt::endl;
+            if (!aligned) ++failures;
+        }
+
         // 通过功能区上的真实按钮切换深色主题，顺带验证：
         // 按钮 → MainWindow → RibbonBar + IconLibrary + 画布 这条链路。
         QToolButton* themeButton = nullptr;
@@ -538,6 +618,10 @@ int main(int argc, char* argv[])
                                          : QStringLiteral("未切换"))
                   << Qt::endl;
             if (!ribbonDark || !iconsDark || !canvasDark) ++failures;
+
+            // 深色下再查一次面板分块：两套主题的面板底色是各自取的，
+            // 只查浅色会让深色那一档悄悄退回「与功能区同色」。
+            reportPanelContrast(QStringLiteral("深色"));
 
             if (!capture(application, window, dir.filePath(QStringLiteral("ui_theme_dark.png")))) {
                 ++failures;

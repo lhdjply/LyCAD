@@ -69,8 +69,15 @@ QFont smallerFont(const QFont& base, double delta)
 RibbonPanel::RibbonPanel(const QString& title, QWidget* parent)
     : QWidget(parent)
 {
+    // 面板自带底色与描边（见 RibbonBar::applyStyle 里的 #ribbonPanel 规则），
+    // 好让「文件 / 绘图 / 修改」在功能区上明确地分成几块——只靠面板之间一条
+    // 1px 竖线时，按钮一多就看不出分组了。
+    // QWidget 的派生类默认不拿样式表里的 background 作画，必须显式打开。
+    setObjectName(QStringLiteral("ribbonPanel"));
+    setAttribute(Qt::WA_StyledBackground, true);
+
     auto* root = new QVBoxLayout(this);
-    root->setContentsMargins(4, 3, 4, 0);
+    root->setContentsMargins(6, 4, 6, 1);
     root->setSpacing(1);
 
     m_body = new QHBoxLayout;
@@ -87,8 +94,8 @@ RibbonPanel::RibbonPanel(const QString& title, QWidget* parent)
 
 void RibbonPanel::flushColumn()
 {
-    // 收尾时在底部补一段空白，让不足三行的小按钮列在面板内保持垂直居中
-    if (m_column) m_column->addStretch(1);
+    // 结束当前小按钮列。列本身不需要在底部补空白来「托住」按钮——
+    // 靠顶由列的对齐方式决定（见 startColumn），这里只负责收尾。
     m_column = nullptr;
     m_columnRows = 0;
 }
@@ -100,8 +107,15 @@ QVBoxLayout* RibbonPanel::startColumn()
     auto* column = new QVBoxLayout;
     column->setContentsMargins(0, 0, 0, 0);
     column->setSpacing(1);
-    column->addStretch(1);
     m_body->addLayout(column);
+
+    // 这一列在面板内**靠顶部**摆放：列只占自身内容的高度，多出来的高度交给
+    // 会伸缩的大按钮。曾经靠「列内上下各加一段弹性空白」来摆位置，效果是垂直
+    // 居中——面板里大按钮的个数不同、分给各列的高度就不同，于是同一条工具栏上
+    // 「撤销/重做」「矩形/点」「填充」各停在一个高度上，参差不齐。
+    if (QLayoutItem* item = m_body->itemAt(m_body->count() - 1)) {
+        item->setAlignment(Qt::AlignTop);
+    }
 
     m_column = column;
     return column;
@@ -180,12 +194,16 @@ void RibbonPanel::addWidget(QWidget* widget)
 {
     flushColumn();
 
+    // 与大按钮、小按钮列同一条顶线：靠顶部对齐，多出来的高度落在下方。
+    // 上下各留一段空白做垂直居中会把下拉框压在面板中间，与相邻面板的按钮
+    // 不在一条顶线上。
     auto* column = new QVBoxLayout;
     column->setContentsMargins(0, 0, 0, 0);
-    column->addStretch(1);
     column->addWidget(widget);
-    column->addStretch(1);
     m_body->addLayout(column);
+    if (QLayoutItem* item = m_body->itemAt(m_body->count() - 1)) {
+        item->setAlignment(Qt::AlignTop);
+    }
 }
 
 void RibbonPanel::addSeparator()
@@ -207,8 +225,9 @@ RibbonBar::RibbonBar(QWidget* parent)
     : QWidget(parent)
 {
     m_layout = new QHBoxLayout(this);
-    m_layout->setContentsMargins(2, 3, 2, 0);
-    m_layout->setSpacing(0);
+    // 面板自带边框，四周与彼此之间都要留出间距，否则描边会贴着窗口边缘或相邻面板
+    m_layout->setContentsMargins(4, 4, 4, 4);
+    m_layout->setSpacing(4);
 
     // 高度由内容决定，宽度跟随窗口
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
@@ -229,11 +248,8 @@ RibbonBar::RibbonBar(QWidget* parent)
 
 RibbonPanel* RibbonBar::addPanel(const QString& title)
 {
-    if (!m_layout->isEmpty()) {
-        // 底部留出面板标题的高度，分隔线不与标题齐平
-        m_layout->addWidget(makeVerticalSeparator(this, 4, 19));
-    }
-
+    // 面板之间不再画竖线：每个面板自带底色与描边，「哪里是一块」由面板本身
+    // 表达（见 RibbonPanel 的构造函数与 applyStyle）。只留一点间距，避免两块贴在一起。
     auto* panel = new RibbonPanel(title, this);
     connect(panel, &RibbonPanel::commandTriggered, this, &RibbonBar::commandTriggered);
     m_layout->addWidget(panel);
@@ -298,6 +314,8 @@ void RibbonBar::applyStyle()
         { "@disabledText@",   c.disabledText },
         { "@titleText@",      c.subtleText },
         { "@separator@",      c.border },
+        { "@panelBg@",        c.ribbonPanelBackground },
+        { "@panelBorder@",    c.ribbonPanelBorder },
         { "@fieldBg@",        c.fieldBackground },
         { "@fieldBorder@",    c.fieldBorder },
         { "@fieldText@",      c.fieldText },
@@ -308,6 +326,13 @@ void RibbonBar::applyStyle()
 #ribbonBar {
     background: @background@;
     border-bottom: 1px solid @border@;
+}
+/* 面板自成一块：底色与描边把「文件 / 绘图 / 修改…」分开，
+   面板之间的分隔线因此不再需要（见 RibbonBar::addPanel）。 */
+#ribbonBar QWidget#ribbonPanel {
+    background: @panelBg@;
+    border: 1px solid @panelBorder@;
+    border-radius: 4px;
 }
 #ribbonBar QToolButton {
     background: transparent;

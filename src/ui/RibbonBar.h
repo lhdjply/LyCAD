@@ -47,7 +47,7 @@ public:
     QToolButton* addSmallCommand(const QString& iconName, const QString& text,
                                  const QString& command, const QString& tooltip);
 
-    /// 嵌入任意控件（下拉框等），在面板内垂直居中
+    /// 嵌入任意控件（下拉框等），与按钮一样靠面板顶部对齐
     void addWidget(QWidget* widget);
 
     /// 插入一条竖线，把面板内容分成两组

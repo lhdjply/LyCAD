@@ -35,6 +35,10 @@ const Palette& lightPalette()
 
         /* ribbonBackground  */ QColor(0xf4, 0xf5, 0xf7),
         /* ribbonBorder      */ QColor(0xc4, 0xc9, 0xd0),
+        // 面板比功能区底色更亮：浅色主题里「亮」= 抬起，与输入框用白色表示凹陷
+        // 是相反的一路；描边比底色深一档，保证分块边界清晰
+        /* ribbonPanelBackground */ QColor(0xff, 0xff, 0xff),
+        /* ribbonPanelBorder     */ QColor(0xd2, 0xd7, 0xdd),
         /* hoverBackground   */ QColor(0xe2, 0xec, 0xf8),
         /* hoverBorder       */ QColor(0xa8, 0xc6, 0xe6),
         /* pressedBackground */ QColor(0xca, 0xdf, 0xf5),
@@ -76,6 +80,10 @@ const Palette& darkPalette()
 
         /* ribbonBackground  */ QColor(0x2b, 0x30, 0x38),
         /* ribbonBorder      */ QColor(0x19, 0x1d, 0x23),
+        // 深色下面板反过来比功能区更暗：按钮的悬停/按下配色是按功能区底色调的，
+        // 面板若做成更亮的一档，悬停色（0x39…) 会贴得几乎看不出来
+        /* ribbonPanelBackground */ QColor(0x26, 0x2b, 0x33),
+        /* ribbonPanelBorder     */ QColor(0x45, 0x4d, 0x59),
         /* hoverBackground   */ QColor(0x39, 0x41, 0x4c),
         /* hoverBorder       */ QColor(0x4d, 0x56, 0x63),
         /* pressedBackground */ QColor(0x22, 0x29, 0x32),

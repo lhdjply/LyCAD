@@ -47,6 +47,13 @@ struct Palette {
     // ---- 功能区 ----
     QColor ribbonBackground;
     QColor ribbonBorder;
+    /// 功能区「面板」自身的底色与描边。
+    ///
+    /// 单独给出而不是复用 ribbonBackground / border：面板要在功能区底色上
+    /// 明确地「分块」，深浅两个主题各自取一档能拉开对比的色值——浅色下比功能区
+    /// 更亮、深色下比功能区更暗，都还能让按钮的悬停/按下配色保持可辨。
+    QColor ribbonPanelBackground;
+    QColor ribbonPanelBorder;
     QColor hoverBackground;
     QColor hoverBorder;
     QColor pressedBackground;
