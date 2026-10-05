@@ -13,7 +13,7 @@
 //    因此它的成功运行本身就是一次端到端的功能验证，
 //    而不仅仅是「窗口能画出来」。
 //
-//  用法： lycad_ui_snapshot <输入.dxf> <输出目录>
+//  用法： lycad_ui_snapshot <输入.dxf|.dwg> <输出目录>
 // =============================================================================
 #include "core/Document.h"
 #include "core/TextEntity.h"
@@ -22,14 +22,17 @@
 #include "render/CadCanvas.h"
 #include "ui/IconLibrary.h"
 #include "ui/MainWindow.h"
+#include "ui/PropertyPanel.h"
 #include "ui/RibbonBar.h"
 
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
+#include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QGroupBox>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPixmap>
@@ -101,6 +104,14 @@ int main(int argc, char* argv[])
     QDir dir(outputDir);
     if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
         out() << QStringLiteral("无法创建输出目录: ") << outputDir << Qt::endl;
+        return 2;
+    }
+
+    // 输入文件先检查一遍再交给主窗口。打开失败时主窗口会弹一个模态错误框，
+    // 而离屏环境里没人点得动它——进程就静静挂在那里，输出缓冲全丢，
+    // 看上去像「卡死」而不是「文件不存在」。这里给它一个能看懂的出口。
+    if (!inputPath.isEmpty() && !QFileInfo::exists(inputPath)) {
+        out() << QStringLiteral("输入文件不存在: ") << inputPath << Qt::endl;
         return 2;
     }
 
@@ -303,7 +314,146 @@ int main(int argc, char* argv[])
             QObject::disconnect(tools, &ToolManager::textEditRequested, nullptr, nullptr);
         }
 
-        // ---- 快照 5：功能区自检 + 深色主题 ----
+        // ---- 快照 5：特性面板的「文字」组（字高 / 旋转 / 对齐）------------------
+        //
+        // 面板只发意图信号，信号到文档的那几根线在 MainWindow 里。这里从面板控件
+        // **反向驱动**一遍，验证的正是那几根线：改控件要真的改到文档、要进撤销栈。
+        {
+            Document* propertyDoc = canvas->document();
+            auto* panel = window.findChild<PropertyPanel*>();
+            auto* heightBox = panel ? panel->findChild<QDoubleSpinBox*>(
+                                          QStringLiteral("propertyPanel.textHeight"))
+                                    : nullptr;
+            auto* rotationBox = panel ? panel->findChild<QDoubleSpinBox*>(
+                                            QStringLiteral("propertyPanel.textRotation"))
+                                      : nullptr;
+            auto* hAlignBox = panel ? panel->findChild<QComboBox*>(
+                                          QStringLiteral("propertyPanel.textHAlign"))
+                                    : nullptr;
+            auto* vAlignBox = panel ? panel->findChild<QComboBox*>(
+                                          QStringLiteral("propertyPanel.textVAlign"))
+                                    : nullptr;
+            auto* textGroup = panel ? panel->findChild<QGroupBox*>(
+                                          QStringLiteral("propertyPanel.textGroup"))
+                                    : nullptr;
+
+            if (!propertyDoc || !heightBox || !rotationBox || !hAlignBox || !vAlignBox
+                || !textGroup) {
+                out() << QStringLiteral("  找不到特性面板的文字属性控件。") << Qt::endl;
+                ++failures;
+            } else {
+                // 选一条文字：面板应显示它的字高与旋转，并露出「文字」组
+                const EntityId target = [propertyDoc]() -> EntityId {
+                    for (EntityId id : propertyDoc->drawOrder()) {
+                        const Entity* e = propertyDoc->entity(id);
+                        if (e && e->type() == EntityType::Text) return id;
+                    }
+                    return kInvalidEntityId;
+                }();
+
+                if (target == kInvalidEntityId) {
+                    out() << QStringLiteral("  文档中没有文字图元，跳过特性面板验证。") << Qt::endl;
+                } else {
+                    propertyDoc->selection().setIds({ target });
+                    settle(application, 120);
+
+                    const auto* before =
+                        static_cast<const TextEntity*>(propertyDoc->entity(target));
+                    const double originalHeight = before->height();
+                    const double originalRotation = before->rotation();
+                    const TextEntity::HAlign originalHAlign = before->hAlign();
+                    const TextEntity::VAlign originalVAlign = before->vAlign();
+                    const int records = propertyDoc->undoStack()->index();
+
+                    if (!textGroup->isVisible()) {
+                        out() << QStringLiteral("  选中文字后「文字」属性组仍未显示。") << Qt::endl;
+                        ++failures;
+                    }
+
+                    // 目标值必须与当前值**确实不同**：这个工具要能跑在任意图纸上，
+                    // 而被选中的文字本来就可能是 90° 或居中——设成同一个值不会产生
+                    // 撤销记录，后面的「+4 条记录」断言就会莫名其妙地失败。
+                    const double targetHeight =
+                        std::abs(originalHeight - 4.0) > 1e-6 ? 4.0 : 6.0;
+                    const double targetRotationDeg =
+                        std::abs(radToDeg(originalRotation) - 90.0) > 0.5 ? 90.0 : 30.0;
+                    const TextEntity::HAlign targetHAlign =
+                        originalHAlign == TextEntity::HAlign::Center ? TextEntity::HAlign::Right
+                                                                    : TextEntity::HAlign::Center;
+                    const TextEntity::VAlign targetVAlign =
+                        originalVAlign == TextEntity::VAlign::Top ? TextEntity::VAlign::Baseline
+                                                                  : TextEntity::VAlign::Top;
+
+                    // 逐项驱动：字高、旋转、水平对齐、垂直对齐
+                    heightBox->setValue(targetHeight);
+                    rotationBox->setValue(targetRotationDeg);          // 面板给的是度
+                    hAlignBox->setCurrentIndex(
+                        hAlignBox->findData(static_cast<int>(targetHAlign)));
+                    vAlignBox->setCurrentIndex(
+                        vAlignBox->findData(static_cast<int>(targetVAlign)));
+                    settle(application, 120);
+
+                    const auto* after =
+                        static_cast<const TextEntity*>(propertyDoc->entity(target));
+                    const bool heightOk = std::abs(after->height() - targetHeight) < 1e-6;
+                    const bool rotationOk =
+                        std::abs(after->rotation() - degToRad(targetRotationDeg)) < 1e-6;
+                    const bool hAlignOk = after->hAlign() == targetHAlign;
+                    const bool vAlignOk = after->vAlign() == targetVAlign;
+                    const bool undoOk = propertyDoc->undoStack()->index() == records + 4;
+
+                    out() << QStringLiteral("  特性面板文字组：字高 %1 / 旋转 %2 / 水平对齐 %3 / "
+                                            "垂直对齐 %4 / 撤销记录 %5")
+                                 .arg(heightOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      rotationOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      hAlignOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      vAlignOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      undoOk ? QStringLiteral("+4")
+                                             : QStringLiteral("异常"))
+                          << Qt::endl;
+                    if (!heightOk || !rotationOk || !hAlignOk || !vAlignOk || !undoOk) {
+                        ++failures;
+                    }
+
+                    // 撤销回去，后面的截图与原始图纸一致
+                    while (propertyDoc->undoStack()->index() > records) {
+                        propertyDoc->undoStack()->undo();
+                    }
+                    const auto* restored =
+                        static_cast<const TextEntity*>(propertyDoc->entity(target));
+                    if (std::abs(restored->height() - originalHeight) > 1e-9
+                        || std::abs(restored->rotation() - originalRotation) > 1e-9
+                        || restored->hAlign() != originalHAlign
+                        || restored->vAlign() != originalVAlign) {
+                        out() << QStringLiteral("  撤销后文字属性没有回到原值。") << Qt::endl;
+                        ++failures;
+                    }
+
+                    // 选中非文字图元时「文字」组应整组隐藏
+                    const EntityId other = [propertyDoc]() -> EntityId {
+                        for (EntityId id : propertyDoc->drawOrder()) {
+                            const Entity* e = propertyDoc->entity(id);
+                            if (e && e->type() != EntityType::Text) return id;
+                        }
+                        return kInvalidEntityId;
+                    }();
+                    if (other != kInvalidEntityId) {
+                        propertyDoc->selection().setIds({ other });
+                        settle(application, 120);
+                        const bool hidden = !textGroup->isVisible();
+                        out() << QStringLiteral("  非文字选择时「文字」组隐藏: %1")
+                                     .arg(hidden ? QStringLiteral("通过")
+                                                 : QStringLiteral("失败"))
+                              << Qt::endl;
+                        if (!hidden) ++failures;
+                    }
+                    propertyDoc->selection().clear();
+                    settle(application, 80);
+                }
+            }
+        }
+
+        // ---- 快照 6：功能区自检 + 深色主题 ----
         auto* ribbon = window.findChild<RibbonBar*>();
         if (!ribbon) {
             out() << QStringLiteral("找不到功能区控件。") << Qt::endl;
@@ -420,7 +570,7 @@ int main(int argc, char* argv[])
             settle(application, 200);
         }
 
-        // ---- 快照 6：图层与特性下拉框就近取景 ----
+        // ---- 快照 7：图层与特性下拉框就近取景 ----
         // 这两个下拉框在窄窗口下位于功能区的右端，需要滚动才能看到，
         // 因此单独抓一张「滚动到末端」的图，方便核对它们的外观。
         if (auto* scroller =

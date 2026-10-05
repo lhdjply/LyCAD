@@ -12,10 +12,12 @@
 #include "core/Document.h"
 #include "core/Entity.h"
 #include "core/Layer.h"
+#include "core/TextEntity.h"
 
 #include <QUndoCommand>
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -129,6 +131,49 @@ private:
     QString m_newString;
     int  m_newInt = 0;
     bool m_newBool = true;
+};
+
+// -----------------------------------------------------------------------------
+//  修改文字属性
+//
+//  字高 / 旋转 / 水平对齐 / 垂直对齐是文字独有的属性，取值是浮点与枚举——
+//  塞进 EntityPropertyCommand 的 string/int/bool 三个槽只会把类型越塞越歪，
+//  因此单独一条命令。与通用属性一致：构造时逐图元留快照，撤销按快照逐图元还原。
+//
+//  旋转存**弧度**（与 TextEntity 同一口径），界面层负责度与弧度的换算。
+// -----------------------------------------------------------------------------
+/// 要写入的文字属性。**未赋值的字段表示本次不动它**。
+///
+/// 这样一条命令既能写单个字段，也能一次写多个字段；更重要的一层原因是属性面板
+/// 会拿它表达「只改这一项」：多选时若某一列取值不一致，那一列无从给出统一旧值，
+/// 但用户仍然应当能改另一列——把四个字段都做成必填就做不到这一点。
+struct TextPropertyValues {
+    std::optional<double> height;
+    std::optional<double> rotation;                             ///< 弧度
+    std::optional<TextEntity::HAlign> hAlign;
+    std::optional<TextEntity::VAlign> vAlign;
+};
+
+class TextPropertyCommand : public QUndoCommand {
+public:
+    /// ids 里不是文字的图元会被剔除；一个文字都没有时命令不做任何事
+    /// （Document 的 setEntitiesTextXxx 会先筛一遍，因此不会压入空命令）。
+    TextPropertyCommand(Document* document,
+                        std::vector<EntityId> ids,
+                        TextPropertyValues values,
+                        const QString& text);
+
+    void undo() override;
+    void redo() override;
+
+private:
+    /// 按「已赋值才写」的规则把 values 落到图元上（redo 与 undo 共用）
+    static void assign(TextEntity& text, const TextPropertyValues& values);
+
+    Document* m_document;
+    std::vector<EntityId> m_ids;                ///< 命中的文字图元
+    std::vector<TextPropertyValues> m_before;   ///< 与 m_ids 一一对应的前置快照
+    TextPropertyValues m_new;
 };
 
 // -----------------------------------------------------------------------------

@@ -3,6 +3,8 @@
 // =============================================================================
 #include "core/Commands.h"
 
+#include "core/TextEntity.h"
+
 #include <algorithm>
 
 namespace lycad {
@@ -202,6 +204,77 @@ void EntityPropertyCommand::undo()
         case EntityProperty::Visible:    e->setVisible(snap.boolValue); break;
         }
         emit m_document->entityChanged(snap.id);
+    }
+    m_document->afterEntitiesMutated();
+}
+
+// -----------------------------------------------------------------------------
+//  TextPropertyCommand
+// -----------------------------------------------------------------------------
+namespace {
+
+/// 取出图元的文字属性快照（四个字段全取，与 m_new 里赋值了哪些字段无关——
+/// 快照多取不影响正确性，assign 只写 m_new 里赋了值的那些字段）。
+bool textValuesOf(const Entity* entity, TextPropertyValues& values)
+{
+    const auto* text = dynamic_cast<const TextEntity*>(entity);
+    if (!text) return false;
+
+    values.height = text->height();
+    values.rotation = text->rotation();
+    values.hAlign = text->hAlign();
+    values.vAlign = text->vAlign();
+    return true;
+}
+
+} // namespace
+
+void TextPropertyCommand::assign(TextEntity& text, const TextPropertyValues& values)
+{
+    // 只写已赋值的字段：未赋值 = 本次不动它，撤销时同样成立
+    if (values.height) text.setHeight(*values.height);
+    if (values.rotation) text.setRotation(*values.rotation);
+    if (values.hAlign) text.setHAlign(*values.hAlign);
+    if (values.vAlign) text.setVAlign(*values.vAlign);
+}
+
+TextPropertyCommand::TextPropertyCommand(Document* document,
+                                         std::vector<EntityId> ids,
+                                         TextPropertyValues values,
+                                         const QString& text)
+    : QUndoCommand(text)
+    , m_document(document)
+    , m_new(std::move(values))
+{
+    m_ids.reserve(ids.size());
+    m_before.reserve(ids.size());
+    for (EntityId id : ids) {
+        TextPropertyValues snapshot;
+        if (!textValuesOf(m_document->entity(id), snapshot)) continue;
+        m_ids.push_back(id);
+        m_before.push_back(snapshot);
+    }
+}
+
+void TextPropertyCommand::redo()
+{
+    for (std::size_t i = 0; i < m_ids.size(); ++i) {
+        auto* text = dynamic_cast<TextEntity*>(m_document->entity(m_ids[i]));
+        if (!text) continue;
+        assign(*text, m_new);
+        emit m_document->entityChanged(m_ids[i]);
+    }
+    m_document->afterEntitiesMutated();
+}
+
+void TextPropertyCommand::undo()
+{
+    // 逐图元还原，因此不能走统一的赋值：旧值各不相同
+    for (std::size_t i = 0; i < m_ids.size(); ++i) {
+        auto* text = dynamic_cast<TextEntity*>(m_document->entity(m_ids[i]));
+        if (!text) continue;
+        assign(*text, m_before[i]);
+        emit m_document->entityChanged(m_ids[i]);
     }
     m_document->afterEntitiesMutated();
 }

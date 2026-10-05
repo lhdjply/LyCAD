@@ -17,6 +17,7 @@
 #include "core/Entity.h"
 #include "core/Layer.h"
 #include "core/Selection.h"
+#include "core/TextEntity.h"
 #include "core/TextStyle.h"
 #include "core/Types.h"
 
@@ -85,6 +86,22 @@ public:
 
     /// 修改可见性
     bool setEntitiesVisible(const std::vector<EntityId>& ids, bool visible);
+
+    // ---- 文字属性（只作用于选择集里的文字图元，其它类型忽略）------------------
+    //
+    // 选择集里一个文字都没有时返回 false 且**不产生撤销记录**——属性面板据此
+    // 判断是否给出提示，也避免用户看到一条点了没反应的「撤销 修改字高」。
+    //
+    // 水平与垂直对齐分开成两个入口：面板上它们是两列，多选时若其中一列取值不一致，
+    // 那一列无从给出统一旧值，但另一列仍应可改。
+    /// 修改字高（世界单位，必须 > 0）
+    bool setEntitiesTextHeight(const std::vector<EntityId>& ids, double height);
+    /// 修改旋转（弧度；内部会归一化到 [0, 2π)）
+    bool setEntitiesTextRotation(const std::vector<EntityId>& ids, double radians);
+    /// 修改水平对齐（DXF 72）
+    bool setEntitiesTextHAlign(const std::vector<EntityId>& ids, TextEntity::HAlign hAlign);
+    /// 修改垂直对齐（DXF 73）
+    bool setEntitiesTextVAlign(const std::vector<EntityId>& ids, TextEntity::VAlign vAlign);
 
     /// 以新几何整体替换某图元的几何（夹点拖拽结束后调用）
     bool replaceEntity(EntityId id,
@@ -177,6 +194,7 @@ private:
     friend class RemoveEntitiesCommand;
     friend class TransformEntitiesCommand;
     friend class EntityPropertyCommand;
+    friend class TextPropertyCommand;
     friend class ReplaceEntityCommand;
     friend class LayerTableCommand;
 

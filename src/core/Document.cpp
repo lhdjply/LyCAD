@@ -288,6 +288,76 @@ bool Document::setEntitiesVisible(const std::vector<EntityId>& ids, bool visible
     return true;
 }
 
+namespace {
+
+/// 选择集里的文字图元。
+///
+/// 文字属性命令本身就只改文字，这里先筛一遍是为了「一个文字都没有时不压撤销栈」：
+/// 否则在纯直线选择集上点一下字高，栈里会多出一条什么也没做的记录，
+/// 用户按撤销时看到「撤销 修改字高」却毫无变化。
+std::vector<EntityId> textEntitiesIn(const Document& document, const std::vector<EntityId>& ids)
+{
+    std::vector<EntityId> texts;
+    texts.reserve(ids.size());
+    for (EntityId id : ids) {
+        const Entity* entity = document.entity(id);
+        if (entity && entity->type() == EntityType::Text) texts.push_back(id);
+    }
+    return texts;
+}
+
+} // namespace
+
+bool Document::setEntitiesTextHeight(const std::vector<EntityId>& ids, double height)
+{
+    if (!(height > 0.0)) return false;
+
+    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    TextPropertyValues values;
+    values.height = height;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改字高")));
+    return true;
+}
+
+bool Document::setEntitiesTextRotation(const std::vector<EntityId>& ids, double radians)
+{
+    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    TextPropertyValues values;
+    values.rotation = radians;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改文字旋转")));
+    return true;
+}
+
+bool Document::setEntitiesTextHAlign(const std::vector<EntityId>& ids, TextEntity::HAlign hAlign)
+{
+    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    TextPropertyValues values;
+    values.hAlign = hAlign;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改文字水平对齐")));
+    return true;
+}
+
+bool Document::setEntitiesTextVAlign(const std::vector<EntityId>& ids, TextEntity::VAlign vAlign)
+{
+    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    TextPropertyValues values;
+    values.vAlign = vAlign;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改文字垂直对齐")));
+    return true;
+}
+
 bool Document::replaceEntity(EntityId id,
                              std::unique_ptr<Entity> replacement,
                              const QString& actionLabel)

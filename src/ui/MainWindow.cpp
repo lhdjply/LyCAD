@@ -959,6 +959,33 @@ void MainWindow::connectSignals()
     connect(m_propertyPanel, &PropertyPanel::visibleChangeRequested, this, [this](bool visible) {
         m_document->setEntitiesVisible(m_document->selection().ids(), visible);
     });
+
+    // ---- 文字属性（字高 / 旋转 / 对齐）---------------------------------------
+    //
+    // 改完回读一次面板：旋转会被归一化到 0~360、字高会被钳制到合法范围，
+    // 不回读的话输入框里留着的还是用户键入的原始数值，与图元实际值对不上。
+    // 选择集里没有文字时，Document 的三个入口返回 false 且不产生撤销记录，
+    // 因此这里不需要额外判断——面板在那种情况下本来也不会发出这些信号。
+    connect(m_propertyPanel, &PropertyPanel::textHeightChangeRequested, this,
+            [this](double height) {
+                m_document->setEntitiesTextHeight(m_document->selection().ids(), height);
+                m_propertyPanel->refresh(m_document);
+            });
+    connect(m_propertyPanel, &PropertyPanel::textRotationChangeRequested, this,
+            [this](double radians) {
+                m_document->setEntitiesTextRotation(m_document->selection().ids(), radians);
+                m_propertyPanel->refresh(m_document);
+            });
+    connect(m_propertyPanel, &PropertyPanel::textHAlignChangeRequested, this,
+            [this](TextEntity::HAlign hAlign) {
+                m_document->setEntitiesTextHAlign(m_document->selection().ids(), hAlign);
+                m_propertyPanel->refresh(m_document);
+            });
+    connect(m_propertyPanel, &PropertyPanel::textVAlignChangeRequested, this,
+            [this](TextEntity::VAlign vAlign) {
+                m_document->setEntitiesTextVAlign(m_document->selection().ids(), vAlign);
+                m_propertyPanel->refresh(m_document);
+            });
 }
 
 // -----------------------------------------------------------------------------
