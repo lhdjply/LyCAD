@@ -1,61 +1,47 @@
-# =============================================================================
-#  LyCAD - 开发工具
-#
-#  这里的程序不随软件一起发布，只用于开发期验证。它们编译的源码范围各不相同，
-#  恰好也是各自的角色说明：
-#
-#   lycad_sample      生成参考 DXF（供外部 CAD 工具交叉校验），也能读取并打印
-#                     任意 DXF 的摘要。它**只编入 core 与 io**，因此顺带充当
-#                     「下层不依赖界面层」的编译期契约检查——一旦 core/io 反向
-#                     依赖了渲染或界面，它会立刻因符号缺失而链接失败。
-#                     （.dwg 也在它的读取范围内：DWG 解析属于 io 层。）
-#
-#   lycad_icon_sheet  把 resources/icons 下的全部图标渲染成一张总览图，
-#                     供人工核对配色与各尺寸下的清晰度。
-#
-#   lycad_ui_snapshot 在进程内渲染主窗口为 PNG，并用真实鼠标事件驱动交互链路。
-#                     后两者需要完整功能，因此编入全部源码。
-# =============================================================================
+# 开发工具（不随软件发布，仅开发期验证）：
+#   lycad_sample      生成/读取参考 DXF/DWG；只编 core+io，兼作「下层不依赖上层」的链接期检查
+#   lycad_icon_sheet  把全部图标渲染成总览图
+#   lycad_ui_snapshot 离屏渲染主窗口为 PNG，驱动交互链路做界面验证
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
 
-add_executable(lycad_sample
+add_executable(lycad_sample EXCLUDE_FROM_ALL
     dxf_sample_generator.cpp
     ${LYCAD_CORE_IO_SOURCES}
     ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad_sample PRIVATE "${LYCAD_SRC_ROOT}")
-# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
-# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
 target_include_directories(lycad_sample SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
 target_link_libraries(lycad_sample PRIVATE Qt6::Core Qt6::Gui LyCAD::Warnings)
 
-add_executable(lycad_icon_sheet
+add_executable(lycad_icon_sheet EXCLUDE_FROM_ALL
     icon_sheet.cpp
     ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
     ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad_icon_sheet PRIVATE "${LYCAD_SRC_ROOT}")
-# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
-# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
 target_include_directories(lycad_icon_sheet SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
 target_link_libraries(lycad_icon_sheet PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
 set_target_properties(lycad_icon_sheet PROPERTIES AUTORCC ON)
 
-# 界面快照需要 QTest 来注入鼠标事件
+# 界面快照需要 QTest 注入鼠标事件
 find_package(Qt6 QUIET COMPONENTS Test)
 
 if(TARGET Qt6::Test)
-    add_executable(lycad_ui_snapshot
+    add_executable(lycad_ui_snapshot EXCLUDE_FROM_ALL
         ui_snapshot.cpp
         ${LYCAD_SOURCES}
         ${LYCAD_RESOURCES}
         ${LYCAD_DXFRW_OBJECTS}
     )
     target_include_directories(lycad_ui_snapshot PRIVATE "${LYCAD_SRC_ROOT}")
-# libdxfrw 的头文件以 SYSTEM 方式引入：它自带 #pragma warning 与隐式拷贝构造等告警，
-# 与本项目无关，用 -isystem 交给编译器忽略，免得刷屏埋掉真正的问题。
     target_include_directories(lycad_ui_snapshot SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
     target_link_libraries(lycad_ui_snapshot
         PRIVATE ${LYCAD_QT_LIBS} Qt6::Test LyCAD::Warnings)
     set_target_properties(lycad_ui_snapshot PROPERTIES AUTORCC ON)
 endif()
+
+add_custom_target(lycad_tools
+    COMMENT "构建全部开发工具"
+    DEPENDS lycad_sample lycad_icon_sheet
+            $<$<TARGET_EXISTS:lycad_ui_snapshot>:lycad_ui_snapshot>)

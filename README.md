@@ -14,10 +14,13 @@
 #       不需要单独安装；它依赖 iconv，
 #       glibc 自带、无需额外安装，macOS 等平台由 CMake 自动链接
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build -j              # 默认只编译主程序
 
-./build/bin/lycad                       # 启动
-./build/bin/lycad drawing.dxf           # 启动并打开文件
+./build/lycad                       # 启动
+./build/lycad drawing.dxf           # 启动并打开文件
+
+# 测试与开发工具按需构建（ctest 不会自己编译缺失的二进制）：
+cmake --build build --target lycad_tests -j
 ctest --test-dir build --output-on-failure   # 运行测试
 ```
 
@@ -25,8 +28,8 @@ ctest --test-dir build --output-on-failure   # 运行测试
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `LYCAD_BUILD_TESTS` | ON | 构建单元测试 |
-| `LYCAD_BUILD_TOOLS` | ON | 构建开发期辅助工具（样例生成器、界面快照） |
+| `LYCAD_BUILD_TESTS` | ON | 定义单元测试目标（不在默认构建里，用 `--target lycad_tests` 按需编译） |
+| `LYCAD_BUILD_TOOLS` | ON | 定义开发工具目标（同上，用 `--target lycad_tools` 按需编译） |
 | `LYCAD_ENABLE_ASAN` | OFF | 启用 AddressSanitizer / UBSan |
 | `LYCAD_WARNINGS_AS_ERRORS` | OFF | 将编译告警视为错误 |
 
@@ -502,7 +505,7 @@ R12 无 HATCH 实体，填充自动降级为闭合多段线并明确告知。
 32 / 24 / 16 三种尺寸下渲染成一张总览图，供人工核对配色与各尺寸下的清晰度：
 
 ```bash
-QT_QPA_PLATFORM=offscreen build/bin/lycad_icon_sheet icon_sheet.png
+QT_QPA_PLATFORM=offscreen build/tools/lycad_icon_sheet icon_sheet.png
 ```
 
 ### 4.4 DWG 实样验证
@@ -524,7 +527,7 @@ DWG 解析的可用性无法用自造文件证明，因此拿本机安装的 Aut
 
 ```bash
 LYCAD_DWG_SAMPLE=/path/a.dwg LYCAD_DXF_SAMPLE=/path/b.dxf \
-    ./build/bin/test_libdxfrw dwgAndDxfAgree
+    ./build/tests/test_libdxfrw dwgAndDxfAgree
 ```
 
 不设 `LYCAD_DXF_SAMPLE` 时，取与 DWG 同名的 `.dxf` 作为对照；两个环境变量都没
@@ -533,13 +536,13 @@ LYCAD_DWG_SAMPLE=/path/a.dwg LYCAD_DXF_SAMPLE=/path/b.dxf \
 ### 4.5 复现验证
 
 ```bash
-cmake --build build -j && ctest --test-dir build --output-on-failure
+cmake --build build --target lycad_tests -j && ctest --test-dir build --output-on-failure
 
-build/bin/lycad_sample /tmp/out                    # 生成参考 DXF
+build/tools/lycad_sample /tmp/out                    # 生成参考 DXF
 python3 tools/verify_dxf_with_ezdxf.py /tmp/out    # 正向交叉校验
-python3 tools/verify_lycad_reads_ezdxf.py build/bin/lycad_sample /tmp/rev   # 反向交叉校验
+python3 tools/verify_lycad_reads_ezdxf.py build/tools/lycad_sample /tmp/rev   # 反向交叉校验
 
-QT_QPA_PLATFORM=offscreen build/bin/lycad_ui_snapshot /tmp/out/lycad_sample_2000.dxf /tmp/shots
+QT_QPA_PLATFORM=offscreen build/tools/lycad_ui_snapshot /tmp/out/lycad_sample_2000.dxf /tmp/shots
 ```
 
 ---
