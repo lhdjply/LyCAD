@@ -48,6 +48,20 @@ double readableAngle(double radians)
     return radians;
 }
 
+/// 标注类型的中文名（与 DXF 70 组码的低 3 位一致）。
+/// 名字一律走 QStringLiteral：这里曾用 const char* + QString::fromLatin1，
+/// UTF-8 字节被当成 Latin-1 解码，「线性」在属性面板里显示成「çº¿æ§」。
+QString dimTypeDisplayName(DimensionEntity::DimType type)
+{
+    switch (type) {
+    case DimensionEntity::DimType::Linear:    return QStringLiteral("线性");
+    case DimensionEntity::DimType::Aligned:   return QStringLiteral("对齐");
+    case DimensionEntity::DimType::Diametric: return QStringLiteral("直径");
+    case DimensionEntity::DimType::Radial:    return QStringLiteral("半径");
+    }
+    return QStringLiteral("标注");
+}
+
 } // namespace
 
 DimensionEntity::DimensionEntity()
@@ -346,32 +360,15 @@ std::vector<Point2D> DimensionEntity::flatten(double sagitta) const
 
 QString DimensionEntity::describe() const
 {
-    static const char* kNames[] = { "线性", "对齐", "直径", "半径" };
-    const char* name = "标注";
-    switch (m_dimType) {
-    case DimType::Linear:    name = kNames[0]; break;
-    case DimType::Aligned:   name = kNames[1]; break;
-    case DimType::Diametric: name = kNames[2]; break;
-    case DimType::Radial:    name = kNames[3]; break;
-    }
     return QStringLiteral("标注  %1  %2")
-        .arg(QString::fromLatin1(name), displayText());
+        .arg(dimTypeDisplayName(m_dimType), displayText());
 }
 
 QString DimensionEntity::geometrySummary() const
 {
-    static const char* kNames[] = { "线性", "对齐", "直径", "半径" };
-    const char* name = "标注";
-    switch (m_dimType) {
-    case DimType::Linear:    name = kNames[0]; break;
-    case DimType::Aligned:   name = kNames[1]; break;
-    case DimType::Diametric: name = kNames[2]; break;
-    case DimType::Radial:    name = kNames[3]; break;
-    }
-
     const Geometry geo = geometry();
     QString text = QStringLiteral("类型: %1\n测量值: %2\n文字: %3\n字高: %4")
-                       .arg(QString::fromLatin1(name),
+                       .arg(dimTypeDisplayName(m_dimType),
                             formatLength(measurement()),
                             displayText(),
                             formatLength(m_textHeight));

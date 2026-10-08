@@ -66,6 +66,7 @@ private slots:
     void dimensionMeasurementAllTypes();
     void dimensionGeometryDerivation();
     void dimensionGripsReflowGeometry();
+    void dimensionTypeNameIsNotMojibake();
 
     // ---- 坐标解析 -----------------------------------------------------------
     void coordinateParsing();
@@ -767,6 +768,40 @@ void TestGeometry::dimensionGeometryDerivation()
     QVERIFY(dim.distanceTo(Point2D(50.0, -20.0)) < 1e-9);
     // 远离时距离单调增大
     QVERIFY(dim.distanceTo(Point2D(50.0, 30.0)) > dim.distanceTo(Point2D(50.0, 0.0)));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::dimensionTypeNameIsNotMojibake()
+{
+    // 回归：类型名一度是 const char* + QString::fromLatin1，UTF-8 字节被按
+    // Latin-1 解码，属性面板的「几何信息」里「线性」显示成「çº¿æ§」。
+    // 逐类型比对完整首行，顺带钉住类型与名字的对应关系。
+    const struct {
+        DimensionEntity::DimType type;
+        const char*              name;   ///< UTF-8 字面量
+    } cases[] = {
+        { DimensionEntity::DimType::Linear,    "线性" },
+        { DimensionEntity::DimType::Aligned,   "对齐" },
+        { DimensionEntity::DimType::Diametric, "直径" },
+        { DimensionEntity::DimType::Radial,    "半径" },
+    };
+
+    for (const auto& c : cases) {
+        DimensionEntity dim(c.type);
+        dim.setFirstPoint(Point2D(0.0, 0.0));
+        dim.setSecondPoint(Point2D(10.0, 0.0));
+        dim.setDimLinePoint(Point2D(5.0, -5.0));
+
+        const QString name = QString::fromUtf8(c.name);
+
+        // 摘要首行 =「类型: <名字>」；还有后续行，否则说明摘要被截断
+        const QStringList lines = dim.geometrySummary().split(QLatin1Char('\n'));
+        QVERIFY(lines.size() > 4);
+        QCOMPARE(lines.first(), QStringLiteral("类型: %1").arg(name));
+
+        // describe() 走同一份映射，同样不能出现乱码
+        QVERIFY(dim.describe().startsWith(QStringLiteral("标注  %1").arg(name)));
+    }
 }
 
 // -----------------------------------------------------------------------------
