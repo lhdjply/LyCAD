@@ -190,6 +190,7 @@ struct dwgW::Private
     std::uint32_t ltypeByLayer = 0, ltypeByBlock = 0, ltypeContinuous = 0;
     std::uint32_t layer0 = 0, styleStandard = 0, vportActive = 0;
     std::uint32_t dimstyleStandard = 0, appidAcad = 0;
+    std::uint16_t codepageId = kCodepageId936;      // EED 字符串的代码页标识
 
     // 命名对象字典链（真实 AutoCAD 文件中必然存在；缺省会让严格读取器
     // 拿不到标准字典而判文件无效）
@@ -294,10 +295,21 @@ struct dwgW::Private
     }
 
     // ---- 公共写入片段 -------------------------------------------------------------
-    void writeTableCommon(ObjBuilder& b, std::uint16_t otype, std::uint32_t handle)
+    /// eed 为空时只写 BS 0 终止；否则写「BS 尺寸 + 应用句柄 + 数据」块。
+    /// 注意 BS 尺寸只是句柄**之后**的数据长度——libredwg / libdxfrw 的读取端
+    /// 都是先读句柄、再按尺寸读数据的。应用固定为 ACAD（码 5 硬指针）。
+    void writeTableCommon(ObjBuilder& b, std::uint16_t otype, std::uint32_t handle,
+                          const std::vector<std::uint8_t>* eed = nullptr)
     {
         b.begin(otype, handle);
-        b.w.writeBS(0);                 // EED 长度（无扩展数据）
+        if (eed && !eed->empty()) {
+            b.w.writeBS(static_cast<dint16>(eed->size()));
+            b.w.writeHandle(kHcAbsolute, appidAcad);
+            for (std::uint8_t byte : *eed) b.w.writeRC(byte);
+            b.w.writeBS(0);                 // EED 终止
+        } else {
+            b.w.writeBS(0);                 // EED 长度（无扩展数据）
+        }
         b.w.writeBL(0);                 // numReactors
     }
 
@@ -534,8 +546,63 @@ void encodeLayer(Private& d, const DRW_Layer& ent, std::uint32_t handle)
 
 void encodeStyle(Private& d, const DRW_Textstyle& ent, std::uint32_t handle)
 {
+    // TrueType 文字样式的字体族名不在 font/bigFont 字段（DXF 3/4 组码）里，
+    // 只存在于扩展数据 EED（应用 ACAD + DXF 1000 族名 / 1071 族标志）。
+    // 不写回 EED，重存的文件在 AutoCAD / 浩辰等 CAD 里会回退成默认 SHX 字体。
+    std::vector<std::uint8_t> eed;
+    bool inAcad = false;
+    for (DRW_Variant* v : ent.extData) {
+        if (v == nullptr) continue;
+        if (v->code() == 1001) {
+            inAcad = (v->type() == DRW_Variant::STRING && *v->content.s == "ACAD");
+            continue;
+        }
+        if (!inAcad) continue;
+        switch (v->code()) {
+        case 1000: {    // 字符串：码 0 + RC 长度 + BE16 代码页 + 编码字节
+            if (v->type() != DRW_Variant::STRING) break;
+            const std::string encoded = d.codec.fromUtf8(*v->content.s);
+            const std::size_t len = std::min<std::size_t>(encoded.size(), 255);
+            eed.push_back(0x00);
+            eed.push_back(static_cast<std::uint8_t>(len));
+            eed.push_back(static_cast<std::uint8_t>(d.codepageId >> 8));
+            eed.push_back(static_cast<std::uint8_t>(d.codepageId & 0xFF));
+            eed.insert(eed.end(), encoded.begin(), encoded.begin() + static_cast<long>(len));
+            break;
+        }
+        case 1070: {    // 16 位整数：码 70 + RS
+            if (v->type() != DRW_Variant::INTEGER) break;
+            const std::uint16_t val = static_cast<std::uint16_t>(v->content.i);
+            eed.push_back(70);
+            eed.push_back(static_cast<std::uint8_t>(val & 0xFF));
+            eed.push_back(static_cast<std::uint8_t>(val >> 8));
+            break;
+        }
+        case 1071: {    // 32 位整数：码 71 + RL（TrueType 字体族标志）
+            if (v->type() != DRW_Variant::INTEGER) break;
+            const std::uint32_t val = static_cast<std::uint32_t>(v->content.i);
+            eed.push_back(71);
+            for (int k = 0; k < 4; ++k)
+                eed.push_back(static_cast<std::uint8_t>((val >> (8 * k)) & 0xFF));
+            break;
+        }
+        case 1040: {    // 实数：码 40 + RD
+            if (v->type() != DRW_Variant::DOUBLE) break;
+            eed.push_back(40);
+            const double val = v->content.d;
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &val, sizeof(bits));
+            for (int k = 0; k < 8; ++k)
+                eed.push_back(static_cast<std::uint8_t>((bits >> (8 * k)) & 0xFF));
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
     Private::ObjBuilder b;
-    d.writeTableCommon(b, kStyle, handle);
+    d.writeTableCommon(b, kStyle, handle, eed.empty() ? nullptr : &eed);
     b.w.writeT(ent.name, d.codec);
     b.w.writeB(false);
     b.w.writeBS(0);                     // xrefindex
@@ -2099,6 +2166,7 @@ bool write(dwgW& writer, DRW_Interface* iface)
         writer.d->codec.setCodePage(dwgCodepage, false);
         codepageId = kCodepageId1252;
     }
+    writer.d->codepageId = codepageId;
 
     // 提取标注参数（DIMSTYLE 记录需要完整字段；取自 $DIMxxx 变量或默认值）
     Private::DimStyleData& dv = writer.d->dimData;

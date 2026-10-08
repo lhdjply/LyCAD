@@ -123,34 +123,67 @@ DRW_DBG("\n***************************** parsing table entry *******************
     dint16 extDataSize = buf->getBitShort(); //BS
     DRW_DBG(" ext data size: "); DRW_DBG(extDataSize);
     while (extDataSize>0 && buf->isGood()) {
-        /* RLZ: TODO */
         dwgHandle ah = buf->getHandle();
         DRW_DBG("App Handle: "); DRW_DBGHL(ah.code, ah.size, ah.ref);
         duint8 *tmpExtData = new duint8[extDataSize];
         buf->getBytes(tmpExtData, extDataSize);
         dwgBuffer tmpExtDataBuf(tmpExtData, extDataSize, buf->decoder);
-        int pos = tmpExtDataBuf.getPosition();
-        int bpos = tmpExtDataBuf.getBitPos();
-        DRW_DBG("ext data pos: "); DRW_DBG(pos); DRW_DBG("."); DRW_DBG(bpos); DRW_DBG("\n");
-        duint8 dxfCode = tmpExtDataBuf.getRawChar8();
-        DRW_DBG(" dxfCode: "); DRW_DBG(dxfCode);
-        switch (dxfCode){
-        case 0:{
-            duint8 strLength = tmpExtDataBuf.getRawChar8();
-            DRW_DBG(" strLength: "); DRW_DBG(strLength);
-            duint16 cp = tmpExtDataBuf.getBERawShort16();
-            DRW_DBG(" str codepage: "); DRW_DBG(cp);
-            for (int i=0;i< strLength+1;i++) {//string length + null terminating char
-                duint8 dxfChar = tmpExtDataBuf.getRawChar8();
-                DRW_DBG(" dxfChar: "); DRW_DBG(dxfChar);
+        // 逐项解析 EED 值并存入 extData（DWG 码 → DXF 码）。
+        // TrueType 文字样式的字体族名（DXF 1000/1071）只存在于这里，
+        // 丢弃它会导致文件重存后字体全部回退成兜底 SHX。
+        bool stop = false;
+        while (!stop && tmpExtDataBuf.getPosition() < extDataSize && tmpExtDataBuf.isGood()) {
+            duint8 dxfCode = tmpExtDataBuf.getRawChar8();
+            DRW_DBG(" dxfCode: "); DRW_DBG(dxfCode);
+            switch (dxfCode){
+            case 0:{   // 字符串 → DXF 1000
+                std::string value;
+                if (version > DRW::AC1018) {//2007+: UTF-16LE 词流（恰 wlen 个词，无 NUL）
+                    duint16 wlen = tmpExtDataBuf.getRawShort16();
+                    std::string raw;
+                    raw.reserve(static_cast<std::size_t>(wlen) * 2);
+                    for (duint16 j = 0; j < wlen && tmpExtDataBuf.isGood(); ++j) {
+                        duint16 ch = tmpExtDataBuf.getRawShort16();
+                        raw.push_back(static_cast<char>(ch & 0xFF));
+                        raw.push_back(static_cast<char>((ch >> 8) & 0xFF));
+                    }
+                    value = buf->decoder ? buf->decoder->toUtf8(raw) : raw;
+                } else {    // R13-R2004: 单字节长度 + 代码页 + 字节流
+                    duint8 strLength = tmpExtDataBuf.getRawChar8();
+                    /*duint16 cp =*/ tmpExtDataBuf.getBERawShort16();
+                    std::string raw;
+                    raw.reserve(strLength);
+                    for (int i=0; i< strLength && tmpExtDataBuf.isGood(); i++) {
+                        raw.push_back(static_cast<char>(tmpExtDataBuf.getRawChar8()));
+                    }
+                    value = buf->decoder ? buf->decoder->toUtf8(raw) : raw;
+                }
+                DRW_DBG(" str: "); DRW_DBG(value.c_str());
+                extData.push_back(new DRW_Variant(1000, value));
+                break;
             }
-            break;
+            case 70: {  // 16 位整数 → DXF 1070
+                duint16 v = tmpExtDataBuf.getRawShort16();
+                extData.push_back(new DRW_Variant(1070, static_cast<dint32>(v)));
+                break;
+            }
+            case 71: {  // 32 位整数 → DXF 1071（TrueType 字体族标志）
+                duint32 v = tmpExtDataBuf.getRawLong32();
+                extData.push_back(new DRW_Variant(1071, static_cast<dint32>(v)));
+                break;
+            }
+            case 40:
+            case 41:
+            case 42: {  // 实数 → DXF 1040
+                double v = tmpExtDataBuf.getRawDouble();
+                extData.push_back(new DRW_Variant(1040, v));
+                break;
+            }
+            default:    // 其余类型（点/二进制等）无法安全跳过，终止本块解析
+                stop = true;
+                break;
+            }
         }
-        default:
-            /* RLZ: TODO */
-            break;
-        }
-        DRW_DBG("ext data pos: "); DRW_DBG(tmpExtDataBuf.getPosition()); DRW_DBG("."); DRW_DBG(tmpExtDataBuf.getBitPos()); DRW_DBG("\n");
         delete[]tmpExtData;
         extDataSize = buf->getBitShort(); //BS
         DRW_DBG(" ext data size: "); DRW_DBG(extDataSize);

@@ -505,6 +505,16 @@ void Builder::addTextStyle(const DRW_Textstyle& data)
     }
     if (!blockFontName.isEmpty()) imported.setTtfName(blockFontName);
     imported.setTtfFlags(data.fontFamily);
+    // DWG 路径下 1071（字体族标志）经由 EED 以扩展数据变体带回，
+    // fontFamily 字段只反映 DXF 直读的情形
+    if (data.fontFamily == 0) {
+        for (DRW_Variant* variant : data.extData) {
+            if (variant && variant->code() == 1071) {
+                imported.setTtfFlags(variant->content.i);
+                break;
+            }
+        }
+    }
 
     if (!imported.hasFontInfo()) {
         // 文件明确给了这条样式，却没给任何字体（既无 3/4 组码，也无 TrueType
