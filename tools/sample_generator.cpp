@@ -29,6 +29,7 @@
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
 #include "core/Document.h"
+#include "core/EllipseEntity.h"
 #include "core/Format.h"
 #include "core/HatchEntity.h"
 #include "core/InfiniteLineEntity.h"
@@ -37,6 +38,7 @@
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
+#include "core/SplineEntity.h"
 #include "core/TextEntity.h"
 #include "core/XLineEntity.h"
 #include "io/CadFile.h"
@@ -126,6 +128,23 @@ void buildSample(Document& document)
         document.addEntity(std::move(arc));
     }
 
+    // 椭圆：整椭圆随层颜色；椭圆弧带参数范围与显式颜色。
+    // 注意：ELLIPSE 是 R13+ 实体，R12 目标下写出时会降级为多段线，由导出警告说明。
+    {
+        auto ellipse = std::make_unique<EllipseEntity>(Point2D(150.0, 92.0),
+                                                        Point2D(16.0, 0.0),
+                                                        0.55, 0.0, degToRad(360.0));
+        ellipse->setLayerName(QStringLiteral("轮廓"));
+        document.addEntity(std::move(ellipse));
+
+        auto ellipticArc = std::make_unique<EllipseEntity>(Point2D(163.0, 30.0),
+                                                            Point2D(11.0, 0.0),
+                                                            0.6, 0.0, degToRad(270.0));
+        ellipticArc->setLayerName(QStringLiteral("轮廓"));
+        ellipticArc->setColorIndex(3);
+        document.addEntity(std::move(ellipticArc));
+    }
+
     // 多段线：含两个不同方向的圆弧段（凸度），闭合
     {
         auto polyline = std::make_unique<PolylineEntity>();
@@ -147,6 +166,18 @@ void buildSample(Document& document)
         track->setConstantWidth(2.0);
         track->setLayerName(QStringLiteral("轮廓"));
         document.addEntity(std::move(track));
+    }
+
+    // 样条曲线：三次 B 样条，夹持节点向量（首末节点重复度 = 阶数 + 1）。
+    // 注意：SPLINE 也是 R13+ 实体，R12 目标下写出时降级为多段线。
+    {
+        auto spline = std::make_unique<SplineEntity>(
+            3,
+            std::vector<Point2D>{ Point2D(12.0, 86.0), Point2D(26.0, 102.0),
+                                  Point2D(40.0, 78.0), Point2D(52.0, 96.0) },
+            std::vector<double>{ 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0 });
+        spline->setLayerName(QStringLiteral("轮廓"));
+        document.addEntity(std::move(spline));
     }
 
     // 点
