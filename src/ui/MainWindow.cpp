@@ -400,7 +400,7 @@ void MainWindow::createMenus()
                 "<p><b>模块结构</b><br>"
                 "core（几何模型） · io（文件解析） · render（渲染显示） · "
                 "interact（用户交互） · ui（界面）</p>"
-                "<p><b>支持格式</b><br>DXF 读写（R12 / R2000，ASCII 与二进制）<br>%1</p>"
+                "<p><b>支持格式</b><br>DXF 读写（R2000 ~ 2018，ASCII 与二进制；R12 只读）<br>%1</p>"
                 "<p><b>可用文件类型</b>：%2</p>"
                 "<p style='color:#888'>渲染后端：QPainter 光栅；"
                 "撤销模型：QUndoCommand 快照式。</p>")

@@ -24,14 +24,17 @@ struct DxfVersionInfo {
 
 /// 可写出的 DXF 目标版本，按版本从低到高排列。
 ///
-/// 这张表是**唯一的版本清单**：界面下拉/过滤器、`DxfCodec::write` 的归一化、
+/// 这张表是**唯一的版本清单**：界面过滤器、`DxfCodec::write` 的归一化、
 /// 以及写出端的 DRW::Version 映射都以它为准，新增版本只需改这一处。
 /// 版本代号与 libdxfrw 的 DRW::Version 一一对应（顺序也一致）。
+///
+/// **不含 R12 (AC1009)**：R12 没有 HATCH / SPLINE / ELLIPSE / XLINE / RAY，
+/// 也没有 TrueType 与 MTEXT，写出时要把这些图元降级改写一遍。这个降级通道
+/// 已经移除——**读取** R12 文件仍然支持（走 Builder，与写出无关），
+/// 但本软件不再把图纸写成 R12。
 const std::vector<DxfVersionInfo>& dxfVersionTable()
 {
     static const std::vector<DxfVersionInfo> kTable = {
-        { QStringLiteral("AC1009"), QStringLiteral("AutoCAD R12 (AC1009)"),
-          QStringLiteral("AutoCAD R12") },
         { QStringLiteral("AC1015"), QStringLiteral("AutoCAD 2000 (AC1015)"),
           QStringLiteral("AutoCAD 2000") },
         { QStringLiteral("AC1018"), QStringLiteral("AutoCAD 2004 (AC1018)"),

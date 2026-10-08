@@ -969,7 +969,7 @@ int main(int argc, char* argv[])
                     }
                 }
 
-                // 逐版本一条 DXF 条目（共七档），默认选中最新档（AC1032），
+                // 逐版本一条 DXF 条目（共六档，R12 已不再可写），默认选中最新档（AC1032），
                 // 且选中的那一档必须真的写进文件头的 $ACADVER；
                 // DWG 条目也要点明写出版本（恒为 R2000），否则与逐版本的
                 // DXF 条目并列时说明不了会写成什么
@@ -979,7 +979,7 @@ int main(int argc, char* argv[])
                     if (type.contains(QStringLiteral("(*.dxf)"))) ++dxfTypes;
                     if (type == QStringLiteral("AutoCAD 2000 DWG 文件 (*.dwg)")) dwgNamed = true;
                 }
-                const bool versionOk = handled && dxfTypes == 7 && dwgNamed
+                const bool versionOk = handled && dxfTypes == 6 && dwgNamed
                                        && defaultType.startsWith(QStringLiteral("AutoCAD 2018"))
                                        && acadVer == QStringLiteral("AC1018");
                 out() << QStringLiteral("  另存为：类型列表 DXF %1 档，DWG 条目 %2，默认「%3」，"

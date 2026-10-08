@@ -25,6 +25,7 @@
 #include "core/RayEntity.h"
 #include "core/TextEntity.h"
 #include "core/XLineEntity.h"
+#include "io/CadFile.h"
 #include "io/DxfCodec.h"
 #include "io/LibDxfRwAdapter.h"
 
@@ -39,8 +40,8 @@ namespace {
 
 constexpr double kTol = 1e-6;
 
-/// 样例一律写 R2000：R12 不支持填充，写出器会把它降级成闭合多段线，
-/// 那样就测不到填充的映射了。
+/// 样例一律写 R2000：它是最低的可写版本，也是「实体集完整」的那一档，
+/// 填充/样条/椭圆/构造线都按原生实体写出，测到的就是真实映射而非降级。
 WriteOptions r2000Options()
 {
     WriteOptions options;
@@ -203,6 +204,9 @@ private slots:
     // ---- 写出后的「打开即见图形」--------------------------------------------
     void writtenActiveViewportCoversDrawing();
     void writtenTextStylesRoundTrip();
+
+    /// R12 只读不写：读他人生成的 R12 文件时，中文的 \U+XXXX 转义必须还原
+    void readsR12UnicodeEscapes();
 
     // ---- 两条独立实现互证 ----------------------------------------------------
 
@@ -488,26 +492,6 @@ void TestLibDxfRw::writtenTextStylesRoundTrip()
     QVERIFY2(!style(QStringLiteral("NoFontInfo")).value(QLatin1String("4")).isEmpty(),
              "缺字体信息的样式未补中文大字体，汉字会被 CAD 渲染成 ?");
 
-    // R12 不支持 TrueType：字体只在扩展数据里的样式必须落到大字体上，
-    // 否则这份 R12 文件里的汉字没有任何字形可用。
-    {
-        const QString r12Path = dir.filePath(QStringLiteral("styles_r12.dxf"));
-        WriteOptions r12;
-        r12.version = QStringLiteral("AC1009");
-        QVERIFY(dxf.write(r12Path, source, r12).ok);
-
-        QFile r12File(r12Path);
-        QVERIFY(r12File.open(QIODevice::ReadOnly));
-        const QStringList r12Lines =
-            QString::fromLatin1(r12File.readAll()).split(QLatin1Char('\n'));
-        const QHash<QString, QString> r12Standard =
-            tableRecord(r12Lines, QStringLiteral("STYLE"), QStringLiteral("Standard"));
-        QVERIFY2(!r12Standard.value(QLatin1String("4")).isEmpty(),
-                 "R12 里的 Standard 未落到中文字体上，汉字会没有字形");
-        QVERIFY2(r12Standard.value(QLatin1String("1000")).isEmpty(),
-                 "R12 不支持 TrueType，不应写 TrueType 扩展数据");
-    }
-
     // 图元的样式名回写
     QHash<QString, int> used;
     for (EntityId id : source.drawOrder()) {
@@ -543,6 +527,88 @@ void TestLibDxfRw::writtenTextStylesRoundTrip()
         if (name == QLatin1String("HZLZB") || name == QLatin1String("PaperStyle")) ++styled;
     }
     QCOMPARE(styled, 2);
+}
+
+// -----------------------------------------------------------------------------
+//  R12 只读不写：读他人生成的 R12 文件，中文的 \U+XXXX 转义必须还原。
+//
+//  R12 的 DXF 没有 UTF-8 可言，非 ASCII 只能用 \U+XXXX 表达。libdxfrw 解这类
+//  序列时会把前导的 '\' 当成代码页里的字符（在那个位置是 ¥），于是
+//  "\U+8F6E\U+5ED3" 变成 "¥U+8F6E¥U+5ED3"，中文退化成可见的转义文本。
+//  适配层的 repairUnicodeEscapes 负责把两种形态都还原回真正的字符。
+//
+//  这段逻辑**只有读别人写的 R12 文件时才会走到**——本项目的可写版本自 R2000 起，
+//  写出的都是代码页或 UTF-8 编码，不会产生转义序列。也正因为如此，它在
+//  「R12 导出移除」之后失去了唯一的生成途径，必须用手写的 R12 文件盯住。
+void TestLibDxfRw::readsR12UnicodeEscapes()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // 一张最小但合法的 R12 ASCII DXF：中文图层名按 R12 的规矩写成 \U+XXXX
+    const QString escaped = QStringLiteral("\\U+8F6E\\U+5ED3");     // 轮廓
+    QStringList lines;
+    const auto code = [&lines](int group, const QString& value) {
+        lines << QString::number(group) << value;
+    };
+
+    code(0, QStringLiteral("SECTION"));
+    code(2, QStringLiteral("HEADER"));
+    code(9, QStringLiteral("$ACADVER"));
+    code(1, QStringLiteral("AC1009"));
+    code(9, QStringLiteral("$DWGCODEPAGE"));
+    code(3, QStringLiteral("ANSI_936"));
+    code(0, QStringLiteral("ENDSEC"));
+
+    code(0, QStringLiteral("SECTION"));
+    code(2, QStringLiteral("TABLES"));
+    code(0, QStringLiteral("TABLE"));
+    code(2, QStringLiteral("LAYER"));
+    code(0, QStringLiteral("LAYER"));
+    code(2, escaped);
+    code(70, QStringLiteral("0"));
+    code(62, QStringLiteral("1"));
+    code(6, QStringLiteral("CONTINUOUS"));
+    code(0, QStringLiteral("ENDTAB"));
+    code(0, QStringLiteral("ENDSEC"));
+
+    code(0, QStringLiteral("SECTION"));
+    code(2, QStringLiteral("ENTITIES"));
+    code(0, QStringLiteral("LINE"));
+    code(8, escaped);
+    code(10, QStringLiteral("0.0"));
+    code(20, QStringLiteral("0.0"));
+    code(11, QStringLiteral("10.0"));
+    code(21, QStringLiteral("10.0"));
+    code(0, QStringLiteral("ENDSEC"));
+    code(0, QStringLiteral("EOF"));
+
+    const QString path = dir.filePath(QStringLiteral("r12_escaped.dxf"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Text));
+    file.write(lines.join(QLatin1Char('\n')).toLatin1());
+    file.write("\n");
+    file.close();
+
+    Document loaded;
+    const IoResult result = CadFile::load(path, loaded);
+
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(loaded.entityCount(), std::size_t(1));
+
+    // 图层名与图元所属图层都要还原成真正的中文
+    bool layerRestored = false;
+    for (const Layer& layer : loaded.layers().all()) {
+        if (layer.name() == QStringLiteral("轮廓")) layerRestored = true;
+        QVERIFY2(!layer.name().contains(QLatin1String("U+")),
+                 qPrintable(QStringLiteral("图层名里残留了转义文本：%1").arg(layer.name())));
+    }
+    QVERIFY2(layerRestored, "R12 的 \\U+ 转义图层名未还原成「轮廓」");
+
+    const Entity* entity = loaded.entity(loaded.drawOrder().front());
+    QVERIFY(entity != nullptr);
+    QCOMPARE(entity->type(), EntityType::Line);
+    QCOMPARE(entity->layerName(), QStringLiteral("轮廓"));
 }
 
 // -----------------------------------------------------------------------------

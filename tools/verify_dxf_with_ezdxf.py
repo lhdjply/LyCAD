@@ -33,8 +33,7 @@ def close(a, b, tol=1e-6):
     return abs(a - b) <= tol
 
 
-def verify(path: Path, expected_version: str, has_lineweight: bool,
-           has_lwpolyline: bool, has_hatch: bool):
+def verify(path: Path, expected_version: str):
     print(f"\n=== 校验 {path.name} (期望版本 {expected_version}) ===")
 
     # recover 模式会报告结构性问题；正常文件应无需修复
@@ -75,9 +74,8 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
     check(layers["标注"].dxf.color == 2, "标注层颜色应为 2")
     check(layers["中心线"].dxf.linetype.upper() == "CENTER", "中心线层线型应为 CENTER")
     check(layers["标注"].dxf.linetype.upper() == "DASHED", "标注层线型应为 DASHED")
-    if has_lineweight:
-        check(layers["轮廓"].dxf.lineweight == 35,
-              f"轮廓层线宽应为 35，实际 {layers['轮廓'].dxf.lineweight}")
+    check(layers["轮廓"].dxf.lineweight == 35,
+          f"轮廓层线宽应为 35，实际 {layers['轮廓'].dxf.lineweight}")
 
     # 图层中文名的 \U+ 转义必须被正确还原
     check("轮廓" in layers and "中心线" in layers and "标注" in layers,
@@ -95,30 +93,23 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
     types = [e.dxftype() for e in modelspace]
     print(f"  实体: {types}")
 
-    # 两个版本档的图元构成不同，各自逐项比对：
-    #   · R2000 及以上：HATCH / SPLINE / ELLIPSE / XLINE / RAY 都是原生实体；
-    #   · R12：没有这几类实体，导出时 HATCH 与椭圆降级为闭合多段线、
-    #     SPLINE 降级为多段线、XLINE/RAY 降级为直线——所以总数仍是 23，
-    #     变的是「以什么形式存在」。降级会在导出警告里如实报数。
-    poly_type = "LWPOLYLINE" if has_lwpolyline else "POLYLINE"
-    if has_hatch:
-        expected_types = {
-            "LWPOLYLINE": 3, "LINE": 4, "CIRCLE": 2, "ARC": 1, "ELLIPSE": 2,
-            "SPLINE": 1, "HATCH": 1, "POINT": 1, "TEXT": 2, "DIMENSION": 4,
-            "XLINE": 1, "RAY": 1,
-        }
-    else:
-        expected_types = {
-            "POLYLINE": 7, "LINE": 6, "CIRCLE": 2, "ARC": 1,
-            "POINT": 1, "TEXT": 2, "DIMENSION": 4,
-        }
+    # 图元构成逐项比对。可写版本自 R2000 起实体集相同，
+    # HATCH / SPLINE / ELLIPSE / XLINE / RAY 都必须是**原生实体**——
+    # R12 的降级通道已随「移除 R12 导出」删除，这里再出现
+    # POLYLINE 顶替 HATCH 之类的情形就是回归。
+    poly_type = "LWPOLYLINE"
+    expected_types = {
+        "LWPOLYLINE": 3, "LINE": 4, "CIRCLE": 2, "ARC": 1, "ELLIPSE": 2,
+        "SPLINE": 1, "HATCH": 1, "POINT": 1, "TEXT": 2, "DIMENSION": 4,
+        "XLINE": 1, "RAY": 1,
+    }
 
     total = sum(expected_types.values())
     check(len(types) == total, f"实体数应为 {total}，实际 {len(types)}")
     for name, want in expected_types.items():
         check(types.count(name) == want, f"{name} 数应为 {want}，实际 {types.count(name)}")
     for name in sorted(set(types) - set(expected_types)):
-        check(False, f"出现预期之外的实体类型: {name}（R12 档不应有原生 HATCH/SPLINE/ELLIPSE/XLINE/RAY）")
+        check(False, f"出现预期之外的实体类型: {name}")
 
     expected_polys = expected_types[poly_type]
 
@@ -149,28 +140,21 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
     polylines = modelspace.query(poly_type)
 
     def is_closed(poly):
-        """LWPOLYLINE 用 70 组码 bit 0；POLYLINE 同样使用 70 组码 bit 0"""
-        if poly_type == "LWPOLYLINE":
-            return bool(poly.closed)
-        return bool(poly.dxf.flags & 1)
+        """LWPOLYLINE 用 70 组码 bit 0"""
+        return bool(poly.closed)
 
     def vertices_of(poly):
-        if poly_type == "LWPOLYLINE":
-            # ezdxf 在不同版本中可能返回标量或单元素元组，统一成二元组
-            return [(pt[0], pt[1]) if isinstance(pt, tuple) else (pt[0], pt[1])
-                    for pt in poly.get_points("xy")]
-        return [(v.dxf.location.x, v.dxf.location.y) for v in poly.vertices]
+        # ezdxf 在不同版本中可能返回标量或单元素元组，统一成二元组
+        return [(pt[0], pt[1]) if isinstance(pt, tuple) else (pt[0], pt[1])
+                for pt in poly.get_points("xy")]
 
     def bulges_of(poly):
-        if poly_type == "LWPOLYLINE":
-            raw = list(poly.get_points("b"))
-        else:
-            raw = [v.dxf.bulge for v in poly.vertices]
+        raw = list(poly.get_points("b"))
         return [round(b[0] if isinstance(b, tuple) else b, 6) for b in raw]
 
-    # 闭合多段线：R2000 是「外框 + 圆弧段多段线」2 条（带宽走线为开环）；
-    # R12 另加由 HATCH 与两个椭圆降级而来的 2 条。
-    expected_closed = 2 if has_hatch else 4
+    # 闭合多段线：外框 + 圆弧段多段线 2 条（带宽走线为开环）。
+    # 填充与椭圆是原生实体，不该再以多段线的形式出现。
+    expected_closed = 2
     closed = [poly for poly in polylines if is_closed(poly)]
     check(len(closed) == expected_closed,
           f"闭合多段线应为 {expected_closed} 条，实际 {len(closed)} 条")
@@ -200,31 +184,12 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
         check(0.6 in bulges, f"缺失凸度 +0.6（逆时针弧段），实际 {bulges}")
         check(-0.4 in bulges, f"缺失凸度 -0.4（顺时针弧段），实际 {bulges}")
 
-    # 带宽度多段线（PCB 走线语义）：宽度值必须完整保留
-    if has_lwpolyline:
-        wide = [p for p in modelspace.query("LWPOLYLINE")
-                if abs((p.dxf.const_width or 0.0) - 2.0) < 1e-9]
-        check(len(wide) == 1, f"应有一条恒定宽度 2.0 的多段线，实际 {len(wide)}")
-    else:
-        # R12：宽度在 POLYLINE 头部的 40/41 组码（ezdxf: default_start/end_width）
-        wide = [p for p in modelspace.query("POLYLINE")
-                if abs((p.dxf.get('default_start_width', 0.0) or 0.0) - 2.0) < 1e-9]
-        check(len(wide) == 1, f"R12 中应有默认宽度 2.0 的 POLYLINE，实际 {len(wide)}")
+    # 带宽度多段线（PCB 走线语义）：宽度值必须完整保留（43 组码）
+    wide = [p for p in modelspace.query("LWPOLYLINE")
+            if abs((p.dxf.const_width or 0.0) - 2.0) < 1e-9]
+    check(len(wide) == 1, f"应有一条恒定宽度 2.0 的多段线，实际 {len(wide)}")
 
-    # R12 下填充被降级为闭合多段线：验证几何信息不丢失
-    if not has_hatch:
-        hatch_like = [poly for poly in polylines
-                      if not any(abs(b) > 1e-9 for b in bulges_of(poly))
-                      and len(vertices_of(poly)) == 5]
-        check(len(hatch_like) == 1, "R12 中应由 HATCH 降级出一条 5 顶点闭合多段线")
-        if hatch_like:
-            got = {(round(x, 6), round(y, 6)) for x, y in vertices_of(hatch_like[0])}
-            expected = {(100.0, 15.0), (130.0, 15.0), (140.0, 38.0),
-                        (115.0, 52.0), (92.0, 38.0)}
-            check(got == expected, f"降级多段线的顶点集合不符: {sorted(got)}")
-
-    # 图层归属。降级不改变图元所属图层（XLINE/RAY 变直线后仍在「中心线」），
-    # 因此两个版本档的分布相同。
+    # 图层归属
     layer_of = {}
     for entity in modelspace:
         layer_of.setdefault(entity.dxf.layer, 0)
@@ -257,34 +222,31 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
               f"第二条文字应带水平镜像标志，实际生成标志 {t2.dxf.text_generation_flag}")
         check(close(t2.dxf.width, 1.1), f"宽度因子应为 1.1，实际 {t2.dxf.width}")
 
-    # ---- 填充（仅 R2000） ----
+    # ---- 填充 ----
     hatches = modelspace.query("HATCH")
-    if has_hatch:
-        check(len(hatches) == 1, f"HATCH 数应为 1，实际 {len(hatches)}")
-        if hatches:
-            h = hatches[0]
-            check(h.dxf.pattern_name.upper() == "ANSI31",
-                  f"填充图案应为 ANSI31，实际 {h.dxf.pattern_name}")
-            check(close(h.dxf.pattern_scale, 1.5),
-                  f"填充比例应为 1.5，实际 {h.dxf.pattern_scale}")
-            check(not h.dxf.solid_fill, "填充不应是实体填充")
-            paths = list(h.paths)
-            check(len(paths) == 1, f"边界环数应为 1，实际 {len(paths)}")
-            if paths and hasattr(paths[0], "vertices"):
-                # ezdxf 对边界顶点有两代表示：早期返回带 x/y 属性的对象，
-                # 新版返回 (x, y) 元组。两种都要能读，否则换个 ezdxf 版本就报错。
-                def vertex_xy(v):
-                    if isinstance(v, (tuple, list)):
-                        return float(v[0]), float(v[1])
-                    return float(v.x), float(v.y)
+    check(len(hatches) == 1, f"HATCH 数应为 1，实际 {len(hatches)}")
+    if hatches:
+        h = hatches[0]
+        check(h.dxf.pattern_name.upper() == "ANSI31",
+              f"填充图案应为 ANSI31，实际 {h.dxf.pattern_name}")
+        check(close(h.dxf.pattern_scale, 1.5),
+              f"填充比例应为 1.5，实际 {h.dxf.pattern_scale}")
+        check(not h.dxf.solid_fill, "填充不应是实体填充")
+        paths = list(h.paths)
+        check(len(paths) == 1, f"边界环数应为 1，实际 {len(paths)}")
+        if paths and hasattr(paths[0], "vertices"):
+            # ezdxf 对边界顶点有两代表示：早期返回带 x/y 属性的对象，
+            # 新版返回 (x, y) 元组。两种都要能读，否则换个 ezdxf 版本就报错。
+            def vertex_xy(v):
+                if isinstance(v, (tuple, list)):
+                    return float(v[0]), float(v[1])
+                return float(v.x), float(v.y)
 
-                verts = [vertex_xy(v) for v in paths[0].vertices]
-                got = {(round(x, 6), round(y, 6)) for x, y in verts}
-                expected = {(100.0, 15.0), (130.0, 15.0), (140.0, 38.0),
-                            (115.0, 52.0), (92.0, 38.0)}
-                check(got == expected, f"填充边界顶点集合不符: {sorted(got)}")
-    else:
-        check(len(hatches) == 0, "R12 文件不应包含 HATCH 实体")
+            verts = [vertex_xy(v) for v in paths[0].vertices]
+            got = {(round(x, 6), round(y, 6)) for x, y in verts}
+            expected = {(100.0, 15.0), (130.0, 15.0), (140.0, 38.0),
+                        (115.0, 52.0), (92.0, 38.0)}
+            check(got == expected, f"填充边界顶点集合不符: {sorted(got)}")
 
     # ---- 尺寸标注 ----
     dims = modelspace.query("DIMENSION")
@@ -360,32 +322,17 @@ def main():
         nested = sample_dir / year / f"lycad_sample_{year}.dxf"
         return nested if nested.is_file() else sample_dir / f"lycad_sample_{year}.dxf"
 
-    verify(sample_path("r12"),
-           expected_version="AC1009",
-           has_lineweight=False,     # R12 无 370 组码
-           has_lwpolyline=False,     # R12 使用 POLYLINE/VERTEX
-           has_hatch=False)          # R12 无 HATCH，降级为多段线
-
-    verify(sample_path("2000"),
-           expected_version="AC1015",
-           has_lineweight=True,
-           has_lwpolyline=True,
-           has_hatch=True)
-
-    # 更高版本：实体集与 R2000 完全相同（都是原生 HATCH/SPLINE/ELLIPSE/XLINE/RAY），
-    # 差别只在 $ACADVER 与文本编码，因此复用同一套期望值，靠 expected_version
-    # 触发版本号与编码两项断言。
-    for year, version in (("2004", "AC1018"), ("2007", "AC1021"), ("2010", "AC1024"),
-                          ("2013", "AC1027"), ("2018", "AC1032")):
+    # 可写版本自 R2000 起：实体集完全相同（都是原生 HATCH/SPLINE/ELLIPSE/XLINE/RAY），
+    # 差别只在 $ACADVER 与文本编码（2007 起 UTF-8），因此共用一套期望值，
+    # 靠 expected_version 触发版本号与编码两项断言。
+    # R12 (AC1009) 已不在可写清单里，也就没有对应的样例可校。
+    for year, version in (("2000", "AC1015"), ("2004", "AC1018"), ("2007", "AC1021"),
+                          ("2010", "AC1024"), ("2013", "AC1027"), ("2018", "AC1032")):
         path = sample_path(year)
         if not path.is_file():
             print(f"\n(跳过 {version}：未找到 lycad_sample_{year}.dxf)")
             continue
-        verify(path,
-               expected_version=version,
-               has_lineweight=True,
-               has_lwpolyline=True,
-               has_hatch=True)
+        verify(path, expected_version=version)
 
     print(f"\n{'=' * 60}")
     if FAILURES:

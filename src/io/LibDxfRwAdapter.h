@@ -48,12 +48,12 @@ IoResult readDxfWithLibDxfRw(const QString& path, Document& document);
 /// 用 libdxfrw-modify 写出 DXF（`DxfCodec::write` 的正式路径）。
 ///
 /// 目标版本取自 `WriteOptions::availableDxfVersions()`：
-/// AC1009 (R12) 与 AC1015/AC1018/AC1021/AC1024/AC1027/AC1032
+/// AC1015/AC1018/AC1021/AC1024/AC1027/AC1032
 /// （AutoCAD 2000 / 2004 / 2007 / 2010 / 2013 / 2018）。
-/// 保真决策在该层完成：尺寸标注同时写出匿名几何块（*Dnn）、
-/// R12 不支持的填充降级为闭合多段线并计数上报、
-/// R12 ~ 2004 的文字以目标代码页（简中 GBK）编码写出，
-/// 2007 及以后一律 UTF-8。
+/// **R12 (AC1009) 不在其中**：它缺 HATCH/SPLINE/ELLIPSE/XLINE/RAY，也没有
+/// TrueType 与 MTEXT，写出时得整体降级改写，这条通道已移除——R12 只读不写。
+/// 保真决策在该层完成：尺寸标注同时写出匿名几何块（*Dnn）；
+/// 2000 ~ 2004 的文字以目标代码页（简中 GBK）编码写出，2007 及以后一律 UTF-8。
 IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
                               const WriteOptions& options);
 

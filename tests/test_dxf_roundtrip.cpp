@@ -4,7 +4,7 @@
 //
 //  测试策略：构造一份覆盖全部图元类型与典型属性的文档，写出后再读回，
 //  逐图元比对「类型 / 图层 / 颜色 / 可见性 / 几何参数」。
-//  同时覆盖三种文件形态：ASCII-R12、ASCII-R2000、二进制 DXF。
+//  覆盖 ASCII-DXF（R2000 ~ 2018 各档）与二进制 DXF。
 // =============================================================================
 #include <QtTest>
 
@@ -58,23 +58,19 @@ class TestDxfRoundTrip : public QObject {
 private slots:
     void initTestCase();
     void dxfVersionCatalog();
-    void roundTripR12();
     void roundTripR2000();
     void roundTripNewerDxfVersions();
     void binaryDxfIsReadable();
     void unsupportedEntitiesAreCountedNotDropped();
-    void infiniteLinesDowngradeToLinesInR12();
+    void infiniteLinesStayNative();
     void dwgSignatureIsRecognized();
 
 private:
-    /// includeR2000Only 为 false 时（目标 R12）不构造 R12 没有的图元
-    /// （HATCH / XLINE / RAY）——它们会被降级为多段线或直线，
-    /// 往返签名必然不同，那样测的就不是「保真」而是「降级」了。
-    static void buildSampleDocument(Document& document, bool includeR2000Only);
+    /// 构造覆盖全部已建模图元与典型属性的样例文档。
+    /// 目标版本的实体集自 R2000 起相同，因此这里不再按版本裁图元。
+    static void buildSampleDocument(Document& document);
     static QStringList entitySignatures(const Document& document);
-    /// includeLineweight 为 false 时忽略线宽字段——
-    /// R12 的 LAYER 记录没有 370 组码，线宽本身无法表达，比对时需排除。
-    static QStringList layerSignatures(const Document& document, bool includeLineweight);
+    static QStringList layerSignatures(const Document& document);
 
     /// 写出后读回，返回两侧的签名列表是否一致
     bool roundTrip(const QString& version, const QString& fileName,
@@ -90,7 +86,7 @@ void TestDxfRoundTrip::initTestCase()
     registerBuiltinCodecs();
 }
 
-void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeR2000Only)
+void TestDxfRoundTrip::buildSampleDocument(Document& document)
 {
     document.clear(true);
 
@@ -163,8 +159,8 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeR2000
         document.addEntity(std::move(centered));
     }
 
-    // 填充（R2000 专属；R12 导出会降级为多段线，故在该版本下跳过）
-    if (includeR2000Only) {
+    // 填充
+    {
         auto hatch = std::make_unique<HatchEntity>(
             std::vector<Point2D>{ Point2D(80.0, 80.0), Point2D(110.0, 80.0),
                                   Point2D(115.0, 100.0), Point2D(85.0, 105.0) },
@@ -383,7 +379,7 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
     return out;
 }
 
-QStringList TestDxfRoundTrip::layerSignatures(const Document& document, bool includeLineweight)
+QStringList TestDxfRoundTrip::layerSignatures(const Document& document)
 {
     QStringList out;
     for (const Layer& layer : document.layers().all()) {
@@ -391,8 +387,7 @@ QStringList TestDxfRoundTrip::layerSignatures(const Document& document, bool inc
                    .arg(layer.name())
                    .arg(layer.colorIndex())
                    .arg(layer.linetype())
-                   .arg(includeLineweight ? QString::number(layer.lineweightDxf())
-                                          : QStringLiteral("-"))
+                   .arg(layer.lineweightDxf())
                    .arg(layer.isVisible() ? 1 : 0)
                    .arg(layer.isFrozen() ? 1 : 0)
                    .arg(layer.isLocked() ? 1 : 0);
@@ -404,9 +399,7 @@ bool TestDxfRoundTrip::roundTrip(const QString& version, const QString& fileName
                                  QString* failure)
 {
     Document source;
-    // R12 没有 HATCH / XLINE / RAY 实体，导出会降级为多段线或直线，
-    // 因此在该版本下不构造这几类图元，其余图元的往返保真不受影响
-    buildSampleDocument(source, version != QLatin1String("AC1009"));
+    buildSampleDocument(source);
 
     const QString path = m_dir.filePath(fileName);
 
@@ -443,11 +436,9 @@ bool TestDxfRoundTrip::roundTrip(const QString& version, const QString& fileName
         }
     }
 
-    // 图层属性同样需要往返一致。R12 不支持线宽（370 组码为 R2000 引入），
-    // 因此在该版本下把线宽字段排除在比对之外，而不是放宽整个断言。
-    const bool hasLineweight = (version != QLatin1String("AC1009"));
-    const QStringList layersBefore = layerSignatures(source, hasLineweight);
-    const QStringList layersAfter = layerSignatures(loaded, hasLineweight);
+    // 图层属性同样需要往返一致（线宽自 R2000 起可表达，所有可写版本都支持）
+    const QStringList layersBefore = layerSignatures(source);
+    const QStringList layersAfter = layerSignatures(loaded);
     if (layersBefore != layersAfter) {
         *failure = QStringLiteral("图层表不一致：\n  原: %1\n  读: %2")
                        .arg(layersBefore.join(QLatin1Char('\n')), layersAfter.join(QLatin1Char('\n')));
@@ -462,13 +453,13 @@ void TestDxfRoundTrip::dxfVersionCatalog()
 {
     // 版本清单是界面、版本归一化与写出端共用的**唯一来源**，
     // 它的顺序与默认值都是对外约定：
-    //   · 由旧到新 —— 另存为的类型列表、目标版本下拉都按这个顺序排；
-    //   · 默认 AC1032 —— 普通保存（Ctrl+S）写出的就是这一档。
+    //   · 由旧到新 —— 另存为的类型列表按这个顺序排；
+    //   · 默认 AC1032 —— 普通保存（Ctrl+S）写出的就是这一档；
+    //   · **不含 AC1009 (R12)** —— R12 导出已移除，只读不写。
     const QStringList versions = WriteOptions::availableDxfVersions();
-    QCOMPARE(versions, QStringList({ QStringLiteral("AC1009"), QStringLiteral("AC1015"),
-                                     QStringLiteral("AC1018"), QStringLiteral("AC1021"),
-                                     QStringLiteral("AC1024"), QStringLiteral("AC1027"),
-                                     QStringLiteral("AC1032") }));
+    QCOMPARE(versions, QStringList({ QStringLiteral("AC1015"), QStringLiteral("AC1018"),
+                                     QStringLiteral("AC1021"), QStringLiteral("AC1024"),
+                                     QStringLiteral("AC1027"), QStringLiteral("AC1032") }));
     QCOMPARE(WriteOptions{}.version, QStringLiteral("AC1032"));
 
     // 两种名字各司其职：短名进另存为的类型列表（要短），
@@ -478,21 +469,15 @@ void TestDxfRoundTrip::dxfVersionCatalog()
     QCOMPARE(WriteOptions::versionDisplayName(QStringLiteral("AC1018")),
              QStringLiteral("AutoCAD 2004 (AC1018)"));
 
-    // 清单之外的版本按原样回显，不静默换成别的名字
-    QCOMPARE(WriteOptions::versionShortName(QStringLiteral("AC9999")),
-             QStringLiteral("AC9999"));
-    QCOMPARE(WriteOptions::versionDisplayName(QStringLiteral("AC9999")),
-             QStringLiteral("AC9999"));
+    // 清单之外的版本按原样回显，不静默换成别的名字；R12 也在其中
+    // （它已不是可写版本，短名/全名都不该再出现在界面上）
+    for (const QString& unknown : { QStringLiteral("AC9999"), QStringLiteral("AC1009") }) {
+        QCOMPARE(WriteOptions::versionShortName(unknown), unknown);
+        QCOMPARE(WriteOptions::versionDisplayName(unknown), unknown);
+    }
 }
 
 // -----------------------------------------------------------------------------
-void TestDxfRoundTrip::roundTripR12()
-{
-    QString failure;
-    QVERIFY2(roundTrip(QStringLiteral("AC1009"), QStringLiteral("sample_r12.dxf"), &failure),
-             qPrintable(failure));
-}
-
 void TestDxfRoundTrip::roundTripR2000()
 {
     QString failure;
@@ -699,65 +684,45 @@ EOF
 }
 
 // -----------------------------------------------------------------------------
-//  无界图元在 R12 中的降级
+//  无界图元不再降级
 //
-//  XLINE / RAY 是 R13 才引入的实体，R12 里根本不存在。写出时既不能静默丢弃
-//  （用户会以为画丢了），也不能写一个「无穷长」的坐标（R12 的数值域装不下）。
-//  可行且与 AutoCAD 一致的做法是降级为一条覆盖全图范围的直线——这里验证的正是
-//  「降级后仍然穿过原定位点」「条数不变」「警告里如实报数」这三件事。
+//  XLINE / RAY 是 R13 才引入的实体，而本软件的可写版本都在 R13 之后，
+//  因此它们一律以原生实体写出。这里盯住两件事：读回仍是 XLINE / RAY
+//  （没有被改写成直线），以及导出**不该**再报任何降级警告——
+//  R12 的降级通道已随「移除 R12 导出」一并删除。
 // -----------------------------------------------------------------------------
-void TestDxfRoundTrip::infiniteLinesDowngradeToLinesInR12()
+void TestDxfRoundTrip::infiniteLinesStayNative()
 {
     Document source;
     source.beginBatchLoad();
-    // 上下两条边围出 [0,100]×[0,100] 的图形范围——降级后的无界图元正是被裁到这里
-    source.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 0.0), Point2D(100.0, 0.0)));
-    source.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 100.0), Point2D(100.0, 100.0)));
-    // 两条都以 (50, 50) 为定位点，降级后必须仍然落在同一条直线上
     source.addEntity(std::make_unique<XLineEntity>(Point2D(50.0, 50.0), Vector2D(1.0, 1.0)));
     source.addEntity(std::make_unique<RayEntity>(Point2D(50.0, 50.0), Vector2D(0.0, 1.0)));
     source.endBatchLoad();
 
-    const QString path = m_dir.filePath(QStringLiteral("infinite_r12.dxf"));
+    const QString path = m_dir.filePath(QStringLiteral("infinite_native.dxf"));
     WriteOptions options;
-    options.version = QStringLiteral("AC1009");
+    options.version = QStringLiteral("AC1015");
 
     const IoResult written = CadFile::save(path, source, options);
     QVERIFY2(written.ok, qPrintable(written.error));
-
-    bool reported = false;
-    for (const QString& warning : written.warnings) {
-        if (warning.contains(QStringLiteral("2 个构造线/射线"))) {
-            reported = true;
-            break;
-        }
-    }
-    QVERIFY2(reported, "无界图元的降级必须在导出警告中如实报数");
+    QVERIFY2(written.warnings.isEmpty(),
+             qPrintable(QStringLiteral("可写版本都支持 XLINE/RAY，不该再有降级警告：%1")
+                            .arg(written.warnings.join(QLatin1Char('|')))));
 
     Document loaded;
     const IoResult readResult = CadFile::load(path, loaded);
     QVERIFY2(readResult.ok, qPrintable(readResult.error));
 
-    QCOMPARE(loaded.entityCount(), std::size_t(4));
-
-    int onOriginalAxis = 0;
+    QCOMPARE(loaded.entityCount(), std::size_t(2));
+    int xlines = 0;
+    int rays = 0;
     for (EntityId id : loaded.drawOrder()) {
-        const Entity* entity = loaded.entity(id);
-        QVERIFY(entity != nullptr);
-        // 四条都应是普通直线：R12 里没有构造线与射线
-        QCOMPARE(entity->type(), EntityType::Line);
-
-        // 降级后的线被裁到图形范围内，因此**不再包含**原定位点；能守住的
-        // 不变量是「仍然落在同一条直线上」，用点到无限直线的垂距来判。
-        const auto& line = static_cast<const LineEntity&>(*entity);
-        const Vector2D along = line.end() - line.start();
-        QVERIFY(along.length() > kGeomTol);
-        const double perpendicular =
-            std::abs(cross(Point2D(50.0, 50.0) - line.start(), along)) / along.length();
-        if (perpendicular < 1e-6) ++onOriginalAxis;
+        const EntityType type = loaded.entity(id)->type();
+        if (type == EntityType::XLine) ++xlines;
+        else if (type == EntityType::Ray) ++rays;
     }
-    // 上下两条边离 (50, 50) 有 50 的距离，落在定位点轴线上的必须正好是两条
-    QCOMPARE(onOriginalAxis, 2);
+    QCOMPARE(xlines, 1);
+    QCOMPARE(rays, 1);
 }
 
 void TestDxfRoundTrip::dwgSignatureIsRecognized()

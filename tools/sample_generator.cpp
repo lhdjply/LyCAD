@@ -2,7 +2,7 @@
 //  LyCAD - tools/sample_generator.cpp
 //  开发用样例生成器。
 //
-//  用途：生成一份覆盖全部图元类型与典型属性的参考图纸（DXF R12 ~ 2018 各一份，
+//  用途：生成一份覆盖全部图元类型与典型属性的参考图纸（DXF R2000 ~ 2018 各一份，
 //  外加 DWG R2000），供外部工具（AutoCAD / LibreCAD / ezdxf / ODA File Converter）
 //  做互操作性校验。自动化测试只验证「自己写、自己读」的一致性，无法发现
 //  「双方都不满足规范」的情况；用独立实现交叉验证才能暴露这类问题，
@@ -13,8 +13,7 @@
 //
 //  输出位置：默认写入仓库的 sample/ 目录（路径由构建系统注入，
 //  见 tools/CMakeLists.txt 的 LYCAD_SAMPLE_DIR），按目标版本分目录：
-//      sample/r12/lycad_sample_r12.dxf        R12（无 HATCH/XLINE/RAY，见导出降级）
-//      sample/2000/lycad_sample_2000.dxf      R2000
+//      sample/2000/lycad_sample_2000.dxf      AC1015（最低的可写版本）
 //      sample/2000/lycad_sample_2000.dwg      原生 dwgW 写出（AC1015）
 //      sample/2004/lycad_sample_2004.dxf      AC1018
 //      sample/2007/lycad_sample_2007.dxf      AC1021（起：文本按 UTF-8 存放）
@@ -432,7 +431,6 @@ int main(int argc, char* argv[])
     // 每个年代出一个文件，便于直接用对应版本的 CAD 打开核对。
     struct Target { const char* year; const char* version; };
     static const Target kTargets[] = {
-        { "r12",  "AC1009" },     // AutoCAD R12
         { "2000", "AC1015" },     // AutoCAD 2000
         { "2004", "AC1018" },     // AutoCAD 2004
         { "2007", "AC1021" },     // AutoCAD 2007
@@ -475,9 +473,9 @@ int main(int argc, char* argv[])
     }
     // DWG：走内置 dwgW 原生写出（目标版本恒为 R2000），与 DXF 同内容，
     // 供「同一张图两种格式」的交叉比对。只出 R2000 一份——
-    // DWG 的写出版本不随 DXF 的版本矩阵变化，重复 7 份没有意义。
+    // DWG 的写出版本不随 DXF 的版本矩阵变化，重复 6 份没有意义。
     failures += writeOne(document,
-                         dirOf(kTargets[1]) + QStringLiteral("/lycad_sample_2000.dwg"),
+                         dirOf(kTargets[0]) + QStringLiteral("/lycad_sample_2000.dwg"),
                          QStringLiteral("AC1015"));
 
     if (failures == 0) {

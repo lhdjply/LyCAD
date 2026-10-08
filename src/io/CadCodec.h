@@ -31,7 +31,8 @@ class Document;
 //  写出选项
 // -----------------------------------------------------------------------------
 struct WriteOptions {
-    /// 目标格式版本。DXF 支持 R12 ~ 2018，取值见 availableDxfVersions()。
+    /// 目标格式版本。DXF 支持 R2000 ~ 2018，取值见 availableDxfVersions()
+    ///（R12 只读不写，不在清单里）。
     /// 默认 AC1032（2018）：现代 CAD 都能打开，实体集完整，文本按 UTF-8 存放，
     /// 中文不再受代码页限制。DWG 的写出版本固定为 R2000，不受此项影响。
     QString version = QStringLiteral("AC1032");

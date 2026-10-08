@@ -7,8 +7,9 @@
 namespace lycad {
 namespace {
 
-/// 样式名比较与其它表一致：DXF 的符号表名大小写不敏感，
-/// 且 R12 写出时会被整体转成大写，读回时不能因此变成两条样式。
+/// 样式名比较与其它符号表一致：DXF 的符号表名大小写不敏感。
+/// 别的 CAD 写出的文件里大小写并不统一（旧版本转 R12 时还会整体转大写），
+/// 按原样比对会让同一条样式变成两条。
 bool sameName(const QString& a, const QString& b)
 {
     return a.compare(b, Qt::CaseInsensitive) == 0;

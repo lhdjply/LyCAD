@@ -179,12 +179,16 @@ QString versionCode(DRW::Version v)
     return QString();
 }
 
-/// "AC1015" 形式的签名码 -> DRW::Version；无法识别时返回 UNKNOWNV
-DRW::Version versionFromCode(const QString& code)
+/// 「可写出版本」的签名码 -> DRW::Version；无法识别时返回 UNKNOWNV。
+///
+/// 刻意**不含 AC1009 (R12)**：R12 缺 HATCH/SPLINE/ELLIPSE/XLINE/RAY，
+/// 也没有 TrueType 与 MTEXT，写出时得整体降级改写。那条降级通道已随
+/// 「移除 R12 导出」一并删除，因此这里也不再把 AC1009 映射成可写目标——
+/// 否则直接调用本层的人会写出一个「R12 文件里装着 R13+ 实体」的四不像。
+/// 未知（含 AC1009）一律由调用方退回默认的可写版本。
+DRW::Version writableVersionFromCode(const QString& code)
 {
     static const std::pair<const char*, DRW::Version> kTable[] = {
-        { "AC1006", DRW::AC1006 }, { "AC1009", DRW::AC1009 },
-        { "AC1012", DRW::AC1012 }, { "AC1014", DRW::AC1014 },
         { "AC1015", DRW::AC1015 }, { "AC1018", DRW::AC1018 },
         { "AC1021", DRW::AC1021 }, { "AC1024", DRW::AC1024 },
         { "AC1027", DRW::AC1027 }, { "AC1032", DRW::AC1032 },
@@ -1537,8 +1541,8 @@ IoResult readDxfWithLibDxfRw(const QString& path, Document& document)
 //  写出协议：实现 DRW_Interface 的 write* 回调，dxfRW 负责组码编排、
 //  区段顺序、句柄分配与 BLOCK_RECORD/OBJECTS 字典区。
 //  图元映射的保真决策与此前自研写出器一致，差异点：
-//    · 文字编码：不再写 \U+XXXX 转义，改为声明 ANSI_936 代码页由库转 GBK
-//      （R12/R2000 均实测可被 ezdxf 正确读回）；
+//    · 文字编码：不再写 \U+XXXX 转义，2000/2004 声明 ANSI_936 由库转 GBK，
+//      2007 及以后直接写 UTF-8（各档均实测可被 ezdxf 正确读回）；
 //    · 实测值 42（标注）不再写出，由读取端按定义点重推导。
 // =============================================================================
 namespace {
@@ -1611,7 +1615,6 @@ public:
     ExporterBase(const Document& document, DRW::Version version)
         : m_doc(document)
         , m_version(version)
-        , m_modern(version > DRW::AC1009)      // R12 之外的目标版本（R13+）
         , m_utf8Text(version >= DRW::AC1021)   // 2007 及以后：DXF 文本一律 UTF-8
     {}
 
@@ -1629,11 +1632,6 @@ public:
                 QStringLiteral("*D%1").arg(++index).toStdString());
         }
     }
-
-    int hatchDowngrades() const noexcept { return m_hatchDowngrades; }
-    int splineDowngrades() const noexcept { return m_splineDowngrades; }
-    int ellipseDowngrades() const noexcept { return m_ellipseDowngrades; }
-    int infiniteDowngrades() const noexcept { return m_infiniteDowngrades; }
 
     // ---- 读侧接口（导出不使用） ----------------------------------------------
     void addHeader(const DRW_Header*) override {}
@@ -1682,7 +1680,7 @@ public:
     {
         // $ACADVER/$HANDSEED 由库负责；$DWGCODEPAGE 决定写出编码。
         //
-        //   · R12 ~ 2004：文本按代码页存放。声明 ANSI_936（简中）后库会把
+        //   · 2000 ~ 2004：文本按代码页存放。声明 ANSI_936（简中）后库会把
         //     UTF-8 字符串转成 GBK，这是简中环境的标准做法。
         //   · 2007 及以后：DXF 文本一律 UTF-8，$DWGCODEPAGE 不再参与解码。
         //     库此时不做任何编码转换，但若仍声明 ANSI_936，会误导按声明
@@ -1776,8 +1774,8 @@ public:
     ///
     /// 文档没提供字体信息的样式（例如纯新建的图纸，或文件里只写了样式名）
     /// 一律补上「txt + gbcbig.shx」：两者都随 AutoCAD / GstarCAD 分发，
-    /// 不依赖操作系统装了哪款中文字体；R12 不支持 TrueType，大字体这条路
-    /// 对 R12 与 R2000 及以上的所有目标版本同样有效。
+    /// 不依赖操作系统装了哪款中文字体，对全部可写版本都有效
+    ///（大字体这条路不挑版本，只需目标 CAD 装了这两款随它分发的字体）。
     void writeTextstyles() override
     {
         const TextStyleTable& table = m_doc.textStyles();
@@ -1791,13 +1789,9 @@ public:
             QString bigFont = style ? style->bigFontFile() : QString();
             const QString ttfName = style ? style->ttfName() : QString();
 
-            // 需要兜底中文字体的两种情形：
-            //   · 文档里根本没有这条样式，或它没带任何字体信息；
-            //   · R12 不支持 TrueType，而这条样式的字体**只**存在于 TrueType
-            //     扩展数据里（3/4 组码为空）——R12 里没有别的办法表达它。
-            const bool needsFallback =
-                (font.isEmpty() && bigFont.isEmpty())
-                && (ttfName.isEmpty() || !m_modern);
+            // 需要兜底中文字体的情形：文档里根本没有这条样式，或它没带任何
+            // 字体信息（3/4 组码为空、也没有 TrueType 族名）。
+            const bool needsFallback = font.isEmpty() && bigFont.isEmpty() && ttfName.isEmpty();
             if (needsFallback) {
                 font = fallback.fontFile();
                 bigFont = fallback.bigFontFile();
@@ -1813,8 +1807,7 @@ public:
             }
             // 3 组码为空、字体只存在于扩展数据时，必须把扩展数据一起写回
             // （libdxfrw-modify 已让写出侧支持表记录的扩展数据）。
-            // R12 不支持 TrueType，上面已经换成大字体，不再写扩展数据。
-            if (m_modern && !ttfName.isEmpty()) {
+            if (!ttfName.isEmpty()) {
                 record.extData.push_back(new DRW_Variant(1001, std::string("ACAD")));
                 record.extData.push_back(new DRW_Variant(1000, ttfName.toStdString()));
                 if (style->ttfFlags() != 0) {
@@ -1884,7 +1877,6 @@ public:
     /// R2000 及以上的 BLOCK_RECORD 表：每个匿名块都要在此登记，写出块体时才能对上句柄
     void writeBlockRecords() override
     {
-        if (!m_modern) return;
         for (const auto& [id, blockName] : m_dimBlocks) {
             Q_UNUSED(id);
             m_rw->writeBlockRecord(blockName);
@@ -2024,36 +2016,21 @@ private:
 
     void writePolyline(const PolylineEntity& polyline)
     {
-        if (m_modern) {
-            DRW_LWPolyline record;
-            applyCommonWrite(record, polyline);
-            record.flags = polyline.isClosed() ? 1 : 0;
-            record.width = polyline.constantWidth();
-            for (const PolylineEntity::Vertex& v : polyline.vertices()) {
-                DRW_Vertex2D* vertex = new DRW_Vertex2D(v.point.x, v.point.y, v.bulge);
-                if (record.width <= kEpsilon) {
-                    vertex->stawidth = v.startWidth;
-                    vertex->endwidth = v.endWidth;
-                }
-                record.vertlist.push_back(vertex);
+        // 一律走 LWPOLYLINE（R2000 起）：顶点与凸度压在一个实体里，
+        // 宽度写 43 组码。R12 的 POLYLINE/VERTEX 形态已随 R12 导出一起移除。
+        DRW_LWPolyline record;
+        applyCommonWrite(record, polyline);
+        record.flags = polyline.isClosed() ? 1 : 0;
+        record.width = polyline.constantWidth();
+        for (const PolylineEntity::Vertex& v : polyline.vertices()) {
+            DRW_Vertex2D* vertex = new DRW_Vertex2D(v.point.x, v.point.y, v.bulge);
+            if (record.width <= kEpsilon) {
+                vertex->stawidth = v.startWidth;
+                vertex->endwidth = v.endWidth;
             }
-            m_rw->writeLWPolyline(&record);
-        } else {
-            DRW_Polyline record;
-            applyCommonWrite(record, polyline);
-            record.flags = polyline.isClosed() ? 1 : 0;
-            record.defstawidth = polyline.constantWidth();
-            record.defendwidth = polyline.constantWidth();
-            for (const PolylineEntity::Vertex& v : polyline.vertices()) {
-                DRW_Vertex* vertex = new DRW_Vertex(v.point.x, v.point.y, 0.0, v.bulge);
-                if (polyline.constantWidth() <= kEpsilon) {
-                    vertex->stawidth = v.startWidth;
-                    vertex->endwidth = v.endWidth;
-                }
-                record.vertlist.push_back(vertex);
-            }
-            m_rw->writePolyline(&record);
+            record.vertlist.push_back(vertex);
         }
+        m_rw->writeLWPolyline(&record);
     }
 
     /// 多行文字的 MTEXT 附着点（1~9）：行 Top=1 / Middle=4 / Bottom=7，
@@ -2088,8 +2065,7 @@ private:
         // DXF 的一个组码值不能跨行，把含 \n 的字符串写进 TEXT 的 1 组码
         // 会产出非法文件（实测 AutoCAD 直接拒绝打开，ezdxf 也报
         // "Invalid group code"）——这正是 MTEXT 用 \P 表示段落的原因。
-        // R12 无 MTEXT，走下方 TEXT 分支并折叠换行。
-        if (m_modern && content.contains(QLatin1Char('\n'))) {
+        if (content.contains(QLatin1Char('\n'))) {
             DRW_MText record;
             applyCommonWrite(record, text);
             applyCoord(record.basePoint, text.effectivePosition());
@@ -2115,7 +2091,8 @@ private:
         applyCommonWrite(record, text);
         applyCoord(record.basePoint, text.position());
         record.secPoint = record.basePoint;
-        // TEXT 的值必须是单行：残留的换行折叠为空格（合法性与 R12 路径兜底）
+        // TEXT 的值必须是单行：走到这里说明内容本来就没有换行，
+        // 这里再折一次只是兜底（合法文件里不会出现跨行的组码值）
         record.text = QString(content)
                           .replace(QLatin1Char('\r'), QString())
                           .replace(QLatin1Char('\n'), QLatin1Char(' '))
@@ -2135,21 +2112,6 @@ private:
 
     void writeHatch(const HatchEntity& hatch)
     {
-        if (!m_modern) {
-            // HATCH 实体为 R14 引入：降级写出闭合边界多段线，保证几何信息不丢失
-            if (hatch.vertexCount() >= 2) {
-                DRW_Polyline record;
-                applyCommonWrite(record, hatch);
-                record.flags = 1;                     // 闭合
-                for (std::size_t i = 0; i < hatch.vertexCount(); ++i) {
-                    record.vertlist.push_back(new DRW_Vertex(
-                        hatch.vertex(i).x, hatch.vertex(i).y, 0.0, hatch.vertexBulge(i)));
-                }
-                m_rw->writePolyline(&record);
-            }
-            ++m_hatchDowngrades;
-            return;
-        }
         if (hatch.vertexCount() < 3) return;      // 无法构成闭合边界
 
         DRW_Hatch record;
@@ -2209,117 +2171,56 @@ private:
         m_rw->writeHatch(&record);
     }
 
-    /// 样条：R12 之外的目标版本按原生 SPLINE 写出；R12 无此实体，降级为多段线并计数
+    /// 样条：按原生 SPLINE 写出
     void writeSplineCurve(const SplineEntity& spline)
     {
-        if (m_modern) {
-            DRW_Spline record;
-            applyCommonWrite(record, spline);
-            record.degree = spline.degree();
-            record.flags = spline.isClosed() ? 1 : 0;
-            record.normalVec = DRW_Coord(0.0, 0.0, 1.0);
-            record.knotslist = spline.knots();
-            for (const Point2D& p : spline.controlPoints()) {
-                record.controllist.push_back(new DRW_Coord(p.x, p.y, 0.0));
-            }
-            record.nknots = static_cast<int>(record.knotslist.size());
-            record.ncontrol = static_cast<int>(record.controllist.size());
-            record.nfit = 0;
-            m_rw->writeSpline(&record);
-            return;
+        DRW_Spline record;
+        applyCommonWrite(record, spline);
+        record.degree = spline.degree();
+        record.flags = spline.isClosed() ? 1 : 0;
+        record.normalVec = DRW_Coord(0.0, 0.0, 1.0);
+        record.knotslist = spline.knots();
+        for (const Point2D& p : spline.controlPoints()) {
+            record.controllist.push_back(new DRW_Coord(p.x, p.y, 0.0));
         }
-
-        const std::vector<Point2D> pts = spline.flatten(0.01);
-        if (pts.size() >= 2) {
-            DRW_Polyline record;
-            applyCommonWrite(record, spline);
-            record.flags = spline.isClosed() ? 1 : 0;
-            for (const Point2D& p : pts) {
-                record.vertlist.push_back(new DRW_Vertex(p.x, p.y, 0.0, 0.0));
-            }
-            m_rw->writePolyline(&record);
-        }
-        ++m_splineDowngrades;
+        record.nknots = static_cast<int>(record.knotslist.size());
+        record.ncontrol = static_cast<int>(record.controllist.size());
+        record.nfit = 0;
+        m_rw->writeSpline(&record);
     }
 
-    /// 椭圆：R12 之外的目标版本按原生 ELLIPSE 写出；R12 无此实体，降级为多段线并计数。
-    ///（库自带的 R12 分支不拷贝图层/颜色等属性，故这里自行降级。）
+    /// 椭圆：按原生 ELLIPSE 写出
     void writeEllipseCurve(const EllipseEntity& ellipse)
     {
-        if (m_modern) {
-            DRW_Ellipse record;
-            applyCommonWrite(record, ellipse);
-            applyCoord(record.basePoint, ellipse.center());
-            const Point2D& axis = ellipse.majorAxisEnd();
-            record.secPoint = DRW_Coord(axis.x, axis.y, 0.0);
-            record.ratio = ellipse.ratio();
-            record.staparam = ellipse.startParam();
-            record.endparam = ellipse.endParam();
-            m_rw->writeEllipse(&record);
-            return;
-        }
-
-        const std::vector<Point2D> pts = ellipse.flatten(0.01);
-        if (pts.size() >= 2) {
-            DRW_Polyline record;
-            applyCommonWrite(record, ellipse);
-            record.flags = ellipse.isClosed() ? 1 : 0;
-            for (const Point2D& p : pts) {
-                record.vertlist.push_back(new DRW_Vertex(p.x, p.y, 0.0, 0.0));
-            }
-            m_rw->writePolyline(&record);
-        }
-        ++m_ellipseDowngrades;
+        DRW_Ellipse record;
+        applyCommonWrite(record, ellipse);
+        applyCoord(record.basePoint, ellipse.center());
+        const Point2D& axis = ellipse.majorAxisEnd();
+        record.secPoint = DRW_Coord(axis.x, axis.y, 0.0);
+        record.ratio = ellipse.ratio();
+        record.staparam = ellipse.startParam();
+        record.endparam = ellipse.endParam();
+        m_rw->writeEllipse(&record);
     }
 
-    /// 构造线：R12 之外的目标版本按原生 XLINE 写出；R12 无此实体（R13 才引入），
-    /// 降级为一条贯穿全图范围的直线并计数。
+    /// 构造线：按原生 XLINE 写出（基点 + 单位方向向量，11 组码）
     void writeXLine(const XLineEntity& line)
     {
-        if (m_modern) {
-            DRW_Xline record;
-            applyCommonWrite(record, line);
-            applyCoord(record.basePoint, line.basePoint());
-            record.secPoint = toCoord(line.direction());    // 单位方向向量（11 组码）
-            m_rw->writeXline(&record);
-            return;
-        }
-        writeInfiniteAsLine(line);
-        ++m_infiniteDowngrades;
+        DRW_Xline record;
+        applyCommonWrite(record, line);
+        applyCoord(record.basePoint, line.basePoint());
+        record.secPoint = toCoord(line.direction());
+        m_rw->writeXline(&record);
     }
 
-    /// 射线：与构造线同构，目标版本决定是原生 RAY 还是降级直线。
+    /// 射线：与构造线同构，按原生 RAY 写出
     void writeRay(const RayEntity& ray)
     {
-        if (m_modern) {
-            DRW_Ray record;
-            applyCommonWrite(record, ray);
-            applyCoord(record.basePoint, ray.basePoint());
-            record.secPoint = toCoord(ray.direction());
-            m_rw->writeRay(&record);
-            return;
-        }
-        writeInfiniteAsLine(ray);
-        ++m_infiniteDowngrades;
-    }
-
-    /// R12 降级：把无界图元写成一条穿过它、长度覆盖全图范围的直线。
-    /// 写「无穷长」不可能，跳过又等于删掉图元；覆盖全图范围是 AutoCAD 自己
-    /// 转 R12 时的做法——读者打开后至少能完整看到这条线，而不是一个点。
-    void writeInfiniteAsLine(const InfiniteLineEntity& line)
-    {
-        Box2D box = drawingExtents();
-        if (!box.isValid()) box = Box2D::fromCorners(Point2D(0.0, 0.0), Point2D(420.0, 297.0));
-        box.expand(box.diagonal() * 0.1 + kMinExtent);   // 留一成余量，免得端点压在边界上
-
-        const auto segment = line.clippedTo(box);
-        if (!segment) return;      // 离图形范围太远、够不到：无法用线段表达
-
-        DRW_Line record;
-        applyCommonWrite(record, line);
-        applyCoord(record.basePoint, segment->first);
-        applyCoord(record.secPoint, segment->second);
-        m_rw->writeLine(&record);
+        DRW_Ray record;
+        applyCommonWrite(record, ray);
+        applyCoord(record.basePoint, ray.basePoint());
+        record.secPoint = toCoord(ray.direction());
+        m_rw->writeRay(&record);
     }
 
     void writeDimension(const DimensionEntity& dim)
@@ -2395,16 +2296,9 @@ private:
     const Document& m_doc;
     RW* m_rw = nullptr;
     DRW::Version m_version = DRW::AC1015;
-    /// 目标版本是否高于 R12。R12 缺 HATCH/SPLINE/ELLIPSE/XLINE/RAY 等实体，
-    /// 也表达不了 TrueType 字体与 MTEXT，这些分支都挂在它上面。
-    bool m_modern = false;
     /// 目标版本的 DXF 文本是否按 UTF-8 存放（AC1021 及以后为真）
     bool m_utf8Text = false;
     std::map<EntityId, std::string> m_dimBlocks;
-    int m_hatchDowngrades = 0;
-    int m_splineDowngrades = 0;
-    int m_ellipseDowngrades = 0;
-    int m_infiniteDowngrades = 0;
     Box2D m_extents;
     bool m_extentsReady = false;
 };
@@ -2417,11 +2311,13 @@ using Exporter = ExporterBase<dxfRW>;
 IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
                               const WriteOptions& options)
 {
-    // 版本归一化：只认得出签名码的版本走各自的目标版本，其余退回 R12。
+    // 版本归一化：认得出的可写版本走各自的目标版本，其余一律退回 AC1015。
     // 调用方 DxfCodec::write 已按 WriteOptions::availableDxfVersions() 归一过一次，
     // 这里再兜一次底，保证直接调用本函数的场景也不会写出版本不明的文件。
-    DRW::Version version = versionFromCode(options.version);
-    if (version == DRW::UNKNOWNV) version = DRW::AC1009;
+    // 注意 AC1009 (R12) 已不在可写清单里，传进来同样会落到 AC1015——
+    // R12 的降级写出通道已随「移除 R12 导出」删除（可读不可写）。
+    DRW::Version version = writableVersionFromCode(options.version);
+    if (version == DRW::UNKNOWNV) version = DRW::AC1015;
 
     Exporter exporter(document, version);
     exporter.prescanDimensionBlocks();
@@ -2435,25 +2331,7 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
         return IoResult::failure(QStringLiteral("DXF 写出失败（libdxfrw）。"));
     }
 
-    IoResult result = IoResult::success(document.entityCount());
-    if (const int downgrades = exporter.hatchDowngrades(); downgrades > 0) {
-        result.addWarning(QStringLiteral("%1 个填充图元在 R12 中降级为闭合多段线（R12 不支持 HATCH 实体）")
-                              .arg(downgrades));
-    }
-    if (const int downgrades = exporter.splineDowngrades(); downgrades > 0) {
-        result.addWarning(QStringLiteral("%1 个样条曲线在 R12 中降级为多段线（R12 不支持 SPLINE 实体）")
-                              .arg(downgrades));
-    }
-    if (const int downgrades = exporter.ellipseDowngrades(); downgrades > 0) {
-        result.addWarning(QStringLiteral("%1 个椭圆在 R12 中降级为多段线（R12 不支持 ELLIPSE 实体）")
-                              .arg(downgrades));
-    }
-    if (const int downgrades = exporter.infiniteDowngrades(); downgrades > 0) {
-        result.addWarning(QStringLiteral("%1 个构造线/射线在 R12 中降级为直线（R12 不支持 XLINE / RAY 实体，"
-                                         "已按全图范围截断）")
-                              .arg(downgrades));
-    }
-    return result;
+    return IoResult::success(document.entityCount());
 }
 
 // -----------------------------------------------------------------------------
