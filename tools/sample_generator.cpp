@@ -395,9 +395,12 @@ int main(int argc, char* argv[])
         }
         const QString version = (arguments.size() > 4) ? arguments.at(4)
                                                        : QStringLiteral("AC1015");
+        // 按目标扩展名路由编解码器（.dwg 走 DwgCodec 的原生 dwgW 写出），
+        // 不能直接调 writeDxfWithLibDxfRw——否则 .dwg 里装的是 DXF 文本，
+        // 再打开时会被文件头签名检查拦下（提示"不具备 DWG 的文件头签名"）。
         WriteOptions options;
         options.version = version;
-        const IoResult written = writeDxfWithLibDxfRw(arguments.at(3), document, options);
+        const IoResult written = CadFile::save(arguments.at(3), document, options);
         out() << QStringLiteral("转换 %1 → %2 (%3)：图元 %4，%5")
                      .arg(arguments.at(2), arguments.at(3), version)
                      .arg(document.entityCount())

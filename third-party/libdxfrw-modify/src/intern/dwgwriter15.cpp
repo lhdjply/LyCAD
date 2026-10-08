@@ -2374,8 +2374,13 @@ bool write(dwgW& writer, DRW_Interface* iface)
         std::sort(entries.begin(), entries.end());
 
         std::size_t i = 0;
-        std::uint32_t lastHandle = 0, lastOffset = 0;
+        // 注意：UMC/MC 增量以「每页」为基准从 0 重新累积，不跨页延续——
+        // libredwg（decode_R13_R2000 的 last_handle/last_offset 每页重置）
+        // 与 libdxfrw 读取端都是按页解码的；跨页累积会让第 2 页起的所有
+        // 句柄/偏移被读错（大图触发，小图只有一页所以从未暴露）。
         while (i < entries.size()) {
+            // 每页重置增量
+            std::uint32_t lastHandle = 0, lastOffset = 0;
             // 试探组包：单节结构与数据量
             std::vector<std::uint8_t> sec;      // 不含 BE16 尺寸字段
             std::size_t n = 0;
