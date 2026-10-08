@@ -18,7 +18,7 @@
 #include "drw_dbg.h"
 #include "dwgreader15.h"
 #include "drw_textcodec.h"
-#include "../libdwgr.h"
+#include "../libdwgrw.h"
 
 bool dwgReader15::readMetaData() {
     version = parent->getVersion();
@@ -33,10 +33,20 @@ bool dwgReader15::readMetaData() {
     DRW_DBG("\nMEASUREMENT (0 = English, 1 = Metric)= "); DRW_DBG(meas);
     duint16 cp = fileBuf->getRawShort16();
     DRW_DBG("\ncodepage= "); DRW_DBG(cp); DRW_DBG("\n");
-    if (cp == 29) //TODO RLZ: locate wath code page and correct this
+    // 代码页 id 与名称的对应见 libredwg codepages.c 的 _codepage_dxfstr 表：
+    // 29/30 = ANSI_1252，38 = ANSI_932，39 = ANSI_936（简中），40 = ANSI_949，
+    // 41 = ANSI_950。此前只认 29/30，导致本库自己写出的 GBK 文件（id=39）
+    // 读回时按默认 ANSI_1252 解码，中文全部乱码。
+    if (cp == 29 || cp == 30)
         decoder.setCodePage("ANSI_1252", false);
-    if (cp == 30)
-        decoder.setCodePage("ANSI_1252", false);
+    else if (cp == 38)
+        decoder.setCodePage("ANSI_932", false);
+    else if (cp == 39)
+        decoder.setCodePage("ANSI_936", false);
+    else if (cp == 40)
+        decoder.setCodePage("ANSI_949", false);
+    else if (cp == 41)
+        decoder.setCodePage("ANSI_950", false);
     return true;
 }
 

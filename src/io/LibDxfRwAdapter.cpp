@@ -58,7 +58,7 @@
 #include "drw_entities.h"
 #include "drw_interface.h"
 #include "drw_objects.h"
-#include "libdwgr.h"
+#include "libdwgrw.h"
 #include "libdxfrw.h"
 
 #include <QFile>
@@ -1519,13 +1519,17 @@ DRW_Text::VAlign toDrwVAlign(TextEntity::VAlign align)
     return DRW_Text::VBaseLine;
 }
 
-/// DXF 导出器：把 Document 翻译成 dxfRW 的写出回调
-class Exporter final : public DRW_Interface {
+/// DXF/DWG 导出器：把 Document 翻译成 libdxfrw 写出回调。
+///
+/// 写出端以模板参数注入：DXF 走 dxfRW，DWG 走 dwgW——两者暴露同一套
+/// writeXxx 方法（dwgW 是 dxfRW 写出侧的同构实现），Exporter 无需感知差异。
+template <typename RW>
+class ExporterBase final : public DRW_Interface {
 public:
-    Exporter(const Document& document, bool r2000)
+    ExporterBase(const Document& document, bool r2000)
         : m_doc(document), m_r2000(r2000) {}
 
-    void setDxfRw(dxfRW* rw) { m_rw = rw; }
+    void setDxfRw(RW* rw) { m_rw = rw; }
 
     /// 预扫描：为每个尺寸标注分配匿名块名（*D1、*D2……）
     void prescanDimensionBlocks()
@@ -2244,7 +2248,7 @@ private:
     }
 
     const Document& m_doc;
-    dxfRW* m_rw = nullptr;
+    RW* m_rw = nullptr;
     bool m_r2000 = false;
     std::map<EntityId, std::string> m_dimBlocks;
     int m_hatchDowngrades = 0;
@@ -2253,6 +2257,9 @@ private:
     Box2D m_extents;
     bool m_extentsReady = false;
 };
+
+/// DXF 导出沿用 dxfRW 写出端
+using Exporter = ExporterBase<dxfRW>;
 
 } // namespace
 
@@ -2290,6 +2297,29 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
                               .arg(downgrades));
     }
     return result;
+}
+
+// -----------------------------------------------------------------------------
+//  DWG 原生写出（libdxfrw-modify 的 dwgW，目标版本恒为 R2000/AC1015）
+// -----------------------------------------------------------------------------
+IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
+                              const WriteOptions& options)
+{
+    Q_UNUSED(options.version);              // DWG 写出固定 AC1015，不随选项变化
+
+    ExporterBase<dwgW> exporter(document, /*r2000=*/true);
+    exporter.prescanDimensionBlocks();
+
+    const QByteArray native = QFile::encodeName(path);
+    dwgW writer(native.constData());
+    exporter.setDxfRw(&writer);
+
+    const bool ok = writer.write(&exporter, DRW::AC1015);
+    if (!ok) {
+        return IoResult::failure(QStringLiteral("DWG 写出失败（libdxfrw dwgW，R2000）。"));
+    }
+
+    return IoResult::success(document.entityCount());
 }
 
 } // namespace lycad

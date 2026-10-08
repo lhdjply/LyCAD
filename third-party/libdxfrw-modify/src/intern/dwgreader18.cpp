@@ -19,7 +19,7 @@
 #include "dwgreader18.h"
 #include "dwgutil.h"
 #include "drw_textcodec.h"
-#include "../libdwgr.h"
+#include "../libdwgrw.h"
 
 void dwgReader18::genMagicNumber(){
     int size =0x114;

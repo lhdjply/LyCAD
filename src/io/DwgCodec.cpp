@@ -299,29 +299,21 @@ bool DwgCodec::canRead() const
 
 bool DwgCodec::canWrite() const
 {
-    return backendForWrite() != nullptr;
+    // 内置 dwgW 原生写出随程序编入，写出能力不依赖外部程序
+    return libDxfRwAvailable() || backendForWrite() != nullptr;
 }
 
 QString DwgCodec::capabilityNote() const
 {
     detectBackends();
 
-    if (libDxfRwAvailable() && canWrite()) {
-        return QStringLiteral(
-                   "DWG 读取：内置 libdxfrw 原生解析，无需外部程序。\n"
-                   "DWG 写出：经 %1 转换为 DXF 后再输出——libdxfrw 只读 DWG，不提供写出能力。")
-            .arg(availableBackendNames().join(QStringLiteral("、")));
-    }
-
     if (libDxfRwAvailable()) {
         return QStringLiteral(
-            "DWG 导入可直接使用：内置 libdxfrw 原生解析，不需要外部程序。\n"
-            "DWG 导出需要一个外部转换器（libdxfrw 只读 DWG，本身不具备写出能力）。"
-            "请任选其一安装：\n"
-            "  · LibreDWG  —— 提供 dwg2dxf / dxf2dwg 命令\n"
-            "  · ODA File Converter —— Autodesk 官方免费转换工具\n"
-            "  · 或在 设置 → DWG 转换命令 中填写自定义转换命令模板（含 %IN% 与 %OUT% 占位符）\n"
-            "在安装之前，DXF 的导入导出完全可用。");
+                   "DWG 读取：内置 libdxfrw 原生解析，无需外部程序。\n"
+                   "DWG 写出：内置 dwgW 原生写出（R2000/AC1015），无需外部程序；\n"
+                   "写出失败时自动回退到外部转换器（%1）。")
+            .arg(canWrite() ? availableBackendNames().join(QStringLiteral("、"))
+                            : QStringLiteral("未检测到，可安装 LibreDWG 或 ODA File Converter"));
     }
 
     return QStringLiteral(
@@ -423,11 +415,32 @@ IoResult DwgCodec::readViaDxf(const QString& path, Document& document,
 IoResult DwgCodec::write(const QString& path, const Document& document,
                          const WriteOptions& options) const
 {
+    // ---- 首选：内置 dwgW 原生写出（R2000） ------------------------------------
+    // 进程内完成，不依赖外部程序。目标版本固定 AC1015：与中间 DXF 的版本
+    // 一致，兼容面最广。
+    IoResult native = writeDwgWithLibDxfRw(path, document, options);
+    if (native.ok) {
+        native.addWarning(QStringLiteral("已由内置 dwgW 原生写出（AutoCAD 2000/R2000 格式）"));
+        return native;
+    }
+
+    // ---- 回退：外部转换器（LibreDWG / ODA / 自定义命令） ----------------------
+    // 保留原生写出的失败原因，让用户看到真实错误而不是一句「转换失败」。
     const Backend* backend = backendForWrite();
     if (!backend) {
-        return IoResult::failure(capabilityNote());
+        IoResult result = IoResult::failure(
+            QStringLiteral("DWG 原生写出失败：%1\n此外未检测到可用的外部转换后端。")
+                .arg(native.error));
+        return result;
     }
-    return writeViaDxf(path, document, options, *backend);
+
+    IoResult converted = writeViaDxf(path, document, options, *backend);
+    if (converted.ok) {
+        converted.addWarning(
+            QStringLiteral("原生 DWG 写出失败（%1），已改用 %2 转换为 DWG 后导出。")
+                .arg(native.error, backend->displayName));
+    }
+    return converted;
 }
 
 IoResult DwgCodec::writeViaDxf(const QString& path, const Document& document,

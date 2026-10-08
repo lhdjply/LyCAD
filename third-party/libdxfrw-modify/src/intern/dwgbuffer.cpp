@@ -12,7 +12,7 @@
 
 
 #include "dwgbuffer.h"
-#include "../libdwgr.h"
+#include "../libdwgrw.h"
 #include "drw_textcodec.h"
 #include "drw_dbg.h"
 //#include <bitset>

@@ -18,7 +18,7 @@
 #include "drw_dbg.h"
 #include "dwgreader27.h"
 #include "drw_textcodec.h"
-#include "../libdwgr.h"
+#include "../libdwgrw.h"
 
 
 bool dwgReader27::readFileHeader() {

@@ -18,7 +18,7 @@
 #include "drw_textcodec.h"
 #include "dwgutil.h"
 #include "dwgbuffer.h"
-#include "../libdwgr.h"
+#include "../libdwgrw.h"
 
 class objHandle{
 public:

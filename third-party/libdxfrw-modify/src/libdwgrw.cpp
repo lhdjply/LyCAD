@@ -11,7 +11,7 @@
 ******************************************************************************/
 
 
-#include "libdwgr.h"
+#include "libdwgrw.h"
 #include <fstream>
 #include <algorithm>
 #include <sstream>
@@ -24,6 +24,7 @@
 #include "intern/dwgreader24.h"
 #include "intern/dwgreader27.h"
 #include "intern/dwgreader32.h"
+#include "intern/dwgwriter15.h"
 
 #define FIRSTHANDLE 48
 
@@ -315,4 +316,25 @@ bool dwgR::processDwg() {
     }
 
     return ret;
+}
+
+// =============================================================================
+//  dwgW：写出入口与**版本分派**
+//
+//  本文件只负责「按目标版本选择实现」；各版本的具体写出逻辑在
+//  intern/dwgwriterNN.cpp（当前仅 intern/dwgwriter15.cpp = AC1015/R2000）。
+//  这与读取端 dwgR 按版本创建 dwgReader15/18/21/… 的做法一致。
+// =============================================================================
+bool dwgW::write(DRW_Interface* iface, DRW::Version ver)
+{
+    if (iface == nullptr)
+        return false;
+
+    if (dwgWriter15::supports(ver))
+        return dwgWriter15::write(*this, iface);
+
+    // 新增目标版本时在此追加分支，例如：
+    //   if (dwgWriter18::supports(ver)) return dwgWriter18::write(*this, iface);
+
+    return false;                       // 暂不支持的目标版本
 }

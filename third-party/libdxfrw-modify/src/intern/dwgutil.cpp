@@ -14,7 +14,7 @@
 #include "drw_dbg.h"
 #include "dwgutil.h"
 #include "rscodec.h"
-#include "../libdwgr.h"
+#include "../libdwgrw.h"
 
 /** utility function
  * convert a int to string in hex

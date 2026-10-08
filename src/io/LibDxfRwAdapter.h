@@ -14,8 +14,8 @@
 //  能力边界（重要）
 //    · 读取：DWG（R14 ~ 2018）与 DXF，均由 libdxfrw-modify 完成。
 //    · 写出：DXF 由 libdxfrw-modify 完成（见 writeDxfWithLibDxfRw）；
-//      它**不提供 DWG 写出**，DWG 导出仍由外部转换器
-//      （ODA File Converter / LibreDWG）承担。
+//      DWG 亦由 libdxfrw-modify 完成（见 writeDwgWithLibDxfRw，dwgW，
+//      目标版本 R2000/AC1015）。外部转换器仅作失败兜底。
 //
 //  许可证
 //    libdxfrw-modify 为 GPL-2.0-or-later，与本项目一同分发时受其约束。
@@ -51,6 +51,14 @@ IoResult readDxfWithLibDxfRw(const QString& path, Document& document);
 /// R12 不支持的填充降级为闭合多段线并计数上报、
 /// 文字以目标代码页（简中 GBK）编码写出。
 IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
+                              const WriteOptions& options);
+
+/// 用 libdxfrw-modify 的 dwgW 原生写出 DWG（`DwgCodec::write` 的首选路径）。
+///
+/// 目标版本固定为 R2000 (AC1015)：与 DXF 中间格式一致，也是开放资料最
+/// 充分、兼容面最广的写出版本。实体复用与 DXF 相同的导出器（Exporter），
+/// 表记录、匿名标注块、模型空间块结构由 dwgW 负责组织。
+IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
                               const WriteOptions& options);
 
 } // namespace lycad
