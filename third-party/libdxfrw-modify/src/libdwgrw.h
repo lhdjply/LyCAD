@@ -89,6 +89,8 @@ class DRW_Vport;
 class DRW_Block;
 class DRW_Point;
 class DRW_Line;
+class DRW_Ray;
+class DRW_Xline;
 class DRW_Circle;
 class DRW_Arc;
 class DRW_Ellipse;
@@ -125,6 +127,11 @@ public:
 
     bool writePoint(DRW_Point* ent);
     bool writeLine(DRW_Line* ent);
+    /// 无界直线：RAY 自基点单向延伸，XLINE 双向延伸。
+    /// 类型数据只有「基点 + 方向」两个 3BD，与读取端 DRW_Ray::parseDwg 的
+    /// 消费顺序严格对应（无厚度/挤出字段）。
+    bool writeRay(DRW_Ray* ent);
+    bool writeXline(DRW_Xline* ent);
     bool writeCircle(DRW_Circle* ent);
     bool writeArc(DRW_Arc* ent);
     bool writeEllipse(DRW_Ellipse* ent);

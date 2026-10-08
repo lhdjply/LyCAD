@@ -47,10 +47,15 @@ struct DrawContext {
     bool isValid() const { return view != nullptr && settings != nullptr; }
 };
 
-/// 图元在设备坐标下的绘制路径（用于包围盒估算与高亮描边）
-QPainterPath toDevicePath(const Entity& entity, const ViewTransform& view);
+/// 图元在设备坐标下的绘制路径（用于包围盒估算与高亮描边）。
+///
+/// clip 为当前视口（设备坐标），无界图元（构造线、射线）必须靠它裁出可见段：
+/// 它们没有有限包围盒，路径形状完全取决于「裁到哪个矩形」。有界图元忽略该参数；
+/// 无界图元在 clip 无效时返回空路径（宁可不画，也不画一条贯穿宇宙的线）。
+QPainterPath toDevicePath(const Entity& entity, const ViewTransform& view, const QRectF& clip);
 
-/// 设备坐标下的包围矩形；图元范围无效时返回空矩形
+/// 设备坐标下的包围矩形；图元范围无效时返回空矩形。
+/// 无界图元（构造线、射线）恒返回空矩形——它们的设备范围无定义。
 QRectF deviceBounds(const Entity& entity, const ViewTransform& view);
 
 /**

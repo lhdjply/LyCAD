@@ -1,18 +1,26 @@
 // =============================================================================
-//  LyCAD - tools/dxf_sample_generator.cpp
+//  LyCAD - tools/sample_generator.cpp
 //  开发用样例生成器。
 //
-//  用途：生成一份覆盖全部图元类型与典型属性的 DXF，供外部工具
-//  （AutoCAD / LibreCAD / ezdxf / ODA File Converter）做互操作性校验。
-//  自动化测试只验证「自己写、自己读」的一致性，无法发现「双方都不满足规范」
-//  的情况；用独立实现交叉验证才能暴露这类问题，本工具正是为此提供输入。
+//  用途：生成一份覆盖全部图元类型与典型属性的参考图纸（DXF R12 / DXF R2000 /
+//  DWG R2000），供外部工具（AutoCAD / LibreCAD / ezdxf / ODA File Converter）
+//  做互操作性校验。自动化测试只验证「自己写、自己读」的一致性，无法发现
+//  「双方都不满足规范」的情况；用独立实现交叉验证才能暴露这类问题，
+//  本工具正是为此提供输入。
 //
 //  另有一个隐含作用：它把 io 与 core 模块作为纯库来链接，
 //  从而在每次构建时验证这两个模块确实不依赖任何界面代码。
 //
+//  输出位置：默认写入仓库的 sample/ 目录（路径由构建系统注入，
+//  见 tools/CMakeLists.txt 的 LYCAD_SAMPLE_DIR），按目标版本分目录：
+//      sample/r12/lycad_sample_r12.dxf        R12（无 HATCH/XLINE/RAY，见导出降级）
+//      sample/2000/lycad_sample_2000.dxf      R2000
+//      sample/2000/lycad_sample_2000.dwg      原生 dwgW 写出（AC1015）
+//  命令行给出目录参数时写到该目录（三种文件平铺，便于临时检查）。
+//
 //  用法：
-//    lycad_sample <输出目录>        生成两份参考 DXF
-//    lycad_sample --inspect <文件>  读取 DXF 并打印内容摘要
+//    lycad_sample_generator [输出目录]          生成参考 DXF / DWG
+//    lycad_sample_generator --inspect <文件>    读取 DXF/DWG 并打印内容摘要
 //
 //  --inspect 用于反向交叉校验：由外部工具（ezdxf / AutoCAD）写出的文件，
 //  交给 LyCAD 读取后打印其理解到的内容，从另一方向验证读取器。
@@ -23,11 +31,14 @@
 #include "core/Document.h"
 #include "core/Format.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/RayEntity.h"
 #include "core/TextEntity.h"
+#include "core/XLineEntity.h"
 #include "io/CadFile.h"
 #include "io/LibDxfRwAdapter.h"
 
@@ -216,6 +227,19 @@ void buildSample(Document& document)
         document.addEntity(std::move(diametric));
     }
 
+    // 无界直线：构造线（双向）与射线（单向）。
+    // 注意：样例同时面向外部工具互操作校验——这两类实体是 R13+ 的，
+    // R12 目标下写出时会降级为覆盖全图范围的直线，由导出警告说明。
+    {
+        auto xline = std::make_unique<XLineEntity>(Point2D(30.0, 30.0), Vector2D(1.0, 0.0));
+        xline->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(xline));
+
+        auto ray = std::make_unique<RayEntity>(Point2D(60.0, 90.0), Vector2D(1.0, 1.0));
+        ray->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(ray));
+    }
+
     document.endBatchLoad();
 }
 
@@ -244,7 +268,7 @@ int writeOne(const Document& document, const QString& path, const QString& versi
     return 0;
 }
 
-/// 读取并打印 DXF 摘要，用于反向交叉校验
+/// 读取并打印文件摘要，用于反向交叉校验
 int inspect(const QString& path)
 {
     Document document;
@@ -354,27 +378,49 @@ int main(int argc, char* argv[])
         return written.ok ? 0 : 1;
     }
 
-    const QString outputDir = (arguments.size() > 1) ? arguments.at(1) : QStringLiteral(".");
+    // 默认写入仓库的 sample/ 目录（构建期注入），按目标版本分目录；
+    // 显式给出目录参数时三种文件平铺写到那里，便于临时检查。
+    const QString defaultDir = QStringLiteral(LYCAD_SAMPLE_DIR);
+    const QString outputDir = (arguments.size() > 1) ? arguments.at(1) : defaultDir;
 
-    QDir dir(outputDir);
-    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+    QDir baseDir(outputDir);
+    if (!baseDir.exists() && !baseDir.mkpath(QStringLiteral("."))) {
         out() << QStringLiteral("无法创建输出目录: ") << outputDir << Qt::endl;
         return 2;
+    }
+
+    const QString r12Dir = (arguments.size() > 1)
+        ? outputDir
+        : outputDir + QStringLiteral("/r12");
+    const QString r2000Dir = (arguments.size() > 1)
+        ? outputDir
+        : outputDir + QStringLiteral("/2000");
+    for (const QString& dir : { r12Dir, r2000Dir }) {
+        QDir d(dir);
+        if (!d.exists() && !d.mkpath(QStringLiteral("."))) {
+            out() << QStringLiteral("无法创建输出目录: ") << dir << Qt::endl;
+            return 2;
+        }
     }
 
     Document document;
     buildSample(document);
 
-    out() << QStringLiteral("LyCAD DXF 样例生成") << Qt::endl;
+    out() << QStringLiteral("LyCAD 样例生成") << Qt::endl;
+    out() << QStringLiteral("输出目录: %1").arg(QDir(outputDir).absolutePath()) << Qt::endl;
     out() << QStringLiteral("图元总数: %1，图层数: %2")
                  .arg(document.entityCount())
                  .arg(document.layers().count())
           << Qt::endl;
 
     int failures = 0;
-    failures += writeOne(document, dir.filePath(QStringLiteral("lycad_sample_r12.dxf")),
+    failures += writeOne(document, r12Dir + QStringLiteral("/lycad_sample_r12.dxf"),
                          QStringLiteral("AC1009"));
-    failures += writeOne(document, dir.filePath(QStringLiteral("lycad_sample_2000.dxf")),
+    failures += writeOne(document, r2000Dir + QStringLiteral("/lycad_sample_2000.dxf"),
+                         QStringLiteral("AC1015"));
+    // DWG：走内置 dwgW 原生写出（目标版本恒为 R2000），
+    // 与 DXF 同内容，供「同一张图两种格式」的交叉比对。
+    failures += writeOne(document, r2000Dir + QStringLiteral("/lycad_sample_2000.dwg"),
                          QStringLiteral("AC1015"));
 
     if (failures == 0) {

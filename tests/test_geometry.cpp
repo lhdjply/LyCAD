@@ -9,10 +9,13 @@
 #include "core/DimensionEntity.h"
 #include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/RayEntity.h"
 #include "core/TextEntity.h"
 #include "core/Types.h"
+#include "core/XLineEntity.h"
 #include "interact/CoordinateInput.h"
 
 using namespace lycad;
@@ -47,6 +50,13 @@ private slots:
     // ---- 椭圆 ---------------------------------------------------------------
     void ellipseHalfAxesNormalization();
     void ellipseBoundsAndSnapPoints();
+
+    // ---- 构造线 / 射线（无界图元）--------------------------------------------
+    void infiniteLineDirectionIsNormalized();
+    void infiniteLineClippingRespectsDirection();
+    void infiniteLineDistanceAndCrossing();
+    void infiniteLineBoundingBoxIsUndefined();
+    void infiniteLineTransformAndGrips();
 
     // ---- 文字 / 填充 / 标注 ---------------------------------------------------
     void textBoundingBoxAndAlignment();
@@ -776,6 +786,176 @@ void TestGeometry::dimensionGripsReflowGeometry()
     // 拖动界线原点：测量值改变（对齐标注取两点直线距离）
     QVERIFY(dim.moveGrip(1, Point2D(140.0, 30.0)));
     QVERIFY(std::abs(dim.measurement() - std::hypot(140.0, 30.0)) < 1e-9);
+}
+
+// -----------------------------------------------------------------------------
+//  构造线 / 射线
+// -----------------------------------------------------------------------------
+void TestGeometry::infiniteLineDirectionIsNormalized()
+{
+    const XLineEntity xline(Point2D(10.0, 20.0), Vector2D(3.0, 4.0));
+
+    // 方向一律按单位向量存储：DXF 的 11 组码就是这么约定的，
+    // 归一化后相距任意远近的「方向」才有一致的语义。
+    QVERIFY(std::abs(xline.direction().length() - 1.0) < 1e-12);
+    QVERIFY(std::abs(xline.direction().x - 0.6) < 1e-12);
+    QVERIFY(std::abs(xline.direction().y - 0.8) < 1e-12);
+    QVERIFY(std::abs(xline.angle() - std::atan2(4.0, 3.0)) < 1e-12);
+
+    // 零方向被忽略而不是把图元变成空壳——否则画出来什么都没有，还选不中
+    XLineEntity zero(Point2D(1.0, 2.0), Vector2D(0.0, 0.0));
+    QVERIFY(!zero.isDegenerate());
+    QCOMPARE(zero.direction().length(), 1.0);
+
+    // 两点式：基点 + 过两点连线的方向
+    const RayEntity ray = RayEntity::throughPoints(Point2D(5.0, 5.0), Point2D(5.0, 15.0));
+    QVERIFY(std::abs(ray.basePoint().x - 5.0) < 1e-12);
+    QVERIFY(std::abs(ray.direction().y - 1.0) < 1e-12);
+    QVERIFY(std::abs(ray.direction().x) < 1e-12);
+}
+
+void TestGeometry::infiniteLineClippingRespectsDirection()
+{
+    const Box2D box(0.0, 0.0, 10.0, 10.0);
+
+    // 构造线：双向延伸到盒外，得到的端点落在盒边界上
+    const XLineEntity xline(Point2D(5.0, 5.0), Vector2D(1.0, 1.0));
+    const auto xSeg = xline.clippedTo(box);
+    QVERIFY(xSeg.has_value());
+    QVERIFY(std::abs(xSeg->first.x - 0.0) < 1e-9 && std::abs(xSeg->first.y - 0.0) < 1e-9);
+    QVERIFY(std::abs(xSeg->second.x - 10.0) < 1e-9 && std::abs(xSeg->second.y - 10.0) < 1e-9);
+
+    // 射线：只朝方向一侧延伸，反向的半个盒内没有线
+    const RayEntity ray(Point2D(5.0, 5.0), Vector2D(1.0, 1.0));
+    const auto raySeg = ray.clippedTo(box);
+    QVERIFY(raySeg.has_value());
+    QVERIFY(std::abs(raySeg->first.x - 5.0) < 1e-9 && std::abs(raySeg->first.y - 5.0) < 1e-9);
+    QVERIFY(std::abs(raySeg->second.x - 10.0) < 1e-9);
+
+    // 射线整条都在盒外（起点在盒上方且朝上）时，裁不出任何东西
+    const RayEntity away(Point2D(5.0, 50.0), Vector2D(0.0, 1.0));
+    QVERIFY(!away.clippedTo(box).has_value());
+
+    // 同一条射线朝下则穿过整个盒子：端点贴在上、下两条边上，
+    // 起点 (5,50) 在盒外，因此不是端点——裁剪结果永远是「盒内的那一段」
+    const RayEntity toward(Point2D(5.0, 50.0), Vector2D(0.0, -1.0));
+    const auto towardSeg = toward.clippedTo(box);
+    QVERIFY(towardSeg.has_value());
+    QVERIFY(std::abs(towardSeg->first.y - 10.0) < 1e-9);
+    QVERIFY(std::abs(towardSeg->second.y - 0.0) < 1e-9);
+
+    // 起点在盒内时，裁剪结果必然从起点开始（射线不向反方向延伸）
+    const RayEntity fromInside(Point2D(5.0, 5.0), Vector2D(0.0, -1.0));
+    const auto insideSeg = fromInside.clippedTo(box);
+    QVERIFY(insideSeg.has_value());
+    QVERIFY(std::abs(insideSeg->first.y - 5.0) < 1e-9);
+    QVERIFY(std::abs(insideSeg->second.y - 0.0) < 1e-9);
+    // 反向的构造线则会同时穿出去两侧
+    const XLineEntity throughInside(Point2D(5.0, 5.0), Vector2D(0.0, -1.0));
+    const auto throughSeg = throughInside.clippedTo(box);
+    QVERIFY(throughSeg.has_value());
+    QVERIFY(std::abs(throughSeg->first.y - 10.0) < 1e-9);
+    QVERIFY(std::abs(throughSeg->second.y - 0.0) < 1e-9);
+
+    // 水平线：与盒平行且贴边时仍然裁得出一段（不能因为「平行」就判为不相交）
+    const XLineEntity horizontal(Point2D(5.0, 0.0), Vector2D(1.0, 0.0));
+    const auto hSeg = horizontal.clippedTo(box);
+    QVERIFY(hSeg.has_value());
+    QVERIFY(std::abs(hSeg->first.x - 0.0) < 1e-9);
+    QVERIFY(std::abs(hSeg->second.x - 10.0) < 1e-9);
+
+    // 与盒完全无关的平行线：不相交
+    const XLineEntity outside(Point2D(5.0, 20.0), Vector2D(1.0, 0.0));
+    QVERIFY(!outside.clippedTo(box).has_value());
+}
+
+void TestGeometry::infiniteLineDistanceAndCrossing()
+{
+    // 水平构造线 y = 0
+    const XLineEntity xline(Point2D(0.0, 0.0), Vector2D(1.0, 0.0));
+    QVERIFY(std::abs(xline.distanceTo(Point2D(50.0, 3.0)) - 3.0) < 1e-9);
+    // 到无限直线的最短距离与「投影是否落在基点之后」无关
+    QVERIFY(std::abs(xline.distanceTo(Point2D(-80.0, 4.0)) - 4.0) < 1e-9);
+    const Point2D closest = xline.closestPointTo(Point2D(-80.0, 4.0));
+    QVERIFY(std::abs(closest.x + 80.0) < 1e-9 && std::abs(closest.y) < 1e-9);
+
+    // 射线只覆盖 t >= 0：基点之后的点最近处就是基点本身
+    const RayEntity ray(Point2D(0.0, 0.0), Vector2D(1.0, 0.0));
+    QVERIFY(std::abs(ray.distanceTo(Point2D(-30.0, 4.0)) - std::hypot(30.0, 4.0)) < 1e-9);
+    QVERIFY(std::abs(ray.distanceTo(Point2D(30.0, 4.0)) - 4.0) < 1e-9);
+
+    // 与框相交：无限直线穿过框即算相交；射线要看方向
+    const Box2D box(10.0, -5.0, 20.0, 5.0);
+    QVERIFY(xline.crosses(box));
+    QVERIFY(ray.crosses(box));
+    const RayEntity backward(Point2D(0.0, 0.0), Vector2D(-1.0, 0.0));
+    QVERIFY(!backward.crosses(box));
+    // 窗选：无限长的线永远不会「完全落在框内」
+    QVERIFY(!xline.isInside(Box2D(-1e6, -1e6, 1e6, 1e6)));
+}
+
+void TestGeometry::infiniteLineBoundingBoxIsUndefined()
+{
+    const XLineEntity xline(Point2D(3.0, 4.0), Vector2D(1.0, 0.0));
+    const RayEntity ray(Point2D(3.0, 4.0), Vector2D(1.0, 0.0));
+
+    // 无界图元没有有限范围：包围盒必须是无效盒，这样范围缩放的
+    // Box2D::expand 会自然跳过它们，而不是把视口撑到无穷
+    QVERIFY(!xline.boundingBox().isValid());
+    QVERIFY(!ray.boundingBox().isValid());
+    QVERIFY(xline.isUnbounded());
+    QVERIFY(ray.isUnbounded());
+
+    Box2D accumulated;
+    accumulated.expand(Point2D(0.0, 0.0));
+    accumulated.expand(xline.boundingBox());
+    QVERIFY(accumulated.valid);
+    QVERIFY(std::abs(accumulated.maxX) < 1e-12);      // 未被无界图元污染
+
+    // 定义点用于坐标体检与属性展示
+    QVERIFY(xline.definitionPoint().has_value());
+    QVERIFY(std::abs(xline.definitionPoint()->x - 3.0) < 1e-12);
+    // 普通图元没有定义点
+    const LineEntity line(Point2D(0.0, 0.0), Point2D(1.0, 1.0));
+    QVERIFY(!line.definitionPoint().has_value());
+    QVERIFY(!line.isUnbounded());
+}
+
+void TestGeometry::infiniteLineTransformAndGrips()
+{
+    XLineEntity xline(Point2D(0.0, 0.0), Vector2D(1.0, 0.0));
+    xline.transform(Transform2D::rotationAround(Point2D(0.0, 0.0), kHalfPi));
+    QVERIFY(std::abs(xline.direction().x) < 1e-12);
+    QVERIFY(std::abs(xline.direction().y - 1.0) < 1e-12);
+
+    xline.transform(Transform2D::translation(5.0, -2.0));
+    QVERIFY(std::abs(xline.basePoint().x - 5.0) < 1e-12);
+    QVERIFY(std::abs(xline.basePoint().y + 2.0) < 1e-12);
+
+    // 镜像保持方向为单位向量（行列式为负，方向随之翻转）
+    xline.transform(Transform2D::mirror(Point2D(0.0, 0.0), Point2D(1.0, 0.0)));
+    QVERIFY(std::abs(xline.direction().length() - 1.0) < 1e-12);
+
+    // 夹点只有定义点一个
+    const std::vector<Point2D> grips = xline.gripPoints();
+    QCOMPARE(grips.size(), std::size_t(1));
+    QVERIFY(grips.front() == xline.basePoint());
+
+    // 拖动定义点整体平移，方向不变
+    const Vector2D before = xline.direction();
+    QVERIFY(xline.moveGrip(0, Point2D(100.0, 200.0)));
+    QVERIFY(std::abs(xline.basePoint().x - 100.0) < 1e-12);
+    QVERIFY(std::abs(xline.direction().x - before.x) < 1e-12
+            && std::abs(xline.direction().y - before.y) < 1e-12);
+    QVERIFY(!xline.moveGrip(1, Point2D(0.0, 0.0)));    // 只有一个夹点
+
+    // 克隆保真
+    const std::unique_ptr<Entity> copy = xline.clone();
+    QCOMPARE(copy->type(), EntityType::XLine);
+    const auto& cloned = static_cast<const InfiniteLineEntity&>(*copy);
+    QVERIFY(cloned.basePoint() == xline.basePoint());
+    QVERIFY(std::abs(cloned.direction().x - xline.direction().x) < 1e-12
+            && std::abs(cloned.direction().y - xline.direction().y) < 1e-12);
 }
 
 // -----------------------------------------------------------------------------

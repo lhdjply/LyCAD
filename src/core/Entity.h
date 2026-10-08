@@ -37,7 +37,9 @@ enum class EntityType {
     Hatch,
     Dimension,
     Spline,
-    Ellipse
+    Ellipse,
+    XLine,      ///< 构造线（DXF: XLINE）——过基点双向无限延伸
+    Ray         ///< 射线（DXF: RAY）——自基点沿方向单向无限延伸
 };
 
 /// 英文类型名（DXF 中的实体名，如 "LINE"）
@@ -124,11 +126,25 @@ public:
     /// 综合图层状态判断是否应当绘制（图层关闭/冻结时不绘制）
     bool isDisplayable(const LayerManager& layers) const;
 
+    // ---- 无界图元 -------------------------------------------------------------
+    /// 是否为无界图元（构造线、射线）。
+    /// 这类图元的 boundingBox() 无定义（返回无效盒），因为它们的范围是无穷。
+    /// 因此依赖真实范围的算法必须先查这里：
+    ///   · 范围缩放 / 出图 / $EXTMIN 要排除它们（否则视口会被撑到无穷）；
+    ///   · 渲染与拾取要靠「裁到视口 / 选区」判断可见性，不能靠包围盒剔除。
+    virtual bool isUnbounded() const noexcept { return false; }
+
+    /// 无界图元的定义点（构造线、射线的基点）。有界图元返回空。
+    /// 导入时的坐标体检、属性面板与夹点都以它为基准。
+    virtual std::optional<Point2D> definitionPoint() const { return std::nullopt; }
+
     // ---- 几何接口（子类实现） -------------------------------------------------
     /// 深拷贝（不含 id，由 Document 重新分配）
     virtual std::unique_ptr<Entity> clone() const = 0;
 
-    /// 轴对齐包围盒（世界坐标）
+    /// 轴对齐包围盒（世界坐标）。
+    /// 无界图元（isUnbounded() 为真）返回**无效盒**——它们没有有限范围，
+    /// Box2D::expand 对无效盒是空操作，范围类算法据此自然跳过它们。
     virtual Box2D boundingBox() const = 0;
 
     /// 点到图元的最短距离，用于拾取判定

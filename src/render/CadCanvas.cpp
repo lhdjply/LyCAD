@@ -449,7 +449,7 @@ void CadCanvas::drawSelectionHighlight(QPainter& painter)
         painter.save();
         painter.setPen(pen);
         painter.setBrush(Qt::NoBrush);
-        painter.drawPath(EntityRenderer::toDevicePath(*entity, m_view));
+        painter.drawPath(EntityRenderer::toDevicePath(*entity, m_view, QRectF(rect())));
         painter.restore();
 
         Q_UNUSED(context);

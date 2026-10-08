@@ -45,14 +45,17 @@
 #include "core/Document.h"
 #include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/Layer.h"
 #include "core/Linetype.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/RayEntity.h"
 #include "core/SplineEntity.h"
 #include "core/TextEntity.h"
 #include "core/Types.h"
+#include "core/XLineEntity.h"
 
 // libdxfrw（第三方）。这些头文件只在本文件出现，不外溢到其它翻译单元。
 #include "drw_entities.h"
@@ -87,6 +90,12 @@ constexpr double kMaxCoordinate = 1e12;
 inline Point2D toPoint(const DRW_Coord& c) noexcept
 {
     return Point2D(c.x, c.y);
+}
+
+/// 方向向量（构造线/射线的 11 组码）：只取 X/Y，Z 分量在二维图元里没有意义
+inline Vector2D toVector(const DRW_Coord& c) noexcept
+{
+    return Vector2D(c.x, c.y);
 }
 
 /// 还原被 libdxfrw 破坏的 \U+XXXX 转义序列。
@@ -219,8 +228,8 @@ public:
     // ---- 图元 ----------------------------------------------------------------
     void addPoint(const DRW_Point& data) override;
     void addLine(const DRW_Line& data) override;
-    void addRay(const DRW_Ray&) override { skip(QStringLiteral("RAY")); }
-    void addXline(const DRW_Xline&) override { skip(QStringLiteral("XLINE")); }
+    void addRay(const DRW_Ray& data) override;
+    void addXline(const DRW_Xline& data) override;
     void addArc(const DRW_Arc& data) override;
     void addCircle(const DRW_Circle& data) override;
     void addEllipse(const DRW_Ellipse& data) override;
@@ -385,11 +394,23 @@ void Builder::place(std::unique_ptr<Entity> entity)
     // 拾取与包围盒判断也跟着失真。实测某 2007 版 DWG 有 2 条样条各一个控制点
     // 如此，几何已不可用。这里挡在入口：非有限值、或超出任何真实图纸量级的一律
     // 跳过并计数上报，不静默丢弃（与 README 的约定一致）。
-    const Box2D box = entity->boundingBox();
+    //
+    // 无界图元（构造线、射线）的范围是无穷，包围盒必然是无效盒；这类图元改以
+    // 其定义点做同一套体检，否则它们会被下面这条判据整批当作坏数据丢掉。
+    Box2D box = entity->boundingBox();
+    if (!box.isValid()) {
+        const std::optional<Point2D> defined = entity->definitionPoint();
+        if (!defined) {
+            skip(QStringLiteral("坐标超出范围（文件数据异常，已跳过）"));
+            return;
+        }
+        box = Box2D::aroundPoint(*defined, 0.0);
+    }
+
     const auto outOfRange = [](double v) {
         return !std::isfinite(v) || std::abs(v) > kMaxCoordinate;
     };
-    if (!box.isValid() || outOfRange(box.minX) || outOfRange(box.minY)
+    if (outOfRange(box.minX) || outOfRange(box.minY)
         || outOfRange(box.maxX) || outOfRange(box.maxY)) {
         skip(QStringLiteral("坐标超出范围（文件数据异常，已跳过）"));
         return;
@@ -576,6 +597,33 @@ void Builder::addLine(const DRW_Line& data)
     }
 
     auto entity = std::make_unique<LineEntity>(a, b);
+    applyCommon(*entity, data);
+    place(std::move(entity));
+}
+
+void Builder::addRay(const DRW_Ray& data)
+{
+    // RAY：基点（10 组码）+ 单位方向（11 组码），只朝方向一侧延伸。
+    // 方向退化为零时图元画不出来也选不中，按坏数据计数上报。
+    if (toVector(data.secPoint).length() <= kGeomTol) {
+        skip(QStringLiteral("RAY(方向为零)"));
+        return;
+    }
+
+    auto entity = std::make_unique<RayEntity>(toPoint(data.basePoint), toVector(data.secPoint));
+    applyCommon(*entity, data);
+    place(std::move(entity));
+}
+
+void Builder::addXline(const DRW_Xline& data)
+{
+    // XLINE：与 RAY 同构，区别只在「双向延伸」（由图元类型决定）。
+    if (toVector(data.secPoint).length() <= kGeomTol) {
+        skip(QStringLiteral("XLINE(方向为零)"));
+        return;
+    }
+
+    auto entity = std::make_unique<XLineEntity>(toPoint(data.basePoint), toVector(data.secPoint));
     applyCommon(*entity, data);
     place(std::move(entity));
 }
@@ -1498,6 +1546,12 @@ DRW_Coord toCoord(const Point2D& p)
     return DRW_Coord(p.x, p.y, 0.0);
 }
 
+/// 方向向量的写出形式（构造线/射线的 11 组码）
+DRW_Coord toCoord(const Vector2D& v)
+{
+    return DRW_Coord(v.x, v.y, 0.0);
+}
+
 DRW_Text::HAlign toDrwHAlign(TextEntity::HAlign align)
 {
     switch (align) {
@@ -1547,6 +1601,7 @@ public:
     int hatchDowngrades() const noexcept { return m_hatchDowngrades; }
     int splineDowngrades() const noexcept { return m_splineDowngrades; }
     int ellipseDowngrades() const noexcept { return m_ellipseDowngrades; }
+    int infiniteDowngrades() const noexcept { return m_infiniteDowngrades; }
 
     // ---- 读侧接口（导出不使用） ----------------------------------------------
     void addHeader(const DRW_Header*) override {}
@@ -1822,6 +1877,8 @@ public:
             case EntityType::Dimension: writeDimension(*static_cast<const DimensionEntity*>(entity)); break;
             case EntityType::Spline:    writeSplineCurve(*static_cast<const SplineEntity*>(entity)); break;
             case EntityType::Ellipse:   writeEllipseCurve(*static_cast<const EllipseEntity*>(entity)); break;
+            case EntityType::XLine:     writeXLine(*static_cast<const XLineEntity*>(entity)); break;
+            case EntityType::Ray:       writeRay(*static_cast<const RayEntity*>(entity)); break;
             default: break;
             }
         }
@@ -2177,6 +2234,56 @@ private:
         ++m_ellipseDowngrades;
     }
 
+    /// 构造线：R2000 按原生 XLINE 写出；R12 无此实体（R13 才引入），
+    /// 降级为一条贯穿全图范围的直线并计数。
+    void writeXLine(const XLineEntity& line)
+    {
+        if (m_r2000) {
+            DRW_Xline record;
+            applyCommonWrite(record, line);
+            applyCoord(record.basePoint, line.basePoint());
+            record.secPoint = toCoord(line.direction());    // 单位方向向量（11 组码）
+            m_rw->writeXline(&record);
+            return;
+        }
+        writeInfiniteAsLine(line);
+        ++m_infiniteDowngrades;
+    }
+
+    /// 射线：与构造线同构，目标版本决定是原生 RAY 还是降级直线。
+    void writeRay(const RayEntity& ray)
+    {
+        if (m_r2000) {
+            DRW_Ray record;
+            applyCommonWrite(record, ray);
+            applyCoord(record.basePoint, ray.basePoint());
+            record.secPoint = toCoord(ray.direction());
+            m_rw->writeRay(&record);
+            return;
+        }
+        writeInfiniteAsLine(ray);
+        ++m_infiniteDowngrades;
+    }
+
+    /// R12 降级：把无界图元写成一条穿过它、长度覆盖全图范围的直线。
+    /// 写「无穷长」不可能，跳过又等于删掉图元；覆盖全图范围是 AutoCAD 自己
+    /// 转 R12 时的做法——读者打开后至少能完整看到这条线，而不是一个点。
+    void writeInfiniteAsLine(const InfiniteLineEntity& line)
+    {
+        Box2D box = drawingExtents();
+        if (!box.isValid()) box = Box2D::fromCorners(Point2D(0.0, 0.0), Point2D(420.0, 297.0));
+        box.expand(box.diagonal() * 0.1 + kMinExtent);   // 留一成余量，免得端点压在边界上
+
+        const auto segment = line.clippedTo(box);
+        if (!segment) return;      // 离图形范围太远、够不到：无法用线段表达
+
+        DRW_Line record;
+        applyCommonWrite(record, line);
+        applyCoord(record.basePoint, segment->first);
+        applyCoord(record.secPoint, segment->second);
+        m_rw->writeLine(&record);
+    }
+
     void writeDimension(const DimensionEntity& dim)
     {
         const DimensionEntity::Geometry geo = dim.geometry();
@@ -2254,6 +2361,7 @@ private:
     int m_hatchDowngrades = 0;
     int m_splineDowngrades = 0;
     int m_ellipseDowngrades = 0;
+    int m_infiniteDowngrades = 0;
     Box2D m_extents;
     bool m_extentsReady = false;
 };
@@ -2294,6 +2402,11 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
     }
     if (const int downgrades = exporter.ellipseDowngrades(); downgrades > 0) {
         result.addWarning(QStringLiteral("%1 个椭圆在 R12 中降级为多段线（R12 不支持 ELLIPSE 实体）")
+                              .arg(downgrades));
+    }
+    if (const int downgrades = exporter.infiniteDowngrades(); downgrades > 0) {
+        result.addWarning(QStringLiteral("%1 个构造线/射线在 R12 中降级为直线（R12 不支持 XLINE / RAY 实体，"
+                                         "已按全图范围截断）")
                               .arg(downgrades));
     }
     return result;

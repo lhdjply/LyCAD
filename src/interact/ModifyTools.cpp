@@ -31,7 +31,7 @@ void drawGhost(QPainter& painter, const Entity& entity,
     painter.save();
     painter.setPen(pen);
     painter.setBrush(Qt::NoBrush);
-    painter.drawPath(EntityRenderer::toDevicePath(entity, *context.view));
+    painter.drawPath(EntityRenderer::toDevicePath(entity, *context.view, context.viewport));
     painter.restore();
 }
 

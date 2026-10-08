@@ -18,10 +18,13 @@
 #include "core/Document.h"
 #include "core/Format.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/RayEntity.h"
 #include "core/TextEntity.h"
+#include "core/XLineEntity.h"
 #include "io/CadFile.h"
 #include "io/DwgCodec.h"
 
@@ -41,12 +44,14 @@ private slots:
     void roundTripR2000();
     void binaryDxfIsReadable();
     void unsupportedEntitiesAreCountedNotDropped();
+    void infiniteLinesDowngradeToLinesInR12();
     void dwgSignatureIsRecognized();
 
 private:
-    /// includeHatch 为 false 时（R12）不构造填充图元——
-    /// R12 没有 HATCH 实体，导出会降级为闭合多段线，往返签名必然不同。
-    static void buildSampleDocument(Document& document, bool includeHatch);
+    /// includeR2000Only 为 false 时（目标 R12）不构造 R12 没有的图元
+    /// （HATCH / XLINE / RAY）——它们会被降级为多段线或直线，
+    /// 往返签名必然不同，那样测的就不是「保真」而是「降级」了。
+    static void buildSampleDocument(Document& document, bool includeR2000Only);
     static QStringList entitySignatures(const Document& document);
     /// includeLineweight 为 false 时忽略线宽字段——
     /// R12 的 LAYER 记录没有 370 组码，线宽本身无法表达，比对时需排除。
@@ -66,7 +71,7 @@ void TestDxfRoundTrip::initTestCase()
     registerBuiltinCodecs();
 }
 
-void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch)
+void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeR2000Only)
 {
     document.clear(true);
 
@@ -140,13 +145,31 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document, bool includeHatch
     }
 
     // 填充（R2000 专属；R12 导出会降级为多段线，故在该版本下跳过）
-    if (includeHatch) {
+    if (includeR2000Only) {
         auto hatch = std::make_unique<HatchEntity>(
             std::vector<Point2D>{ Point2D(80.0, 80.0), Point2D(110.0, 80.0),
                                   Point2D(115.0, 100.0), Point2D(85.0, 105.0) },
             QStringLiteral("ANSI31"), 2.0, 0.0);
         hatch->setLayerName(QStringLiteral("轮廓"));
         document.addEntity(std::move(hatch));
+
+        // 构造线：斜向的、非单位长度的方向输入——写出时必须归一化为单位向量
+        // （DXF 的 11 组码约定如此），读回后仍应与原始方向同向。
+        {
+            auto xline = std::make_unique<XLineEntity>(Point2D(10.0, 130.0),
+                                                       Vector2D(3.0, -4.0));
+            xline->setLayerName(QStringLiteral("中心线"));
+            document.addEntity(std::move(xline));
+        }
+
+        // 射线：起点 + 方向，方向同样按单位向量往返
+        {
+            auto ray = std::make_unique<RayEntity>(Point2D(-20.0, 70.0),
+                                                   Vector2D(-1.0, 0.0));
+            ray->setLayerName(QStringLiteral("中心线"));
+            ray->setColorIndex(2);
+            document.addEntity(std::move(ray));
+        }
     }
 
     // 尺寸标注：对齐 / 线性 / 半径 / 直径
@@ -302,6 +325,18 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
         }
         case EntityType::Spline:   break;
         case EntityType::Ellipse:  break;
+        case EntityType::XLine:
+        case EntityType::Ray: {
+            // 无界图元只有「定位点 + 单位方向」两个量，方向截到 9 位后比对：
+            // 归一化与十进制往返都会在末位引入差异，而这个精度远高于任何可见误差。
+            const auto& line = static_cast<const InfiniteLineEntity&>(*entity);
+            geometry = QStringLiteral("B%1;D%2")
+                           .arg(formatDxfDouble(line.basePoint().x) + QLatin1Char(',')
+                                    + formatDxfDouble(line.basePoint().y),
+                                formatDxfDouble(line.direction().x, 9) + QLatin1Char(',')
+                                    + formatDxfDouble(line.direction().y, 9));
+            break;
+        }
         case EntityType::Dimension: {
             const auto& dim = static_cast<const DimensionEntity&>(*entity);
             geometry = QStringLiteral("D%1;F%2;S%3;L%4;R%5;TX[%6]")
@@ -350,8 +385,8 @@ bool TestDxfRoundTrip::roundTrip(const QString& version, const QString& fileName
                                  QString* failure)
 {
     Document source;
-    // R12 没有 HATCH 实体，导出会降级为闭合多段线，
-    // 因此在该版本下不构造填充，其余图元的往返保真不受影响
+    // R12 没有 HATCH / XLINE / RAY 实体，导出会降级为多段线或直线，
+    // 因此在该版本下不构造这几类图元，其余图元的往返保真不受影响
     buildSampleDocument(source, version != QLatin1String("AC1009"));
 
     const QString path = m_dir.filePath(fileName);
@@ -564,6 +599,68 @@ EOF
         }
     }
     QVERIFY2(reported, "降级处理的实体类型必须出现在导入警告中");
+}
+
+// -----------------------------------------------------------------------------
+//  无界图元在 R12 中的降级
+//
+//  XLINE / RAY 是 R13 才引入的实体，R12 里根本不存在。写出时既不能静默丢弃
+//  （用户会以为画丢了），也不能写一个「无穷长」的坐标（R12 的数值域装不下）。
+//  可行且与 AutoCAD 一致的做法是降级为一条覆盖全图范围的直线——这里验证的正是
+//  「降级后仍然穿过原定位点」「条数不变」「警告里如实报数」这三件事。
+// -----------------------------------------------------------------------------
+void TestDxfRoundTrip::infiniteLinesDowngradeToLinesInR12()
+{
+    Document source;
+    source.beginBatchLoad();
+    // 上下两条边围出 [0,100]×[0,100] 的图形范围——降级后的无界图元正是被裁到这里
+    source.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 0.0), Point2D(100.0, 0.0)));
+    source.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 100.0), Point2D(100.0, 100.0)));
+    // 两条都以 (50, 50) 为定位点，降级后必须仍然落在同一条直线上
+    source.addEntity(std::make_unique<XLineEntity>(Point2D(50.0, 50.0), Vector2D(1.0, 1.0)));
+    source.addEntity(std::make_unique<RayEntity>(Point2D(50.0, 50.0), Vector2D(0.0, 1.0)));
+    source.endBatchLoad();
+
+    const QString path = m_dir.filePath(QStringLiteral("infinite_r12.dxf"));
+    WriteOptions options;
+    options.version = QStringLiteral("AC1009");
+
+    const IoResult written = CadFile::save(path, source, options);
+    QVERIFY2(written.ok, qPrintable(written.error));
+
+    bool reported = false;
+    for (const QString& warning : written.warnings) {
+        if (warning.contains(QStringLiteral("2 个构造线/射线"))) {
+            reported = true;
+            break;
+        }
+    }
+    QVERIFY2(reported, "无界图元的降级必须在导出警告中如实报数");
+
+    Document loaded;
+    const IoResult readResult = CadFile::load(path, loaded);
+    QVERIFY2(readResult.ok, qPrintable(readResult.error));
+
+    QCOMPARE(loaded.entityCount(), std::size_t(4));
+
+    int onOriginalAxis = 0;
+    for (EntityId id : loaded.drawOrder()) {
+        const Entity* entity = loaded.entity(id);
+        QVERIFY(entity != nullptr);
+        // 四条都应是普通直线：R12 里没有构造线与射线
+        QCOMPARE(entity->type(), EntityType::Line);
+
+        // 降级后的线被裁到图形范围内，因此**不再包含**原定位点；能守住的
+        // 不变量是「仍然落在同一条直线上」，用点到无限直线的垂距来判。
+        const auto& line = static_cast<const LineEntity&>(*entity);
+        const Vector2D along = line.end() - line.start();
+        QVERIFY(along.length() > kGeomTol);
+        const double perpendicular =
+            std::abs(cross(Point2D(50.0, 50.0) - line.start(), along)) / along.length();
+        if (perpendicular < 1e-6) ++onOriginalAxis;
+    }
+    // 上下两条边离 (50, 50) 有 50 的距离，落在定位点轴线上的必须正好是两条
+    QCOMPARE(onOriginalAxis, 2);
 }
 
 void TestDxfRoundTrip::dwgSignatureIsRecognized()

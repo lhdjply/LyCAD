@@ -101,6 +101,18 @@ void ToolManager::registerBuiltinTools()
                  QStringLiteral("绘制多段线（C 闭合 / U 放弃）"),
                  [](ToolContext& c) { return std::make_unique<DrawPolylineTool>(c); });
 
+    registerTool(QStringLiteral("XLINE"), { QStringLiteral("XL") },
+                 QStringLiteral("绘制构造线（点 + 通过点；H 水平 / V 垂直）"),
+                 [](ToolContext& c) {
+                     return std::make_unique<DrawInfiniteLineTool>(c, EntityType::XLine);
+                 });
+
+    registerTool(QStringLiteral("RAY"), {},
+                 QStringLiteral("绘制射线（起点 + 通过点）"),
+                 [](ToolContext& c) {
+                     return std::make_unique<DrawInfiniteLineTool>(c, EntityType::Ray);
+                 });
+
     registerTool(QStringLiteral("POINT"), { QStringLiteral("PO") },
                  QStringLiteral("绘制点"),
                  [](ToolContext& c) { return std::make_unique<DrawPointTool>(c); });

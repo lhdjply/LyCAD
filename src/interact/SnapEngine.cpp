@@ -9,6 +9,7 @@
 #include "core/EllipseEntity.h"
 #include "core/Document.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
@@ -61,6 +62,17 @@ std::vector<std::pair<Point2D, Point2D>> nearbySegments(const Entity& entity,
 {
     std::vector<std::pair<Point2D, Point2D>> out;
     if (radius <= kGeomTol) return out;
+
+    // 无界图元（构造线、射线）不能按「离散整条图元」处理：它名义上有一百万
+    // 单位长，拿它去算交点会白白丢掉精度（两端点相差如此悬殊时，交点的有效
+    // 位数会被大端吞掉）。裁到光标邻域，得到的就是唯一有意义的那一段。
+    if (entity.isUnbounded()) {
+        const auto& line = static_cast<const InfiniteLineEntity&>(entity);
+        if (const auto seg = line.clippedTo(Box2D::aroundPoint(cursor, radius))) {
+            out.push_back(*seg);
+        }
+        return out;
+    }
 
     // 离散精度取光圈半径的 1/40，足以保证交点定位精度
     const double sagitta = std::max(radius / 40.0, kGeomTol);
@@ -123,11 +135,15 @@ void SnapEngine::collectEntityCandidates(const Document& document,
         const Entity* entity = document.entity(id);
         if (!entity || !entity->isDisplayable(layers)) continue;
 
-        // 粗筛：包围盒与光标的距离超过光圈则整段跳过
-        Box2D box = entity->boundingBox();
-        if (!box.isValid()) continue;
-        box.expand(aperture);
-        if (!box.contains(cursor)) continue;
+        // 粗筛：包围盒与光标的距离超过光圈则整段跳过。
+        // 无界图元没有包围盒，也无法用「基点是否在光圈内」代替——一条构造线
+        // 可以离基点十万八千里仍从光标下穿过，因此这一类不做粗筛。
+        if (!entity->isUnbounded()) {
+            Box2D box = entity->boundingBox();
+            if (!box.isValid()) continue;
+            box.expand(aperture);
+            if (!box.contains(cursor)) continue;
+        }
 
         bool touched = false;
 
@@ -241,6 +257,15 @@ void SnapEngine::collectEntityCandidates(const Document& document,
                     touched |= add(p, SnapKind::Quadrant);
                 }
             }
+            break;
+        }
+        case EntityType::XLine:
+        case EntityType::Ray: {
+            // 无界图元没有端点、中点、圆心，AutoCAD 对它们也只提供最近点与交点。
+            // 前者由下面的通用逻辑处理（走精确的投影解），后者由 collectIntersections
+            // 的邻域裁剪处理。定义点额外按节点语义给出：辅助线常被当作基准来用。
+            const auto& line = static_cast<const InfiniteLineEntity&>(*entity);
+            if (m_settings.node) touched |= add(line.basePoint(), SnapKind::NodePoint);
             break;
         }
         }

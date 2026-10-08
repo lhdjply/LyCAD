@@ -18,10 +18,13 @@
 #include "core/DimensionEntity.h"
 #include "core/Document.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/RayEntity.h"
 #include "core/TextEntity.h"
+#include "core/XLineEntity.h"
 #include "io/DxfCodec.h"
 #include "io/LibDxfRwAdapter.h"
 
@@ -88,6 +91,13 @@ void buildSample(Document& document)
         dim->setDimLinePoint(Point2D(40.0, -15.0));
         document.addEntity(std::move(dim));
     }
+
+    // 无界直线：构造线（双向）与射线（单向）。
+    // 方向刻意给成非单位向量：写出时必须归一化（DXF 的 11 组码约定如此）。
+    document.addEntity(std::make_unique<XLineEntity>(Point2D(30.0, 45.0),
+                                                     Vector2D(3.0, 4.0)));
+    document.addEntity(std::make_unique<RayEntity>(Point2D(75.0, 10.0),
+                                                   Vector2D(1.0, 2.0)));
 }
 
 /// 按类型统计图元个数
@@ -183,6 +193,10 @@ private slots:
     void mtextRotationFromXAxisDirection();
     void mtextInlineFontBecomesTextStyle();
     void writtenHatchPatternDefinitionRoundTrips();
+    /// 无界图元（构造线 / 射线）经原生 dwgW 写出后必须原样读回
+    void infiniteLinesRoundTripThroughNativeDwg();
+    /// 普通几何（直线 / 多段线）经原生 dwgW 写出后坐标必须逐位保真
+    void linesAndPolylinesRoundTripThroughNativeDwg();
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
     void writtenActiveViewportCoversDrawing();
@@ -230,6 +244,8 @@ void TestLibDxfRw::readsAllModelledEntities()
     QVERIFY2(counts.value(static_cast<int>(EntityType::Text)) >= 1, "文字缺失");
     QVERIFY2(counts.value(static_cast<int>(EntityType::Hatch)) >= 1, "填充缺失");
     QVERIFY2(counts.value(static_cast<int>(EntityType::Dimension)) >= 1, "标注缺失");
+    QVERIFY2(counts.value(static_cast<int>(EntityType::XLine)) >= 1, "构造线缺失");
+    QVERIFY2(counts.value(static_cast<int>(EntityType::Ray)) >= 1, "射线缺失");
 }
 
 // -----------------------------------------------------------------------------
@@ -926,6 +942,125 @@ void TestLibDxfRw::dwgAndDxfAgree()
                                 .arg(i).arg(dwgTexts.size())
                                 .arg(dwgTexts.at(i), dxfTexts.at(i))));
     }
+}
+
+// -----------------------------------------------------------------------------
+//  无界图元（构造线 / 射线）的原生 DWG 往返
+//
+//  R2000 的 RAY / XLINE 对象只有「基点 3BD + 方向 3BD」两个字段（见 libdxfrw
+//  DRW_Ray::parseDwg），写出端必须与之严格对称——多写或少写一个字节都会让
+//  句柄流错位，文件在 AutoCAD 里直接打不开。因此这里做一次真实的写-读往返，
+//  而不是只看写出是否返回成功。
+// -----------------------------------------------------------------------------
+void TestLibDxfRw::infiniteLinesRoundTripThroughNativeDwg()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    Document source;
+    source.beginBatchLoad();
+    // 方向刻意给成非单位向量，顺带验证「按单位向量存储」的约定
+    source.addEntity(std::make_unique<XLineEntity>(Point2D(12.5, -30.25), Vector2D(0.0, 5.0)));
+    source.addEntity(std::make_unique<RayEntity>(Point2D(-40.0, 8.0), Vector2D(-3.0, -4.0)));
+    source.endBatchLoad();
+
+    const QString path = dir.filePath(QStringLiteral("infinite.dwg"));
+    const IoResult written = writeDwgWithLibDxfRw(path, source, WriteOptions{});
+    QVERIFY2(written.ok, qPrintable(written.error));
+
+    Document loaded;
+    const IoResult result = readDwgWithLibDxfRw(path, loaded);
+    QVERIFY2(result.ok, qPrintable(result.error));
+
+    const Entity* xline = firstOfType(loaded, EntityType::XLine);
+    const Entity* ray = firstOfType(loaded, EntityType::Ray);
+    QVERIFY2(xline != nullptr, "构造线在 DWG 往返中丢失");
+    QVERIFY2(ray != nullptr, "射线在 DWG 往返中丢失");
+
+    const auto& x = static_cast<const InfiniteLineEntity&>(*xline);
+    QVERIFY(std::abs(x.basePoint().x - 12.5) < kTol);
+    QVERIFY(std::abs(x.basePoint().y + 30.25) < kTol);
+    // 方向 (0, 5) 归一化后应为 (0, 1)
+    QVERIFY2(std::abs(x.direction().y - 1.0) < kTol && std::abs(x.direction().x) < kTol,
+             qPrintable(QStringLiteral("构造线方向未归一化：%1, %2")
+                            .arg(x.direction().x).arg(x.direction().y)));
+
+    const auto& r = static_cast<const InfiniteLineEntity&>(*ray);
+    QVERIFY(std::abs(r.basePoint().x + 40.0) < kTol);
+    QVERIFY(std::abs(r.basePoint().y - 8.0) < kTol);
+    // 方向 (-3, -4) 归一化后应为 (-0.6, -0.8)
+    QVERIFY2(std::abs(r.direction().x + 0.6) < kTol && std::abs(r.direction().y + 0.8) < kTol,
+             qPrintable(QStringLiteral("射线方向错误：%1, %2")
+                            .arg(r.direction().x).arg(r.direction().y)));
+}
+
+// -----------------------------------------------------------------------------
+//  普通几何（直线 / 多段线）的原生 DWG 往返
+//
+//  DWG 的坐标用「带默认值的压缩 double（DD）」编码：第二点/顶点按位与参考值
+//  比较，能省则省。写出端的分支语义必须与读取端 getDefaultDouble 严格对偶，
+//  否则坐标会悄悄变成垃圾值——实测曾因此让几乎所有直线读回时长度变成 1e-5、
+//  部分线段更因「零长度」被当作坏数据丢弃。这里用覆盖各压缩分支的坐标钉死约定。
+// -----------------------------------------------------------------------------
+void TestLibDxfRw::linesAndPolylinesRoundTripThroughNativeDwg()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    Document source;
+    source.beginBatchLoad();
+    source.addEntity(std::make_unique<LineEntity>(Point2D(10.0, 10.0), Point2D(170.0, 100.0)));
+    source.addEntity(std::make_unique<LineEntity>(Point2D(10.0, 100.0), Point2D(170.0, 10.0)));
+    source.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 55.0), Point2D(180.0, 55.0)));
+    source.addEntity(std::make_unique<LineEntity>(Point2D(90.0, 0.0), Point2D(90.0, 110.0)));
+    {
+        auto polyline = std::make_unique<PolylineEntity>();
+        polyline->appendVertex(Point2D(0.0, 0.0), 0.0);
+        polyline->appendVertex(Point2D(180.0, 0.0), 0.0);
+        polyline->appendVertex(Point2D(180.0, 110.0), 0.0);
+        polyline->appendVertex(Point2D(0.0, 110.0), 0.0);
+        polyline->setClosed(true);
+        source.addEntity(std::move(polyline));
+    }
+    source.endBatchLoad();
+
+    const QString path = dir.filePath(QStringLiteral("lines.dwg"));
+    QVERIFY2(writeDwgWithLibDxfRw(path, source, WriteOptions{}).ok, "DWG 写出失败");
+
+    Document loaded;
+    QVERIFY2(readDwgWithLibDxfRw(path, loaded).ok, "DWG 读回失败");
+
+    // 一条不少：零长度在读取端是坏数据，坐标一旦被写坏，线段会在这里凭空消失
+    QCOMPARE(loaded.entityCount(), source.entityCount());
+
+    const auto expectLine = [&loaded](std::size_t index, const Point2D& start,
+                                      const Point2D& end) {
+        const Entity* entity = loaded.entity(loaded.drawOrder().at(index));
+        QVERIFY(entity != nullptr);
+        QCOMPARE(entity->type(), EntityType::Line);
+        const auto& line = static_cast<const LineEntity&>(*entity);
+        QVERIFY2(line.start().distanceTo(start) < kTol && line.end().distanceTo(end) < kTol,
+                 qPrintable(QStringLiteral("第 %1 条直线几何不一致：读回 (%2, %3) → (%4, %5)")
+                                .arg(index)
+                                .arg(line.start().x, 0, 'g', 12)
+                                .arg(line.start().y, 0, 'g', 12)
+                                .arg(line.end().x, 0, 'g', 12)
+                                .arg(line.end().y, 0, 'g', 12)));
+    };
+    expectLine(0, Point2D(10.0, 10.0), Point2D(170.0, 100.0));
+    expectLine(1, Point2D(10.0, 100.0), Point2D(170.0, 10.0));
+    expectLine(2, Point2D(0.0, 55.0), Point2D(180.0, 55.0));
+    expectLine(3, Point2D(90.0, 0.0), Point2D(90.0, 110.0));
+
+    const Entity* polylineEntity = loaded.entity(loaded.drawOrder().at(4));
+    QVERIFY(polylineEntity != nullptr);
+    QCOMPARE(polylineEntity->type(), EntityType::Polyline);
+    const auto& polyline = static_cast<const PolylineEntity&>(*polylineEntity);
+    QCOMPARE(polyline.vertexCount(), std::size_t(4));
+    QVERIFY(polyline.vertex(0).point == Point2D(0.0, 0.0));
+    QVERIFY(polyline.vertex(1).point == Point2D(180.0, 0.0));
+    QVERIFY(polyline.vertex(2).point == Point2D(180.0, 110.0));
+    QVERIFY(polyline.vertex(3).point == Point2D(0.0, 110.0));
 }
 
 QTEST_MAIN(TestLibDxfRw)

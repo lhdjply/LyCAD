@@ -304,7 +304,8 @@ void PropertyPanel::refresh(const Document* document)
         int countedTypes = 0;
         for (EntityId id : ids) {
             if (const Entity* entity = document->entity(id)) {
-                if (entity->type() != EntityType::Point) {
+                // 点没有长度；构造线/射线的长度是无穷，计入会把累计值变成 inf
+                if (entity->type() != EntityType::Point && !entity->isUnbounded()) {
                     totalLength += entity->length();
                     ++countedTypes;
                 }

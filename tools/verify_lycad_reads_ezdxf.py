@@ -145,7 +145,7 @@ def main():
     global LYCAD_SAMPLE, WORK
 
     if len(sys.argv) < 3:
-        print("用法: verify_lycad_reads_ezdxf.py <lycad_sample 可执行文件> <工作目录>")
+        print("用法: verify_lycad_reads_ezdxf.py <lycad_sample_generator 可执行文件> <工作目录>")
         return 2
 
     LYCAD_SAMPLE = sys.argv[1]

@@ -322,13 +322,18 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
 def main():
     sample_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
 
-    verify(sample_dir / "lycad_sample_r12.dxf",
+    # 默认按「lycad_sample_generator 写入仓库 sample/ 的目录结构」取文件；
+    # 生成器显式指定输出目录时，三种文件平铺在该目录下，直接把该目录传进来即可。
+    r12_dir = sample_dir / "r12" if (sample_dir / "r12").is_dir() else sample_dir
+    r2000_dir = sample_dir / "2000" if (sample_dir / "2000").is_dir() else sample_dir
+
+    verify(r12_dir / "lycad_sample_r12.dxf",
            expected_version="AC1009",
            has_lineweight=False,     # R12 无 370 组码
            has_lwpolyline=False,     # R12 使用 POLYLINE/VERTEX
            has_hatch=False)          # R12 无 HATCH，降级为多段线
 
-    verify(sample_dir / "lycad_sample_2000.dxf",
+    verify(r2000_dir / "lycad_sample_2000.dxf",
            expected_version="AC1015",
            has_lineweight=True,
            has_lwpolyline=True,

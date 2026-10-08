@@ -292,6 +292,8 @@ void MainWindow::createMenus()
         { "椭圆(&E)", "ELLIPSE" },
         { "矩形(&R)", "RECTANGLE" },
         { "点(&O)", "POINT" },
+        { "构造线(&X)", "XLINE" },
+        { "射线(&Y)", "RAY" },
         { nullptr, "" },                    // 分隔线
         { "文字(&T)", "TEXT" },
         { "填充(&H)", "HATCH" },
@@ -511,6 +513,11 @@ void MainWindow::createRibbon()
                                QStringLiteral("RECTANGLE"), QStringLiteral("矩形 (RECTANGLE / REC)"));
         panel->addSmallCommand(QStringLiteral("point"), QStringLiteral("点"),
                                QStringLiteral("POINT"), QStringLiteral("点 (POINT / PO)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("xline"), QStringLiteral("构造线"),
+                               QStringLiteral("XLINE"), QStringLiteral("构造线 (XLINE / XL)"));
+        panel->addSmallCommand(QStringLiteral("ray"), QStringLiteral("射线"),
+                               QStringLiteral("RAY"), QStringLiteral("射线 (RAY)"));
         panel->addSeparator();
         panel->addSmallCommand(QStringLiteral("hatch"), QStringLiteral("填充"),
                                QStringLiteral("HATCH"), QStringLiteral("图案填充 (HATCH / H)"));

@@ -63,6 +63,8 @@ enum : std::uint16_t {
     kSolid         = 0x1F,
     kEllipse       = 0x23,
     kSpline        = 0x24,
+    kRay           = 0x28,
+    kXline         = 0x29,
     kMText         = 0x2C,
     kBlockControl  = 0x30,
     kBlockHeader   = 0x31,
@@ -1318,6 +1320,28 @@ bool dwgW::writeLine(DRW_Line* ent)
             b.w.writeDD(ent->secPoint.z, ent->basePoint.z);
         }
         d->writeThicknessExtrusion(b, ent->thickness, ent->extPoint);
+    });
+    return true;
+}
+
+// 无界直线（RAY 0x28 / XLINE 0x29）：类型数据 = 基点 3BD + 方向 3BD。
+// 严格对应读取端 DRW_Ray::parseDwg（common data → 3BD → 3BD → 句柄流），
+// 这两个实体在 R2000 里没有厚度与挤出字段，多写一个字节都会让后续数据错位。
+// 方向按单位向量写出（与 DXF 的 11 组码语义一致），由调用方保证。
+bool dwgW::writeRay(DRW_Ray* ent)
+{
+    d->encodeEntity(kRay, *ent, [&](Private::ObjBuilder& b) {
+        b.w.write3BD(ent->basePoint.x, ent->basePoint.y, ent->basePoint.z);
+        b.w.write3BD(ent->secPoint.x, ent->secPoint.y, ent->secPoint.z);
+    });
+    return true;
+}
+
+bool dwgW::writeXline(DRW_Xline* ent)
+{
+    d->encodeEntity(kXline, *ent, [&](Private::ObjBuilder& b) {
+        b.w.write3BD(ent->basePoint.x, ent->basePoint.y, ent->basePoint.z);
+        b.w.write3BD(ent->secPoint.x, ent->secPoint.y, ent->secPoint.z);
     });
     return true;
 }

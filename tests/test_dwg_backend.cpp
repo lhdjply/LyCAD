@@ -3,10 +3,12 @@
 //  DWG 后端适配链路的测试。
 //
 //  为什么这样测
-//    DWG 为闭源二进制格式，本软件不自行解析，而是驱动外部转换器完成
-//    「DWG ↔ DXF」的转换，再交由自带的 DXF 编解码器处理。这条链路无法用
-//    真实的转换器做自动化测试（CI 环境通常没有 ODA/LibreDWG），但它的
-//    逻辑——参数展开、临时目录编排、失败处理、能力上报——完全可以被验证。
+//    DWG 的读写主路径是内置的 libdxfrw-modify（读取见 readDwgWithLibDxfRw，
+//    写出见 dwgW）——它才是 DXF/DWG 之间真正的翻译器。外部转换器
+//    （LibreDWG / ODA / 用户自定义命令）只在主路径不可用时兜底，因此本文件
+//    测的是**兜底链路**：参数展开、临时目录编排、失败处理、能力上报。
+//    这条链路无法用真实的转换器做自动化测试（CI 环境通常没有 ODA/LibreDWG），
+//    但它的逻辑完全可以被验证。
 //
 //    做法：注册一个行为确定的「替代转换器」（一段复制文件的脚本），
 //    通过自定义转换命令接进去，然后走完整的读取与写出流程。
@@ -310,13 +312,16 @@ void TestDwgBackend::writeThroughExternalConverter()
     QVERIFY(QFileInfo::exists(dwgPath));
     QVERIFY(QFileInfo(dwgPath).size() > 0);
 
-    // 中间 DXF 必须以 R2000 生成：这是兼容性最好的中间格式
+    // 内置 dwgW 已能原生写出 R2000，且**优先于**外部转换器（见 DwgCodec::write）。
+    // 因此这里得到的是二进制 DWG，而不是中间 DXF 的副本——两者可以这样区分：
+    // 二进制 DWG 只以版本签名开头，正文里没有 DXF 的段落名。
     QFile file(dwgPath);
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray content = file.readAll();
-    QVERIFY(content.contains("AC1015"));
-    QVERIFY(content.contains("ENTITIES"));
-    QVERIFY(content.contains("LINE"));
+    QCOMPARE(content.left(6), QByteArray("AC1015"));
+    QVERIFY2(!content.contains("ENTITIES"), "写出走的应是原生 dwgW，而不是转换器");
+    QVERIFY2(result.warnings.join(QLatin1Char('\n')).contains(QStringLiteral("dwgW")),
+             "走出原生写出时应在提示中说明，便于用户追溯");
 }
 
 void TestDwgBackend::converterFailureIsReportedNotSwallowed()

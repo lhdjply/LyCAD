@@ -26,6 +26,8 @@ QString entityTypeName(EntityType type)
     case EntityType::Dimension:return QStringLiteral("DIMENSION");
     case EntityType::Spline:   return QStringLiteral("SPLINE");
     case EntityType::Ellipse:  return QStringLiteral("ELLIPSE");
+    case EntityType::XLine:    return QStringLiteral("XLINE");
+    case EntityType::Ray:      return QStringLiteral("RAY");
     }
     return QStringLiteral("UNKNOWN");
 }
@@ -43,6 +45,8 @@ QString entityTypeDisplayName(EntityType type)
     case EntityType::Dimension:return QStringLiteral("尺寸标注");
     case EntityType::Spline:   return QStringLiteral("样条曲线");
     case EntityType::Ellipse:  return QStringLiteral("椭圆");
+    case EntityType::XLine:    return QStringLiteral("构造线");
+    case EntityType::Ray:      return QStringLiteral("射线");
     }
     return QStringLiteral("未知图元");
 }

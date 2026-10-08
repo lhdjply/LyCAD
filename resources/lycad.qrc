@@ -30,6 +30,7 @@
         <file alias="polyline.svg">icons/polyline.svg</file>
         <file alias="print.svg">icons/print.svg</file>
         <file alias="properties.svg">icons/properties.svg</file>
+        <file alias="ray.svg">icons/ray.svg</file>
         <file alias="rectangle.svg">icons/rectangle.svg</file>
         <file alias="redo.svg">icons/redo.svg</file>
         <file alias="rotate.svg">icons/rotate.svg</file>
@@ -40,6 +41,7 @@
         <file alias="text.svg">icons/text.svg</file>
         <file alias="theme-dark.svg">icons/theme-dark.svg</file>
         <file alias="undo.svg">icons/undo.svg</file>
+        <file alias="xline.svg">icons/xline.svg</file>
         <file alias="zoom-extents.svg">icons/zoom-extents.svg</file>
         <file alias="zoom-selection.svg">icons/zoom-selection.svg</file>
     </qresource>

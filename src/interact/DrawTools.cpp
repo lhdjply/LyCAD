@@ -7,9 +7,12 @@
 #include "core/CircleEntity.h"
 #include "core/Document.h"
 #include "core/EllipseEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
+#include "core/RayEntity.h"
+#include "core/XLineEntity.h"
 #include "render/CadCanvas.h"
 
 #include <QKeyEvent>
@@ -38,7 +41,7 @@ void drawPreviewEntity(QPainter& painter, const Entity& entity,
     painter.save();
     painter.setPen(pen);
     painter.setBrush(Qt::NoBrush);
-    painter.drawPath(EntityRenderer::toDevicePath(entity, *context.view));
+    painter.drawPath(EntityRenderer::toDevicePath(entity, *context.view, context.viewport));
     painter.restore();
 }
 
@@ -1297,6 +1300,229 @@ void DrawEllipseTool::paintOverlay(QPainter& painter, const EntityRenderer::Draw
 }
 
 void DrawEllipseTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
+//  构造线 / 射线
+// =============================================================================
+DrawInfiniteLineTool::DrawInfiniteLineTool(ToolContext& context, EntityType type)
+    : Tool(context), m_type(type)
+{
+    Q_ASSERT(type == EntityType::XLine || type == EntityType::Ray);
+}
+
+QString DrawInfiniteLineTool::name() const
+{
+    return isRay() ? QStringLiteral("RAY") : QStringLiteral("XLINE");
+}
+
+QString DrawInfiniteLineTool::displayName() const
+{
+    return isRay() ? QStringLiteral("射线") : QStringLiteral("构造线");
+}
+
+QString DrawInfiniteLineTool::prompt() const
+{
+    // 方向已锁定（H/V）：第一个点就是通过点本身
+    if (m_lockedDirection) return QStringLiteral("指定通过点:");
+    if (!m_base) {
+        return isRay() ? QStringLiteral("指定起点:")
+                       : QStringLiteral("指定点或 [水平(H)/垂直(V)]:");
+    }
+    return QStringLiteral("指定通过点:");
+}
+
+DrawInfiniteLineTool::StepPoint DrawInfiniteLineTool::resolveStep(const Point2D& raw) const
+{
+    StepPoint step;
+    step.point = resolve(raw, m_base);
+
+    // 定方向：吸附到上下左右四个正方向，用户不必靠肉眼把辅助线摆平
+    if (m_base) {
+        Vector2D direction;
+        if (const std::optional<Point2D> snapped =
+                snapToCardinalDirection(*m_base, step.point.position,
+                                        ctx().apertureWorld(), direction)) {
+            step.point.position = *snapped;
+            step.point.kind = SnapKind::Ortho;
+            step.point.label = std::abs(direction.x) > 0.5 ? QStringLiteral("水平")
+                                                           : QStringLiteral("竖直");
+            step.directionSnapped = true;
+        }
+    }
+    return step;
+}
+
+void DrawInfiniteLineTool::commit(const Point2D& base, const Point2D& through)
+{
+    const Vector2D direction = through - base;
+    if (direction.length() <= kGeomTol) {
+        // 方向为零的构造线画不出来也选不中，宁可拒绝并说清楚
+        message(QStringLiteral("通过点与定位点重合，方向无法确定，已忽略。"));
+        return;
+    }
+
+    std::unique_ptr<InfiniteLineEntity> entity;
+    if (isRay()) entity = std::make_unique<RayEntity>(base, direction);
+    else         entity = std::make_unique<XLineEntity>(base, direction);
+
+    applyDefaults(*entity, ctx());
+    ctx().document->addEntity(std::move(entity));
+}
+
+std::unique_ptr<Entity> DrawInfiniteLineTool::makePreview(const Point2D& through) const
+{
+    Point2D base;
+    Vector2D direction;
+
+    if (m_lockedDirection) {
+        // 方向已锁定：通过点即定位点
+        base = through;
+        direction = *m_lockedDirection;
+    } else if (m_base) {
+        base = *m_base;
+        direction = through - *m_base;
+    } else {
+        return nullptr;
+    }
+
+    if (direction.length() <= kGeomTol) return nullptr;
+
+    if (isRay()) return std::make_unique<RayEntity>(base, direction);
+    return std::make_unique<XLineEntity>(base, direction);
+}
+
+void DrawInfiniteLineTool::reset()
+{
+    // 与其它绘制工具一致：一次绘制结束后回到默认方式，H/V 选项只对本次生效
+    m_lockedDirection.reset();
+    m_base.reset();
+    m_directionSnapped = false;
+    notifyPromptChanged();
+    repaint();
+}
+
+bool DrawInfiniteLineTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const StepPoint step = resolveStep(event.worldPos);
+
+    // 方向已锁定：落点直接作为通过点，图元一次成型
+    if (m_lockedDirection) {
+        commit(step.point.position, step.point.position + *m_lockedDirection);
+        reset();
+        return true;
+    }
+
+    if (!m_base) {
+        m_base = step.point.position;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    commit(*m_base, step.point.position);
+    reset();      // 命令不结束，可继续画下一条（与 AutoCAD 一致）
+    return true;
+}
+
+bool DrawInfiniteLineTool::mouseMove(const CanvasEvent& event)
+{
+    const StepPoint step = resolveStep(event.worldPos);
+    m_cursor = step.point;
+    m_hasCursor = true;
+    m_directionSnapped = step.directionSnapped;
+
+    if (step.directionSnapped || m_cursor.isObjectSnap()) {
+        ctx().setSnapMarker(m_cursor.toSnapResult());
+    } else {
+        ctx().setSnapMarker(std::nullopt);
+    }
+
+    repaint();
+    return true;
+}
+
+bool DrawInfiniteLineTool::keyPress(QKeyEvent* event)
+{
+    switch (event->key()) {
+    case Qt::Key_Escape:
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+        finish();
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool DrawInfiniteLineTool::textInput(const QString& text)
+{
+    // 第一步的选项：构造线的 H 水平 / V 垂直。方向由此锁定，只需再给通过点。
+    // （射线必须先有起点，AutoCAD 的 RAY 也没有这两个选项。）
+    if (!isRay() && !m_lockedDirection && !m_base) {
+        if (matchesOption(text, QStringLiteral("H")) || matchesOption(text, QStringLiteral("V"))) {
+            const bool horizontal = matchesOption(text, QStringLiteral("H"));
+            m_lockedDirection = horizontal ? Vector2D(1.0, 0.0) : Vector2D(0.0, 1.0);
+            message(horizontal ? QStringLiteral("方向锁定为水平，指定通过点。")
+                               : QStringLiteral("方向锁定为竖直，指定通过点。"));
+            notifyPromptChanged();
+            repaint();
+            return true;
+        }
+    }
+
+    const std::optional<Point2D> point = parsePointInput(text, m_base);
+    if (!point) return true;          // 已输出错误信息，视为已处理
+
+    // 键盘输入的数字是「我要这个精确值」，不参与方向吸附（吸附只服务于鼠标的模糊指向）
+    if (m_lockedDirection) {
+        commit(*point, *point + *m_lockedDirection);
+        reset();
+        return true;
+    }
+
+    if (!m_base) {
+        m_base = *point;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    commit(*m_base, *point);
+    reset();
+    return true;
+}
+
+void DrawInfiniteLineTool::paintOverlay(QPainter& painter,
+                                        const EntityRenderer::DrawContext& context)
+{
+    if (!m_hasCursor) return;
+
+    // 方向已锁定但还没落点：只画一条过光标的预览线
+    if (m_lockedDirection) {
+        if (std::unique_ptr<Entity> preview = makePreview(m_cursor.position)) {
+            drawPreviewEntity(painter, *preview, context);
+        }
+        return;
+    }
+
+    if (!m_base) return;
+
+    // 定位点已定：橡皮筋指向光标，吸附到正方向时再补一条贯穿视口的追踪线
+    drawRubberBand(painter, context, *m_base, m_cursor.position);
+    if (m_directionSnapped) {
+        drawTrackingLine(painter, context, *m_base, m_cursor.position);
+    }
+    if (std::unique_ptr<Entity> preview = makePreview(m_cursor.position)) {
+        drawPreviewEntity(painter, *preview, context);
+    }
+}
+
+void DrawInfiniteLineTool::deactivate()
 {
     ctx().setSnapMarker(std::nullopt);
 }

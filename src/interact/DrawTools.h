@@ -1,6 +1,6 @@
 // =============================================================================
 //  LyCAD - interact/DrawTools.h
-//  绘制类工具：直线、圆、圆弧、椭圆、多段线、点、矩形。
+//  绘制类工具：直线、圆、圆弧、椭圆、构造线与射线、多段线、点、矩形。
 //
 //  共同的交互范式（与 AutoCAD 一致）
 //    · 第一个点之后的操作都有「基准点」，因此可以启用相对坐标与极轴追踪；
@@ -257,6 +257,69 @@ private:
     ResolvedPoint m_cursor;
     bool m_hasCursor = false;
     bool m_directionSnapped = false;    ///< 当前光标是否被吸到正方向（决定是否画追踪线）
+};
+
+// -----------------------------------------------------------------------------
+//  构造线（XLINE）与射线（RAY）：定位点 + 通过点
+//
+//  两者共用一套交互，差别只在几何（构造线双向延伸、射线单向），因此共用一个
+//  工具类，由构造参数决定产出哪种图元——不把同一段状态机抄两遍。
+//
+//  与直线工具的关键区别是**第二个点的含义**：直线取的是终点，这里取的是方向
+//  （点到为止，长度由无限延伸补足）。由此带来三点行为差异：
+//    · 第二个点同样吸附到上下左右，并画出贯穿视口的追踪线——方向类输入最怕
+//      差之毫厘，方向一旦偏一点，远处就谬以千里；
+//    · 落点不结束命令，可以连续画多条（与 AutoCAD 一致）；
+//    · 构造线在第一步还支持 H（水平）/ V（垂直）：方向直接锁定，只需再给一个
+//      通过点。射线必须先有起点，故不提供该选项。
+//  两点重合（方向退化）的落点会被拒绝并提示，不会留下画不出来、也选不中的图元。
+// -----------------------------------------------------------------------------
+class DrawInfiniteLineTool : public Tool {
+public:
+    DrawInfiniteLineTool(ToolContext& context, EntityType type);
+
+    QString name() const override;
+    QString displayName() const override;
+    QString prompt() const override;
+
+    bool mousePress(const CanvasEvent& event) override;
+    bool mouseMove(const CanvasEvent& event) override;
+    bool keyPress(QKeyEvent* event) override;
+    bool textInput(const QString& text) override;
+    void paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context) override;
+    void deactivate() override;
+
+private:
+    /// 一次点位求解：捕捉后的点 + 「是否被方向吸附拉到正方向上」
+    struct StepPoint {
+        ResolvedPoint point;
+        bool directionSnapped = false;
+    };
+
+    bool isRay() const noexcept { return m_type == EntityType::Ray; }
+
+    /// 对象捕捉 + 定方向时的正方向吸附
+    StepPoint resolveStep(const Point2D& raw) const;
+
+    /// 以定位点与通过点落盘图元；方向退化时给出提示并放弃本次
+    void commit(const Point2D& base, const Point2D& through);
+
+    /// 按当前状态与一个通过点拼出预览图元；方向未定时返回空
+    std::unique_ptr<Entity> makePreview(const Point2D& through) const;
+
+    void reset();
+
+    EntityType m_type;
+
+    /// H/V 锁定的方向；为空表示方向由「定位点 → 通过点」决定
+    std::optional<Vector2D> m_lockedDirection;
+    /// 定位点（构造线称基点、射线称起点）
+    std::optional<Point2D> m_base;
+
+    ResolvedPoint m_cursor;
+    bool m_hasCursor = false;
+    /// 当前光标是否被吸到正方向（决定是否画追踪线）
+    bool m_directionSnapped = false;
 };
 
 } // namespace lycad

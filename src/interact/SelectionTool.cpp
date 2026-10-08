@@ -356,7 +356,7 @@ void SelectionTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawCo
         painter.save();
         painter.setPen(pen);
         painter.setBrush(Qt::NoBrush);
-        painter.drawPath(EntityRenderer::toDevicePath(*preview, *context.view));
+        painter.drawPath(EntityRenderer::toDevicePath(*preview, *context.view, context.viewport));
         painter.restore();
 
         // 自原夹点到新位置的牵引线

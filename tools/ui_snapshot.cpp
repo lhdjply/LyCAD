@@ -503,6 +503,15 @@ int main(int argc, char* argv[])
                 //  对后者本来就该分两页。因此基准取「刚好装进可打印区」的 2 的幂，
                 //  再比较基准、两倍、四倍三档——三档都保证单页，倍半关系直接
                 //  钉住换算本身。
+                //
+                //  例外：无界图元（构造线、射线）在任何比例下都会贯穿整张纸
+                //  （AutoCAD 的行为一致），墨迹宽度因此恒为满幅，「与比例成反比」
+                //  对含无界图元的图纸不成立——此时不量墨迹，也不计失败。
+                bool hasUnbounded = false;
+                for (EntityId id : plotDoc->drawOrder()) {
+                    const Entity* entity = plotDoc->entity(id);
+                    if (entity && entity->isUnbounded()) { hasUnbounded = true; break; }
+                }
                 {
                     const double pxPerMm = 300.0 / 25.4;
                     const double printableMm =
@@ -524,12 +533,16 @@ int main(int argc, char* argv[])
                         return box.isNull() ? 0.0 : static_cast<double>(box.width());
                     };
 
-                    const double w1 = inkWidthFor(base);
-                    const double w2 = inkWidthFor(base * 2.0);
-                    const double w4 = inkWidthFor(base * 4.0);
-                    const bool ratiosOk = w1 > 0.0 && w2 > 0.0 && w4 > 0.0
-                                          && std::abs(w2 / w1 - 0.5) < 0.02
-                                          && std::abs(w4 / w2 - 0.5) < 0.02;
+                    double w1 = 0.0, w2 = 0.0, w4 = 0.0;
+                    if (!hasUnbounded) {
+                        w1 = inkWidthFor(base);
+                        w2 = inkWidthFor(base * 2.0);
+                        w4 = inkWidthFor(base * 4.0);
+                    }
+                    const bool ratiosOk = hasUnbounded
+                        || (w1 > 0.0 && w2 > 0.0 && w4 > 0.0
+                            && std::abs(w2 / w1 - 0.5) < 0.02
+                            && std::abs(w4 / w2 - 0.5) < 0.02);
 
                     // 顺手把缩小档的整页存下来，与「适应图纸」的整页并排就是
                     // 比例设置最直观的证据
@@ -548,8 +561,10 @@ int main(int argc, char* argv[])
                                  .arg(std::lround(w1))
                                  .arg(std::lround(w2))
                                  .arg(std::lround(w4))
-                                 .arg(ratiosOk ? QStringLiteral("严格成反比")
-                                               : QStringLiteral("换算有误"))
+                                 .arg(hasUnbounded
+                                          ? QStringLiteral("含无界图元，不适用")
+                                          : (ratiosOk ? QStringLiteral("严格成反比")
+                                                      : QStringLiteral("换算有误")))
                           << Qt::endl;
                     if (!ratiosOk) ++failures;
                 }

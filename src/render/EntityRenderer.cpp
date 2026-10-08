@@ -8,6 +8,7 @@
 #include "core/DimensionEntity.h"
 #include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
+#include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
@@ -217,6 +218,27 @@ bool visibleInViewport(const Entity& entity, const ViewTransform& view, const QR
     return viewport.intersects(padded);
 }
 
+/// 视口（设备坐标）对应的世界范围。
+///
+/// 视图变换只含平移、等比缩放与 Y 轴翻转，因此设备下的轴对齐矩形换算到世界
+/// 后仍然轴对齐——裁剪盒不需要任何旋转补偿。
+Box2D viewportWorldBox(const ViewTransform& view, const QRectF& viewport)
+{
+    const Point2D a = view.toWorld(Point2D(viewport.left(), viewport.top()));
+    const Point2D b = view.toWorld(Point2D(viewport.right(), viewport.bottom()));
+    return Box2D::fromCorners(a, b);
+}
+
+/// 把给定矩形（设备坐标）内可见的那一段无界直线裁出来（世界坐标）。
+/// 与视口无交集时返回空。
+std::optional<std::pair<Point2D, Point2D>> clipToDeviceRect(const InfiniteLineEntity& line,
+                                                            const ViewTransform& view,
+                                                            const QRectF& rect)
+{
+    if (!rect.isValid()) return std::nullopt;
+    return line.clippedTo(viewportWorldBox(view, rect));
+}
+
 void drawCircleEntity(QPainter& painter, const CircleEntity& circle, const DrawContext& context,
                       const AngleWindow& window)
 {
@@ -369,6 +391,22 @@ void drawPolylineWithVaryingWidth(QPainter& painter, const PolylineEntity& polyl
         pen.setWidthF(std::min(std::max(widthPixels, 1.0), 600.0));
         painter.strokePath(segPath, pen);
     }
+}
+
+// -----------------------------------------------------------------------------
+//  构造线 / 射线
+// -----------------------------------------------------------------------------
+/// 无界图元按「裁到视口」绘制：先求出与视口相交的那一段，再画这条普通线段。
+/// 直接画「无穷长」既不可能也没必要——屏幕上可见的部分本来就是线段。
+void drawInfiniteLine(QPainter& painter, const InfiniteLineEntity& line,
+                      const DrawContext& context)
+{
+    const auto segment = clipToDeviceRect(line, *context.view, context.viewport);
+    if (!segment) return;                     // 与本视口无交集
+
+    const Point2D a = context.view->toDevice(segment->first);
+    const Point2D b = context.view->toDevice(segment->second);
+    painter.drawLine(QPointF(a.x, a.y), QPointF(b.x, b.y));
 }
 
 // -----------------------------------------------------------------------------
@@ -593,6 +631,9 @@ double adaptiveSagitta(const DrawContext& context)
 
 QRectF deviceBounds(const Entity& entity, const ViewTransform& view)
 {
+    // 无界图元的设备范围取决于裁剪矩形，单看变换无法给出——交由绘制路径负责
+    if (entity.isUnbounded()) return QRectF();
+
     const Box2D worldBox = entity.boundingBox();
     if (!worldBox.isValid()) return QRectF();
 
@@ -603,9 +644,23 @@ QRectF deviceBounds(const Entity& entity, const ViewTransform& view)
                   QPointF(std::max(a.x, b.x), std::max(a.y, b.y)));
 }
 
-QPainterPath toDevicePath(const Entity& entity, const ViewTransform& view)
+QPainterPath toDevicePath(const Entity& entity, const ViewTransform& view, const QRectF& clip)
 {
     QPainterPath path;
+
+    // 无界图元：形状 = 裁到给定矩形的线段。isUnbounded() 为真的只有
+    // InfiniteLineEntity 一族，因此这里的向下转换是安全的。
+    if (entity.isUnbounded()) {
+        const auto* line = static_cast<const InfiniteLineEntity*>(&entity);
+        const auto segment = clipToDeviceRect(*line, view, clip);
+        if (!segment) return path;
+
+        const Point2D a = view.toDevice(segment->first);
+        const Point2D b = view.toDevice(segment->second);
+        path.moveTo(a.x, a.y);
+        path.lineTo(b.x, b.y);
+        return path;
+    }
 
     const double sagitta = std::max(view.pixelsToWorld(0.3), kGeomTol);
     const std::vector<Point2D> points = entity.flatten(sagitta);
@@ -648,7 +703,11 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
           const QColor& color, double lineweightMm, const QString& linetypeName)
 {
     if (!context.isValid()) return;
-    if (!visibleInViewport(entity, *context.view, context.viewport)) return;
+    // 无界图元（构造线、射线）没有包围盒，剔除必须改用「与本视口是否相交」，
+    // 这一步在无界分支内部完成（见 drawInfiniteLine）。
+    if (!entity.isUnbounded() && !visibleInViewport(entity, *context.view, context.viewport)) {
+        return;
+    }
 
     const DisplaySettings& settings = *context.settings;
 
@@ -741,6 +800,11 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
         const auto& ellipse = static_cast<const EllipseEntity&>(entity);
         drawFlattenedCurve(painter, ellipse.flatten(adaptiveSagitta(context)),
                            ellipse.isClosed(), context);
+        break;
+    }
+    case EntityType::XLine:
+    case EntityType::Ray: {
+        drawInfiniteLine(painter, static_cast<const InfiniteLineEntity&>(entity), context);
         break;
     }
     }
