@@ -8,8 +8,8 @@
 //    只需实现接口并注册。
 //
 //    这也是 DWG 支持得以工程化落地的关键：DWG 为闭源二进制格式，
-//    本软件不重新实现其解析器，而是通过 DwgCodec 适配外部后端（libdxfrw /
-//    ODA File Converter / LibreDWG），接口层保持不变。
+//    本软件不重新实现其解析器，而是通过 DwgCodec 适配内置的 libdxfrw，
+//    接口层保持不变。
 // =============================================================================
 #pragma once
 
@@ -80,13 +80,13 @@ public:
     /// 可写出的扩展名（小写，不含点）
     virtual QStringList writeExtensions() const = 0;
 
-    /// 是否具备读取能力（例如缺少 DWG 后端时为 false）
+    /// 是否具备读取能力（例如某个格式的解析器未编入时为 false）
     virtual bool canRead() const { return true; }
 
     /// 是否具备写出能力
     virtual bool canWrite() const { return true; }
 
-    /// 能力受限时的原因说明，界面据此向用户解释
+    /// 能力与适用范围说明，界面据此向用户解释
     virtual QString capabilityNote() const { return QString(); }
 
     /// 扩展名匹配 **且** 当前具备读取能力

@@ -54,13 +54,6 @@ target_compile_options(lycad_warnings INTERFACE
     $<$<CXX_COMPILER_ID:MSVC>:/W3>)
 
 # ---------------------------------------------------------------------------
-# 外部 DWG 转换器探测（DWG 读取由内置 libdxfrw 完成，导出才需要外部程序）
-# ---------------------------------------------------------------------------
-find_program(LYCAD_ODA_CONVERTER NAMES ODAFileConverter)
-find_program(LYCAD_LIBREDWG_DWG2DXF NAMES dwg2dxf)
-find_program(LYCAD_LIBREDWG_DXF2DWG NAMES dxf2dwg)
-
-# ---------------------------------------------------------------------------
 # 消毒器 / 告警即错误
 # ---------------------------------------------------------------------------
 if(LYCAD_ENABLE_ASAN AND NOT MSVC)

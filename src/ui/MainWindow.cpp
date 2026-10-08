@@ -68,9 +68,8 @@ constexpr int kMaxMessageLog = 500;
 
 /// 可拖入的文件扩展名。
 ///
-/// 刻意使用「已知格式」而非「当前可用格式」：未安装 DWG 后端时，
-/// 仍应允许把 .dwg 拖进来，随后由导入流程告知用户缺什么、怎么装；
-/// 若在拖入阶段就静默拒绝，用户只能看到「拖拽无反应」。
+/// 刻意使用「已知格式」而非「当前可用格式」：接受拖入与能否读出是两件事，
+/// 先把文件收下、再由导入流程给出具体原因，用户才不会只看到「拖拽无反应」。
 QStringList droppableExtensions()
 {
     return CodecRegistry::instance().knownReadExtensions();
@@ -400,8 +399,8 @@ void MainWindow::createMenus()
         QStringList backends = CodecRegistry::instance().supportedReadExtensions();
         QString dwgNote;
         if (ICadCodec* dwg = CodecRegistry::instance().codecByName(QStringLiteral("DWG"))) {
-            dwgNote = dwg->canRead() ? QStringLiteral("DWG 读写：可用")
-                                     : QStringLiteral("DWG 读写：不可用（未检测到转换后端）");
+            dwgNote = dwg->canRead() ? QStringLiteral("DWG 读写：可用（内置 libdxfrw）")
+                                     : QStringLiteral("DWG 读写：不可用");
         }
 
         QMessageBox::about(

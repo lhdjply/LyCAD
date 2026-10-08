@@ -15,7 +15,7 @@
 //    · 读取：DWG（R14 ~ 2018）与 DXF，均由 libdxfrw-modify 完成。
 //    · 写出：DXF 由 libdxfrw-modify 完成（见 writeDxfWithLibDxfRw）；
 //      DWG 亦由 libdxfrw-modify 完成（见 writeDwgWithLibDxfRw，dwgW，
-//      目标版本 R2000/AC1015）。外部转换器仅作失败兜底。
+//      目标版本 R2000/AC1015）。DWG 的读与写都不依赖外部程序。
 //
 //  许可证
 //    libdxfrw-modify 为 GPL-2.0-or-later，与本项目一同分发时受其约束。
@@ -29,7 +29,8 @@ namespace lycad {
 
 class Document;
 
-/// 是否已编入 libdxfrw（构建期决定，见 LYCAD_WITH_LIBDXFRW）
+/// libdxfrw 是否可用。其源码随项目一起编译，因此恒为 true——
+/// 保留该查询只为让「解析器是否在位」在调用处显式可见。
 bool libDxfRwAvailable();
 
 /// 用内置 libdxfrw 原生读取 DWG。

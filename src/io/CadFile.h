@@ -36,7 +36,7 @@ IoResult save(const QString& path, const Document& document,
 bool canLoad(const QString& path);
 bool canSave(const QString& path);
 
-/// 供界面提示：该扩展名已知但当前不可用（典型场景：未安装 DWG 后端）
+/// 供界面提示：该扩展名已知但当前不可用（例如某个格式的解析器未编入）
 QString capabilityNoteFor(const QString& path);
 
 } // namespace CadFile

@@ -137,7 +137,7 @@ ICadCodec* CodecRegistry::codecForPath(const QString& path, bool forWriting) con
         if (capable) return codec.get();
     }
 
-    // 第二轮：格式已知但能力不足（典型场景是未安装 DWG 转换后端）。
+    // 第二轮：格式已知但能力不足（例如某个格式的解析器未编入）。
     // 这里仍返回该编解码器，好让调用方用 capabilityNote() 说明具体原因与解决办法。
     // 若在此处过滤掉，用户看到的将是一句没有信息量的「不支持的文件类型 .dwg」。
     for (const auto& codec : m_codecs) {
