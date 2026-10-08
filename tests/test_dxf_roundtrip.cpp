@@ -35,6 +35,23 @@
 
 using namespace lycad;
 
+namespace {
+
+/// 取出 ASCII DXF 头部 $ACADVER 的值（组码 9 之后是组码 1）
+QString acadVerOf(const QByteArray& bytes)
+{
+    const QList<QByteArray> lines = bytes.split('\n');
+    for (int i = 0; i + 3 < lines.size(); ++i) {
+        if (lines.at(i).trimmed() == "9" && lines.at(i + 1).trimmed() == "$ACADVER"
+            && lines.at(i + 2).trimmed() == "1") {
+            return QString::fromLatin1(lines.at(i + 3).trimmed());
+        }
+    }
+    return QString();
+}
+
+} // namespace
+
 class TestDxfRoundTrip : public QObject {
     Q_OBJECT
 
@@ -42,6 +59,7 @@ private slots:
     void initTestCase();
     void roundTripR12();
     void roundTripR2000();
+    void roundTripNewerDxfVersions();
     void binaryDxfIsReadable();
     void unsupportedEntitiesAreCountedNotDropped();
     void infiniteLinesDowngradeToLinesInR12();
@@ -451,6 +469,56 @@ void TestDxfRoundTrip::roundTripR2000()
     QString failure;
     QVERIFY2(roundTrip(QStringLiteral("AC1015"), QStringLiteral("sample_2000.dxf"), &failure),
              qPrintable(failure));
+}
+
+// -----------------------------------------------------------------------------
+void TestDxfRoundTrip::roundTripNewerDxfVersions()
+{
+    // AC1018 (2004) / AC1021 (2007) / AC1024 (2010) / AC1027 (2013) / AC1032 (2018)。
+    // 这些版本在实体集上与 R2000 相同（都有 HATCH/SPLINE/…），差别在文本编码：
+    //   · 2004 及更早：文本按 $DWGCODEPAGE 的代码页存放（简中为 GBK）
+    //   · 2007 及以后：文本一律 UTF-8，$DWGCODEPAGE 不再参与解码
+    // 因此这里除了逐图元往返，还要盯住文件头声明的版本与实际的字节编码——
+    // 「声明 2007 却写 GBK」这类错误在「自己写、自己读」的往返里是看不出来的，
+    // 因为读侧会跟着同一个声明走，只有别的 CAD 打开时才暴露。
+    const QStringList versions = {
+        QStringLiteral("AC1018"), QStringLiteral("AC1021"),
+        QStringLiteral("AC1024"), QStringLiteral("AC1027"),
+        QStringLiteral("AC1032"),
+    };
+
+    for (const QString& version : versions) {
+        const QString fileName = QStringLiteral("sample_%1.dxf").arg(version);
+
+        QString failure;
+        QVERIFY2(roundTrip(version, fileName, &failure),
+                 qPrintable(QStringLiteral("%1 往返失败：%2").arg(version, failure)));
+
+        QFile file(m_dir.filePath(fileName));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray bytes = file.readAll();
+
+        // 头部声明的版本必须与请求的一致
+        QCOMPARE(acadVerOf(bytes), version);
+
+        // R13+ 的骨架：CLASSES 与 OBJECTS 段都要在
+        QVERIFY2(bytes.contains("CLASSES"), qPrintable(version));
+        QVERIFY2(bytes.contains("OBJECTS"), qPrintable(version));
+
+        // 中文必须按该版本的编码规则落盘
+        const QByteArray utf8Layer = QStringLiteral("轮廓").toUtf8();
+        if (version >= QStringLiteral("AC1021")) {
+            QVERIFY2(bytes.contains(utf8Layer),
+                     qPrintable(QStringLiteral("%1 的文本应为 UTF-8 编码").arg(version)));
+            QVERIFY2(!bytes.contains("ANSI_936"),
+                     qPrintable(QStringLiteral("%1 不应再声明 ANSI_936").arg(version)));
+        } else {
+            // 2004：文本是代码页编码，UTF-8 字节序列不应原样出现
+            QVERIFY2(!bytes.contains(utf8Layer),
+                     qPrintable(QStringLiteral("%1 的文本应按代码页编码").arg(version)));
+            QVERIFY2(bytes.contains("ANSI_936"), qPrintable(version));
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

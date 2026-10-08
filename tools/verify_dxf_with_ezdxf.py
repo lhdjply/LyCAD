@@ -10,6 +10,7 @@ LyCAD 导出的 DXF 独立交叉校验。
 """
 import sys
 import math
+import tempfile
 from pathlib import Path
 
 import ezdxf
@@ -41,6 +42,16 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
 
     check(doc.dxfversion == expected_version,
           f"版本号应为 {expected_version}，实际 {doc.dxfversion}")
+
+    # 文本编码：AC1021（2007）起 DXF 一律 UTF-8，更早按 $DWGCODEPAGE 走代码页。
+    # 「声明 2007 却写 GBK」这类错误在自己读自己时看不出来（读侧跟着同一个声明走），
+    # 只有独立实现按版本判定时才暴露。
+    if expected_version >= "AC1021":
+        check(doc.output_encoding == "utf-8",
+              f"{expected_version} 的文本编码应为 utf-8，实际 {doc.output_encoding}")
+    else:
+        check(doc.output_encoding != "utf-8",
+              f"{expected_version} 的文本应按代码页编码，实际 {doc.output_encoding}")
     print(f"  版本: {doc.dxfversion}  (DXF 规范版本 {ezdxf.DXF12 if expected_version == 'AC1009' else ezdxf.DXF2000})")
 
     # 审计器报告的每个错误都视为缺陷
@@ -83,18 +94,33 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
     modelspace = doc.modelspace()
     types = [e.dxftype() for e in modelspace]
     print(f"  实体: {types}")
-    check(len(types) == 18, f"实体数应为 18，实际 {len(types)}")
-    check(types.count("LINE") == 4, f"LINE 数应为 4，实际 {types.count('LINE')}")
-    check(types.count("CIRCLE") == 2, f"CIRCLE 数应为 2，实际 {types.count('CIRCLE')}")
-    check(types.count("ARC") == 1, "ARC 数应为 1")
-    check(types.count("POINT") == 1, "POINT 数应为 1")
-    check(types.count("TEXT") == 2, f"TEXT 数应为 2，实际 {types.count('TEXT')}")
-    check(types.count("DIMENSION") == 4, f"DIMENSION 数应为 4，实际 {types.count('DIMENSION')}")
+
+    # 两个版本档的图元构成不同，各自逐项比对：
+    #   · R2000 及以上：HATCH / SPLINE / ELLIPSE / XLINE / RAY 都是原生实体；
+    #   · R12：没有这几类实体，导出时 HATCH 与椭圆降级为闭合多段线、
+    #     SPLINE 降级为多段线、XLINE/RAY 降级为直线——所以总数仍是 23，
+    #     变的是「以什么形式存在」。降级会在导出警告里如实报数。
     poly_type = "LWPOLYLINE" if has_lwpolyline else "POLYLINE"
-    # R2000：外框 + 圆弧段多段线 + 带宽度走线 = 3；R12 额外多一条由 HATCH 降级而来的闭合多段线
-    expected_polys = 4 if not has_hatch else 3
-    check(types.count(poly_type) == expected_polys,
-          f"{poly_type} 数应为 {expected_polys}，实际 {types.count(poly_type)}")
+    if has_hatch:
+        expected_types = {
+            "LWPOLYLINE": 3, "LINE": 4, "CIRCLE": 2, "ARC": 1, "ELLIPSE": 2,
+            "SPLINE": 1, "HATCH": 1, "POINT": 1, "TEXT": 2, "DIMENSION": 4,
+            "XLINE": 1, "RAY": 1,
+        }
+    else:
+        expected_types = {
+            "POLYLINE": 7, "LINE": 6, "CIRCLE": 2, "ARC": 1,
+            "POINT": 1, "TEXT": 2, "DIMENSION": 4,
+        }
+
+    total = sum(expected_types.values())
+    check(len(types) == total, f"实体数应为 {total}，实际 {len(types)}")
+    for name, want in expected_types.items():
+        check(types.count(name) == want, f"{name} 数应为 {want}，实际 {types.count(name)}")
+    for name in sorted(set(types) - set(expected_types)):
+        check(False, f"出现预期之外的实体类型: {name}（R12 档不应有原生 HATCH/SPLINE/ELLIPSE/XLINE/RAY）")
+
+    expected_polys = expected_types[poly_type]
 
     # 圆弧几何
     arcs = modelspace.query("ARC")
@@ -142,9 +168,12 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
             raw = [v.dxf.bulge for v in poly.vertices]
         return [round(b[0] if isinstance(b, tuple) else b, 6) for b in raw]
 
+    # 闭合多段线：R2000 是「外框 + 圆弧段多段线」2 条（带宽走线为开环）；
+    # R12 另加由 HATCH 与两个椭圆降级而来的 2 条。
+    expected_closed = 2 if has_hatch else 4
     closed = [poly for poly in polylines if is_closed(poly)]
-    check(len(closed) == expected_polys - 1,
-          f"闭合多段线应为 {expected_polys - 1} 条（带宽走线为开环），实际 {len(closed)} 条")
+    check(len(closed) == expected_closed,
+          f"闭合多段线应为 {expected_closed} 条，实际 {len(closed)} 条")
 
     # 用凸度区分「直线外框」与「含圆弧段的多段线」
     arc_polys = [poly for poly in polylines if any(abs(b) > 1e-9 for b in bulges_of(poly))]
@@ -194,16 +223,16 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
                         (115.0, 52.0), (92.0, 38.0)}
             check(got == expected, f"降级多段线的顶点集合不符: {sorted(got)}")
 
-    # 图层归属
+    # 图层归属。降级不改变图元所属图层（XLINE/RAY 变直线后仍在「中心线」），
+    # 因此两个版本档的分布相同。
     layer_of = {}
     for entity in modelspace:
         layer_of.setdefault(entity.dxf.layer, 0)
         layer_of[entity.dxf.layer] += 1
     print(f"  实体图层分布: {layer_of}")
-    check(layer_of.get("中心线") == 2, f"中心线层应有 2 个实体，实际 {layer_of.get('中心线')}")
-    check(layer_of.get("轮廓", 0) >= 5, "轮廓层实体数偏少")
-    check(layer_of.get("标注", 0) == 8,
-          f"标注层应有 8 个实体（点/隐藏圆/2 文字/4 标注），实际 {layer_of.get('标注')}")
+    expected_layer_of = {"0": 2, "中心线": 4, "标注": 8, "轮廓": 9}
+    check(layer_of == expected_layer_of,
+          f"实体图层分布应为 {expected_layer_of}，实际 {layer_of}")
 
     # ---- 文字 ----
     texts = modelspace.query("TEXT")
@@ -308,10 +337,13 @@ def verify(path: Path, expected_version: str, has_lineweight: bool,
             check(close(measurement, 50.0), f"直径标注测量值应为 50，实际 {measurement}")
 
     # ---- 回写再读：验证 ezdxf 能无损重写我们的文件 ----
+    # 回写产物一律落在临时目录：sample/ 是纳入版本管理的参考图纸目录，
+    # 校验脚本对它只读，绝不往里写任何中间文件。
     rewritten = ezdxf.recover.readfile(str(path))[0]
     ok = True
     try:
-        rewritten.saveas(str(path.with_name(path.stem + "_ezdxf.dxf")))
+        with tempfile.TemporaryDirectory(prefix="lycad-verify-") as tmp:
+            rewritten.saveas(str(Path(tmp) / (path.stem + "_ezdxf.dxf")))
     except Exception as exc:                       # noqa: BLE001
         ok = False
         check(False, f"ezdxf 回写失败: {exc}")
@@ -323,21 +355,37 @@ def main():
     sample_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
 
     # 默认按「lycad_sample_generator 写入仓库 sample/ 的目录结构」取文件；
-    # 生成器显式指定输出目录时，三种文件平铺在该目录下，直接把该目录传进来即可。
-    r12_dir = sample_dir / "r12" if (sample_dir / "r12").is_dir() else sample_dir
-    r2000_dir = sample_dir / "2000" if (sample_dir / "2000").is_dir() else sample_dir
+    # 生成器显式指定输出目录时，全部文件平铺在该目录下，直接把该目录传进来即可。
+    def sample_path(year: str) -> Path:
+        nested = sample_dir / year / f"lycad_sample_{year}.dxf"
+        return nested if nested.is_file() else sample_dir / f"lycad_sample_{year}.dxf"
 
-    verify(r12_dir / "lycad_sample_r12.dxf",
+    verify(sample_path("r12"),
            expected_version="AC1009",
            has_lineweight=False,     # R12 无 370 组码
            has_lwpolyline=False,     # R12 使用 POLYLINE/VERTEX
            has_hatch=False)          # R12 无 HATCH，降级为多段线
 
-    verify(r2000_dir / "lycad_sample_2000.dxf",
+    verify(sample_path("2000"),
            expected_version="AC1015",
            has_lineweight=True,
            has_lwpolyline=True,
            has_hatch=True)
+
+    # 更高版本：实体集与 R2000 完全相同（都是原生 HATCH/SPLINE/ELLIPSE/XLINE/RAY），
+    # 差别只在 $ACADVER 与文本编码，因此复用同一套期望值，靠 expected_version
+    # 触发版本号与编码两项断言。
+    for year, version in (("2004", "AC1018"), ("2007", "AC1021"), ("2010", "AC1024"),
+                          ("2013", "AC1027"), ("2018", "AC1032")):
+        path = sample_path(year)
+        if not path.is_file():
+            print(f"\n(跳过 {version}：未找到 lycad_sample_{year}.dxf)")
+            continue
+        verify(path,
+               expected_version=version,
+               has_lineweight=True,
+               has_lwpolyline=True,
+               has_hatch=True)
 
     print(f"\n{'=' * 60}")
     if FAILURES:

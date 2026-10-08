@@ -2,8 +2,8 @@
 //  LyCAD - tools/sample_generator.cpp
 //  开发用样例生成器。
 //
-//  用途：生成一份覆盖全部图元类型与典型属性的参考图纸（DXF R12 / DXF R2000 /
-//  DWG R2000），供外部工具（AutoCAD / LibreCAD / ezdxf / ODA File Converter）
+//  用途：生成一份覆盖全部图元类型与典型属性的参考图纸（DXF R12 ~ 2018 各一份，
+//  外加 DWG R2000），供外部工具（AutoCAD / LibreCAD / ezdxf / ODA File Converter）
 //  做互操作性校验。自动化测试只验证「自己写、自己读」的一致性，无法发现
 //  「双方都不满足规范」的情况；用独立实现交叉验证才能暴露这类问题，
 //  本工具正是为此提供输入。
@@ -16,7 +16,12 @@
 //      sample/r12/lycad_sample_r12.dxf        R12（无 HATCH/XLINE/RAY，见导出降级）
 //      sample/2000/lycad_sample_2000.dxf      R2000
 //      sample/2000/lycad_sample_2000.dwg      原生 dwgW 写出（AC1015）
-//  命令行给出目录参数时写到该目录（三种文件平铺，便于临时检查）。
+//      sample/2004/lycad_sample_2004.dxf      AC1018
+//      sample/2007/lycad_sample_2007.dxf      AC1021（起：文本按 UTF-8 存放）
+//      sample/2010/lycad_sample_2010.dxf      AC1024
+//      sample/2013/lycad_sample_2013.dxf      AC1027
+//      sample/2018/lycad_sample_2018.dxf      AC1032
+//  命令行给出目录参数时全部文件平铺写到该目录，便于临时检查。
 //
 //  用法：
 //    lycad_sample_generator [输出目录]          生成参考 DXF / DWG
@@ -413,7 +418,7 @@ int main(int argc, char* argv[])
     }
 
     // 默认写入仓库的 sample/ 目录（构建期注入），按目标版本分目录；
-    // 显式给出目录参数时三种文件平铺写到那里，便于临时检查。
+    // 显式给出目录参数时全部文件平铺写到那里，便于临时检查。
     const QString defaultDir = QStringLiteral(LYCAD_SAMPLE_DIR);
     const QString outputDir = (arguments.size() > 1) ? arguments.at(1) : defaultDir;
 
@@ -423,13 +428,27 @@ int main(int argc, char* argv[])
         return 2;
     }
 
-    const QString r12Dir = (arguments.size() > 1)
-        ? outputDir
-        : outputDir + QStringLiteral("/r12");
-    const QString r2000Dir = (arguments.size() > 1)
-        ? outputDir
-        : outputDir + QStringLiteral("/2000");
-    for (const QString& dir : { r12Dir, r2000Dir }) {
+    // 目标版本矩阵：目录名（同时也是文件名里的年代）-> DXF 版本代号。
+    // 每个年代出一个文件，便于直接用对应版本的 CAD 打开核对。
+    struct Target { const char* year; const char* version; };
+    static const Target kTargets[] = {
+        { "r12",  "AC1009" },     // AutoCAD R12
+        { "2000", "AC1015" },     // AutoCAD 2000
+        { "2004", "AC1018" },     // AutoCAD 2004
+        { "2007", "AC1021" },     // AutoCAD 2007
+        { "2010", "AC1024" },     // AutoCAD 2010
+        { "2013", "AC1027" },     // AutoCAD 2013
+        { "2018", "AC1032" },     // AutoCAD 2018
+    };
+
+    const bool flat = arguments.size() > 1;
+    const auto dirOf = [&](const Target& target) {
+        return flat ? outputDir
+                    : QStringLiteral("%1/%2").arg(outputDir, QLatin1String(target.year));
+    };
+
+    for (const Target& target : kTargets) {
+        const QString dir = dirOf(target);
         QDir d(dir);
         if (!d.exists() && !d.mkpath(QStringLiteral("."))) {
             out() << QStringLiteral("无法创建输出目录: ") << dir << Qt::endl;
@@ -448,13 +467,17 @@ int main(int argc, char* argv[])
           << Qt::endl;
 
     int failures = 0;
-    failures += writeOne(document, r12Dir + QStringLiteral("/lycad_sample_r12.dxf"),
-                         QStringLiteral("AC1009"));
-    failures += writeOne(document, r2000Dir + QStringLiteral("/lycad_sample_2000.dxf"),
-                         QStringLiteral("AC1015"));
-    // DWG：走内置 dwgW 原生写出（目标版本恒为 R2000），
-    // 与 DXF 同内容，供「同一张图两种格式」的交叉比对。
-    failures += writeOne(document, r2000Dir + QStringLiteral("/lycad_sample_2000.dwg"),
+    for (const Target& target : kTargets) {
+        failures += writeOne(document,
+                             dirOf(target) + QStringLiteral("/lycad_sample_%1.dxf")
+                                                 .arg(QLatin1String(target.year)),
+                             QString::fromLatin1(target.version));
+    }
+    // DWG：走内置 dwgW 原生写出（目标版本恒为 R2000），与 DXF 同内容，
+    // 供「同一张图两种格式」的交叉比对。只出 R2000 一份——
+    // DWG 的写出版本不随 DXF 的版本矩阵变化，重复 7 份没有意义。
+    failures += writeOne(document,
+                         dirOf(kTargets[1]) + QStringLiteral("/lycad_sample_2000.dwg"),
                          QStringLiteral("AC1015"));
 
     if (failures == 0) {

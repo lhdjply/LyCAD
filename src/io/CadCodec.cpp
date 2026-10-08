@@ -5,22 +5,51 @@
 
 #include <QFileInfo>
 
+#include <utility>
+#include <vector>
+
 namespace lycad {
 
 // -----------------------------------------------------------------------------
 //  WriteOptions
 // -----------------------------------------------------------------------------
+namespace {
+
+/// 可写出的 DXF 目标版本，按版本从低到高排列。
+///
+/// 这张表是**唯一的版本清单**：界面下拉框、`DxfCodec::write` 的归一化、
+/// 以及写出端的 DRW::Version 映射都以它为准，新增版本只需改这一处。
+/// 版本代号与 libdxfrw 的 DRW::Version 一一对应（顺序也一致）。
+const std::vector<std::pair<QString, QString>>& dxfVersionTable()
+{
+    static const std::vector<std::pair<QString, QString>> kTable = {
+        { QStringLiteral("AC1009"), QStringLiteral("AutoCAD R12 (AC1009)") },
+        { QStringLiteral("AC1015"), QStringLiteral("AutoCAD 2000 (AC1015)") },
+        { QStringLiteral("AC1018"), QStringLiteral("AutoCAD 2004 (AC1018)") },
+        { QStringLiteral("AC1021"), QStringLiteral("AutoCAD 2007 (AC1021)") },
+        { QStringLiteral("AC1024"), QStringLiteral("AutoCAD 2010 (AC1024)") },
+        { QStringLiteral("AC1027"), QStringLiteral("AutoCAD 2013 (AC1027)") },
+        { QStringLiteral("AC1032"), QStringLiteral("AutoCAD 2018 (AC1032)") },
+    };
+    return kTable;
+}
+
+} // namespace
+
 QString WriteOptions::versionDisplayName(const QString& version)
 {
-    if (version == QLatin1String("AC1009")) return QStringLiteral("AutoCAD R12 (AC1009)");
-    if (version == QLatin1String("AC1015")) return QStringLiteral("AutoCAD 2000 (AC1015)");
-    if (version == QLatin1String("AC1018")) return QStringLiteral("AutoCAD 2004 (AC1018)");
+    for (const auto& entry : dxfVersionTable()) {
+        if (entry.first.compare(version, Qt::CaseInsensitive) == 0) return entry.second;
+    }
     return version;
 }
 
 QStringList WriteOptions::availableDxfVersions()
 {
-    return { QStringLiteral("AC1009"), QStringLiteral("AC1015") };
+    QStringList versions;
+    versions.reserve(static_cast<qsizetype>(dxfVersionTable().size()));
+    for (const auto& entry : dxfVersionTable()) versions << entry.first;
+    return versions;
 }
 
 // -----------------------------------------------------------------------------

@@ -231,7 +231,10 @@ void MainWindow::createMenus()
         const QString chosen = QInputDialog::getItem(
             this, QStringLiteral("DXF 目标版本"),
             QStringLiteral("保存为 DXF 时使用的版本：\n"
-                           "AC1009 (R12) 兼容性最广，AC1015 (2000) 支持 LWPOLYLINE。"),
+                           "AC1009 (R12) 兼容性最广，但缺 HATCH/SPLINE 等实体，"
+                           "导出时会被降级；\n"
+                           "AC1015 (2000) 起支持全部已建模图元；\n"
+                           "AC1021 (2007) 起文本按 UTF-8 存放，中文不再受代码页限制。"),
             labels, static_cast<int>(std::max<qsizetype>(0, versions.indexOf(m_writeOptions.version))),
             false, &ok);
         if (!ok) return;

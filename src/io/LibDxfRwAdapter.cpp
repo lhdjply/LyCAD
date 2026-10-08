@@ -179,6 +179,24 @@ QString versionCode(DRW::Version v)
     return QString();
 }
 
+/// "AC1015" 形式的签名码 -> DRW::Version；无法识别时返回 UNKNOWNV
+DRW::Version versionFromCode(const QString& code)
+{
+    static const std::pair<const char*, DRW::Version> kTable[] = {
+        { "AC1006", DRW::AC1006 }, { "AC1009", DRW::AC1009 },
+        { "AC1012", DRW::AC1012 }, { "AC1014", DRW::AC1014 },
+        { "AC1015", DRW::AC1015 }, { "AC1018", DRW::AC1018 },
+        { "AC1021", DRW::AC1021 }, { "AC1024", DRW::AC1024 },
+        { "AC1027", DRW::AC1027 }, { "AC1032", DRW::AC1032 },
+    };
+    for (const auto& entry : kTable) {
+        if (code.compare(QLatin1String(entry.first), Qt::CaseInsensitive) == 0) {
+            return entry.second;
+        }
+    }
+    return DRW::UNKNOWNV;
+}
+
 // -----------------------------------------------------------------------------
 //  Builder：把 libdxfrw 的回调装配成 LyCAD 文档
 // -----------------------------------------------------------------------------
@@ -1590,8 +1608,12 @@ DRW_Text::VAlign toDrwVAlign(TextEntity::VAlign align)
 template <typename RW>
 class ExporterBase final : public DRW_Interface {
 public:
-    ExporterBase(const Document& document, bool r2000)
-        : m_doc(document), m_r2000(r2000) {}
+    ExporterBase(const Document& document, DRW::Version version)
+        : m_doc(document)
+        , m_version(version)
+        , m_modern(version > DRW::AC1009)      // R12 之外的目标版本（R13+）
+        , m_utf8Text(version >= DRW::AC1021)   // 2007 及以后：DXF 文本一律 UTF-8
+    {}
 
     void setDxfRw(RW* rw) { m_rw = rw; }
 
@@ -1658,9 +1680,15 @@ public:
     // ---- 写侧 ----------------------------------------------------------------
     void writeHeader(DRW_Header& header) override
     {
-        // $ACADVER/$HANDSEED 由库负责；$DWGCODEPAGE 决定写出编码，
-        // 声明 ANSI_936 后库会把 UTF-8 字符串转成 GBK（简中环境的标准做法）。
-        header.addStr("$DWGCODEPAGE", "ANSI_936", 3);
+        // $ACADVER/$HANDSEED 由库负责；$DWGCODEPAGE 决定写出编码。
+        //
+        //   · R12 ~ 2004：文本按代码页存放。声明 ANSI_936（简中）后库会把
+        //     UTF-8 字符串转成 GBK，这是简中环境的标准做法。
+        //   · 2007 及以后：DXF 文本一律 UTF-8，$DWGCODEPAGE 不再参与解码。
+        //     库此时不做任何编码转换，但若仍声明 ANSI_936，会误导按声明
+        //     解码的读取器（本软件与 AutoCAD 都按版本判定，不受影响）。
+        //     按惯例声明 ANSI_1252——AutoCAD 写 2007+ DXF 时正是这么写的。
+        header.addStr("$DWGCODEPAGE", m_utf8Text ? "ANSI_1252" : "ANSI_936", 3);
 
         header.addStr("$CLAYER", m_doc.layers().currentLayerName().toStdString(), 8);
         header.addInt("$CECOLOR", 256, 62);
@@ -1749,7 +1777,7 @@ public:
     /// 文档没提供字体信息的样式（例如纯新建的图纸，或文件里只写了样式名）
     /// 一律补上「txt + gbcbig.shx」：两者都随 AutoCAD / GstarCAD 分发，
     /// 不依赖操作系统装了哪款中文字体；R12 不支持 TrueType，大字体这条路
-    /// 对 R12 与 R2000 同样有效。
+    /// 对 R12 与 R2000 及以上的所有目标版本同样有效。
     void writeTextstyles() override
     {
         const TextStyleTable& table = m_doc.textStyles();
@@ -1769,7 +1797,7 @@ public:
             //     扩展数据里（3/4 组码为空）——R12 里没有别的办法表达它。
             const bool needsFallback =
                 (font.isEmpty() && bigFont.isEmpty())
-                && (ttfName.isEmpty() || !m_r2000);
+                && (ttfName.isEmpty() || !m_modern);
             if (needsFallback) {
                 font = fallback.fontFile();
                 bigFont = fallback.bigFontFile();
@@ -1786,7 +1814,7 @@ public:
             // 3 组码为空、字体只存在于扩展数据时，必须把扩展数据一起写回
             // （libdxfrw-modify 已让写出侧支持表记录的扩展数据）。
             // R12 不支持 TrueType，上面已经换成大字体，不再写扩展数据。
-            if (m_r2000 && !ttfName.isEmpty()) {
+            if (m_modern && !ttfName.isEmpty()) {
                 record.extData.push_back(new DRW_Variant(1001, std::string("ACAD")));
                 record.extData.push_back(new DRW_Variant(1000, ttfName.toStdString()));
                 if (style->ttfFlags() != 0) {
@@ -1853,10 +1881,10 @@ public:
         m_rw->writeVport(&viewport);
     }
 
-    /// R2000 的 BLOCK_RECORD 表：每个匿名块都要在此登记，写出块体时才能对上句柄
+    /// R2000 及以上的 BLOCK_RECORD 表：每个匿名块都要在此登记，写出块体时才能对上句柄
     void writeBlockRecords() override
     {
-        if (!m_r2000) return;
+        if (!m_modern) return;
         for (const auto& [id, blockName] : m_dimBlocks) {
             Q_UNUSED(id);
             m_rw->writeBlockRecord(blockName);
@@ -1996,7 +2024,7 @@ private:
 
     void writePolyline(const PolylineEntity& polyline)
     {
-        if (m_r2000) {
+        if (m_modern) {
             DRW_LWPolyline record;
             applyCommonWrite(record, polyline);
             record.flags = polyline.isClosed() ? 1 : 0;
@@ -2061,7 +2089,7 @@ private:
         // 会产出非法文件（实测 AutoCAD 直接拒绝打开，ezdxf 也报
         // "Invalid group code"）——这正是 MTEXT 用 \P 表示段落的原因。
         // R12 无 MTEXT，走下方 TEXT 分支并折叠换行。
-        if (m_r2000 && content.contains(QLatin1Char('\n'))) {
+        if (m_modern && content.contains(QLatin1Char('\n'))) {
             DRW_MText record;
             applyCommonWrite(record, text);
             applyCoord(record.basePoint, text.effectivePosition());
@@ -2107,7 +2135,7 @@ private:
 
     void writeHatch(const HatchEntity& hatch)
     {
-        if (!m_r2000) {
+        if (!m_modern) {
             // HATCH 实体为 R14 引入：降级写出闭合边界多段线，保证几何信息不丢失
             if (hatch.vertexCount() >= 2) {
                 DRW_Polyline record;
@@ -2181,10 +2209,10 @@ private:
         m_rw->writeHatch(&record);
     }
 
-    /// 样条：R2000 按原生 SPLINE 写出；R12 无此实体，降级为多段线并计数
+    /// 样条：R12 之外的目标版本按原生 SPLINE 写出；R12 无此实体，降级为多段线并计数
     void writeSplineCurve(const SplineEntity& spline)
     {
-        if (m_r2000) {
+        if (m_modern) {
             DRW_Spline record;
             applyCommonWrite(record, spline);
             record.degree = spline.degree();
@@ -2214,11 +2242,11 @@ private:
         ++m_splineDowngrades;
     }
 
-    /// 椭圆：R2000 按原生 ELLIPSE 写出；R12 无此实体，降级为多段线并计数。
+    /// 椭圆：R12 之外的目标版本按原生 ELLIPSE 写出；R12 无此实体，降级为多段线并计数。
     ///（库自带的 R12 分支不拷贝图层/颜色等属性，故这里自行降级。）
     void writeEllipseCurve(const EllipseEntity& ellipse)
     {
-        if (m_r2000) {
+        if (m_modern) {
             DRW_Ellipse record;
             applyCommonWrite(record, ellipse);
             applyCoord(record.basePoint, ellipse.center());
@@ -2244,11 +2272,11 @@ private:
         ++m_ellipseDowngrades;
     }
 
-    /// 构造线：R2000 按原生 XLINE 写出；R12 无此实体（R13 才引入），
+    /// 构造线：R12 之外的目标版本按原生 XLINE 写出；R12 无此实体（R13 才引入），
     /// 降级为一条贯穿全图范围的直线并计数。
     void writeXLine(const XLineEntity& line)
     {
-        if (m_r2000) {
+        if (m_modern) {
             DRW_Xline record;
             applyCommonWrite(record, line);
             applyCoord(record.basePoint, line.basePoint());
@@ -2263,7 +2291,7 @@ private:
     /// 射线：与构造线同构，目标版本决定是原生 RAY 还是降级直线。
     void writeRay(const RayEntity& ray)
     {
-        if (m_r2000) {
+        if (m_modern) {
             DRW_Ray record;
             applyCommonWrite(record, ray);
             applyCoord(record.basePoint, ray.basePoint());
@@ -2366,7 +2394,12 @@ private:
 
     const Document& m_doc;
     RW* m_rw = nullptr;
-    bool m_r2000 = false;
+    DRW::Version m_version = DRW::AC1015;
+    /// 目标版本是否高于 R12。R12 缺 HATCH/SPLINE/ELLIPSE/XLINE/RAY 等实体，
+    /// 也表达不了 TrueType 字体与 MTEXT，这些分支都挂在它上面。
+    bool m_modern = false;
+    /// 目标版本的 DXF 文本是否按 UTF-8 存放（AC1021 及以后为真）
+    bool m_utf8Text = false;
     std::map<EntityId, std::string> m_dimBlocks;
     int m_hatchDowngrades = 0;
     int m_splineDowngrades = 0;
@@ -2384,12 +2417,13 @@ using Exporter = ExporterBase<dxfRW>;
 IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
                               const WriteOptions& options)
 {
-    // 版本归一化：仅接受本写出路径支持的两个目标版本
-    const bool r2000 = options.version.compare(QLatin1String("AC1009"),
-                                               Qt::CaseInsensitive) != 0;
-    const DRW::Version version = r2000 ? DRW::AC1015 : DRW::AC1009;
+    // 版本归一化：只认得出签名码的版本走各自的目标版本，其余退回 R12。
+    // 调用方 DxfCodec::write 已按 WriteOptions::availableDxfVersions() 归一过一次，
+    // 这里再兜一次底，保证直接调用本函数的场景也不会写出版本不明的文件。
+    DRW::Version version = versionFromCode(options.version);
+    if (version == DRW::UNKNOWNV) version = DRW::AC1009;
 
-    Exporter exporter(document, r2000);
+    Exporter exporter(document, version);
     exporter.prescanDimensionBlocks();
 
     const QByteArray native = QFile::encodeName(path);
@@ -2430,7 +2464,7 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
 {
     Q_UNUSED(options.version);              // DWG 写出固定 AC1015，不随选项变化
 
-    ExporterBase<dwgW> exporter(document, /*r2000=*/true);
+    ExporterBase<dwgW> exporter(document, DRW::AC1015);
     exporter.prescanDimensionBlocks();
 
     const QByteArray native = QFile::encodeName(path);

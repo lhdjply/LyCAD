@@ -31,7 +31,8 @@ class Document;
 //  写出选项
 // -----------------------------------------------------------------------------
 struct WriteOptions {
-    /// 目标格式版本。DXF 支持 "AC1009"(R12) 与 "AC1015"(R2000)。
+    /// 目标格式版本。DXF 支持 R12 ~ 2018，取值见 availableDxfVersions()；
+    /// DWG 的写出版本固定为 R2000，不受此项影响。
     QString version = QStringLiteral("AC1009");
 
     /// 输出可直接阅读的缩进版本（体积略增，便于人工排查）
@@ -39,6 +40,9 @@ struct WriteOptions {
 
     /// 版本名称，供界面展示
     static QString versionDisplayName(const QString& version);
+
+    /// 可写出的 DXF 目标版本代号，按版本从低到高排列。
+    /// 这是版本清单的唯一来源：界面、版本归一化、写出端都取自这里。
     static QStringList availableDxfVersions();
 };
 

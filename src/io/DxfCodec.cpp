@@ -72,7 +72,8 @@ IoResult DxfCodec::write(const QString& path, const Document& document,
 {
     WriteOptions effective = options;
 
-    // 版本归一化：仅接受本写出器实现的两个目标版本
+    // 版本归一化：只接受 WriteOptions::availableDxfVersions() 里的目标版本，
+    // 其余（含空串）一律落到清单首项 R12，绝不写出版本不明的文件
     const QStringList supported = WriteOptions::availableDxfVersions();
     if (!supported.contains(effective.version, Qt::CaseInsensitive)) {
         effective.version = supported.front();
