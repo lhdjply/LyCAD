@@ -2429,12 +2429,10 @@ bool DRW_Dimension::parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer *sB
         duint8 dimVersion = buf->getRawChar8();
         DRW_DBG("\ndimVersion: "); DRW_DBG(dimVersion);
     }
-    extPoint = buf->getExtrusion(version > DRW::AC1014);
+    // 标注的拉伸方向在 R13-R15 均为普通 3BD（LibreDWG 对真实 AutoCAD 文件的
+    // 解码已验证），没有公共实体数据那种「默认标志位」，也没有附加未知位。
+    extPoint = buf->get3BitDouble();
     DRW_DBG("\nextPoint: "); DRW_DBGPT(extPoint.x, extPoint.y, extPoint.z);
-    if (version > DRW::AC1014) { //2000+
-        DRW_DBG("\nFive unknown bits: "); DRW_DBG(buf->getBit()); DRW_DBG(buf->getBit());
-        DRW_DBG(buf->getBit()); DRW_DBG(buf->getBit()); DRW_DBG(buf->getBit());
-    }
     textPoint.x = buf->getRawDouble();
     textPoint.y = buf->getRawDouble();
     textPoint.z = buf->getBitDouble();

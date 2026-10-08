@@ -1097,6 +1097,36 @@ AcDbSymbolTableRecord
 100
 AcDbLinetypeTableRecord
   2
+DASHED
+ 70
+    0
+  3
+__ __ __ __ __ __ __ __ __ __ __ __ __
+ 72
+   65
+ 73
+    2
+ 40
+0.75
+ 49
+0.5
+ 74
+    0
+ 49
+-0.25
+ 74
+    0
+  0
+LTYPE
+  5
+33
+330
+5
+100
+AcDbSymbolTableRecord
+100
+AcDbLinetypeTableRecord
+  2
 CENTER
  70
     0
@@ -1118,36 +1148,6 @@ ____ _ ____ _ ____ _ ____ _ ____
     0
  49
 0.25
- 74
-    0
- 49
--0.25
- 74
-    0
-  0
-LTYPE
-  5
-33
-330
-5
-100
-AcDbSymbolTableRecord
-100
-AcDbLinetypeTableRecord
-  2
-DASHED
- 70
-    0
-  3
-__ __ __ __ __ __ __ __ __ __ __ __ __
- 72
-   65
- 73
-    2
- 40
-0.75
- 49
-0.5
  74
     0
  49

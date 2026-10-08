@@ -218,13 +218,17 @@ struct dwgW::Private
     std::set<std::uint32_t> encodedHandles;     // 已编码的表记录句柄
 
     /// 标注参数（R2000 DIMSTYLE 记录需要完整字段集，取值来自 header 变量）
+    /// 默认值必须与 LyCAD 标注引擎的实际布局参数一致（DimensionEntity.cpp）：
+    /// 字高 3.5、箭头长 = 字高、界线间隙 0.18×字高、界线超出 0.30×字高、
+    /// 文字置于尺寸线上方（dimtad=1 风格）。真实 CAD 打开时若按 DIMSTYLE
+    /// 重算标注，声明的值就是它的布局依据——与块内几何不一致就会产生偏移。
     struct DimStyleData {
-        double scale=1.0, asz=2.5, exo=0.625, dli=3.75, exe=1.25;
+        double scale=1.0, asz=3.5, exo=0.63, dli=3.75, exe=1.05;
         double rnd=0.0, dle=0.0, tp=0.0, tm=0.0;
-        double txt=2.5, cen=2.5, tsz=0.0, altf=0.03937007874015748;
+        double txt=3.5, cen=2.5, tsz=0.0, altf=0.03937007874015748;
         double lfac=1.0, tvp=0.0, tfac=1.0, gap=0.625, altrnd=0.0;
         int tol=0, lim=0, tih=0, toh=0, se1=0, se2=0;
-        int tad=0, zin=0, azin=0;
+        int tad=1, zin=0, azin=0;
         int alt=0, altd=4, tofl=0, sah=0, tix=0, soxd=0;
         int clrd=0, clre=0, clrt=0;
         int adec=0, dec=4, tdec=4, altu=2, alttd=4, aunit=0;
@@ -1566,8 +1570,12 @@ bool dwgW::writeText(DRW_Text* ent)
             b.w.writeDD(ent->secPoint.y, ent->basePoint.y);
         }
         d->writeThicknessExtrusion(b, ent->thickness, ent->extPoint);
-        if (!(df & 0x04)) b.w.writeRD(ent->oblique);
-        if (!(df & 0x08)) b.w.writeRD(ent->angle);
+        // 倾角与旋转角：DRW_Text::angle/oblique 与 DXF 50/51 组码同单位（度），
+        // 而 DWG 位流里一律存弧度——不换算的话，90° 的文字会被真实 CAD 解释为
+        // 90 弧度（≈116.6°取模），旋转整体错乱。标注几何块内的文字（适配器按
+        // 度填 angle）受影响最直接：DXF 打开正常、DWG 打开旋转不对。
+        if (!(df & 0x04)) b.w.writeRD(ent->oblique * kDegToRad);
+        if (!(df & 0x08)) b.w.writeRD(ent->angle * kDegToRad);
         b.w.writeRD(ent->height);
         if (!(df & 0x10)) b.w.writeRD(ent->widthscale);
         b.w.writeT(ent->text, d->codec);
@@ -1637,31 +1645,32 @@ bool dwgW::writeDimension(DRW_Dimension* ent)
     }
     const DRW_Coord defPoint = ent->getDefPoint();
 
-    const std::uint32_t styleH = d->styleHandle(ent->getStyle());
+    // 标注引用的是 DIMSTYLE 表记录（不是文字样式表），styleMap 查出来会指错对象。
+    const std::uint32_t styleH = d->dimstyleHandle(ent->getStyle());
     const std::uint32_t blockH = d->blockRecordHandle(ent->getName());
 
     d->encodeEntity(otype, *ent, [&](Private::ObjBuilder& b) {
+        // R2000 标注专属数据，字段序与真实 AutoCAD 文件逐字节对齐（LibreDWG 校验通过）：
+        // 拉伸方向这里是普通 3BD，没有公共实体数据那种「默认标志位」。
         const DRW_Coord ext = ent->getExtrusion();
-        if (isDefaultExtrusion(ext)) b.w.writeB(true);
-        else { b.w.writeB(false); b.w.write3BD(ext.x, ext.y, ext.z); }
-        for (int i = 0; i < 5; ++i) b.w.writeB(false);
+        b.w.write3BD(ext.x, ext.y, ext.z);
         const DRW_Coord tp = ent->getTextPoint();
-        b.w.writeRD(tp.x);
-        b.w.writeRD(tp.y);
-        b.w.writeBD(tp.z);
-        // dimtype 字节：bit1 置位 → 读取端还原出 bit5（几何块存在）+ bit7；
-        // 标注子类型由 oType 决定（低 3 位被读取端清除后按 oType 重组）。
-        b.w.writeRC(0x02);
-        b.w.writeT(ent->getText(), d->codec);
-        b.w.writeBD(0.0);               // rot
-        b.w.writeBD(0.0);               // hdir
-        b.w.write3BD(0.0, 0.0, 0.0);    // inspoint
-        b.w.writeBD(0.0);               // insRot（54）
-        b.w.writeBS(0);                 // align
-        b.w.writeBS(0);                 // linesty
-        b.w.writeBD(1.0);               // linefactor
-        b.w.writeBD(ent->getMeasurement());
-        b.w.write2RD(0.0, 0.0);         // clonePoint
+        b.w.write2RD(tp.x, tp.y);           // 文字中点 (11)
+        b.w.writeBD(tp.z);                  // 文字高程 (31)
+        // flag1 位语义（与读取端对偶）：bit0=文字处于默认位置（读取端据此清除
+        // DXF 70 的 bit7），bit1=引用几何块（读取端还原 bit5，R13 起恒置位）。
+        // 低 3 位的标注子类型由对象类型决定，不在此字节内。
+        b.w.writeRC(0x03);
+        b.w.writeT(ent->getText(), d->codec);   // 用户文字 (1)
+        b.w.writeBD(0.0);                   // 文字旋转 (53)
+        b.w.writeBD(0.0);                   // 水平方向 (51)
+        b.w.write3BD(1.0, 1.0, 1.0);        // 插入比例（AutoCAD 实测写 (1,1,1)）
+        b.w.writeBD(0.0);                   // 插入旋转 (54)
+        b.w.writeBS(static_cast<dint16>(ent->getAlign()));          // 文字对齐 (71)
+        b.w.writeBS(static_cast<dint16>(ent->getTextLineStyle()));  // 行距样式 (72)
+        b.w.writeBD(ent->getTextLineFactor());                      // 行距系数 (41)
+        b.w.writeBD(ent->getMeasurement());                         // 实测值 (42)
+        b.w.write2RD(0.0, 0.0);             // clone 插入点 (12)
         switch (otype) {
         case kDimLinear:
             b.w.write3BD(def1.x, def1.y, def1.z);
@@ -1906,11 +1915,13 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d)
     w.writeT(std::string(), d.codec);                   // DIMAPOST
 
     // ---- 标注变量（第一组）------------------------------------------------------
+    // 默认值与 DimStyleData（即 LyCAD 标注引擎布局）保持一致，两处必须同步：
+    // DIMTAD=1 对应引擎「文字置于尺寸线上方」的实际布局，字高/箭头=3.5。
     w.writeBD(hdrDouble(hdr, "$DIMSCALE", 1.0));
-    w.writeBD(hdrDouble(hdr, "$DIMASZ", 2.5));
-    w.writeBD(hdrDouble(hdr, "$DIMEXO", 0.625));
+    w.writeBD(hdrDouble(hdr, "$DIMASZ", 3.5));
+    w.writeBD(hdrDouble(hdr, "$DIMEXO", 0.63));
     w.writeBD(hdrDouble(hdr, "$DIMDLI", 3.75));
-    w.writeBD(hdrDouble(hdr, "$DIMEXE", 1.25));
+    w.writeBD(hdrDouble(hdr, "$DIMEXE", 1.05));
     w.writeBD(0.0);                                     // DIMRND
     w.writeBD(0.0);                                     // DIMDLE
     w.writeBD(0.0);                                     // DIMTP
@@ -1921,10 +1932,10 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d)
     w.writeB(false);                                    // DIMTOH
     w.writeB(false);                                    // DIMSE1
     w.writeB(false);                                    // DIMSE2
-    w.writeBS(0);                                       // DIMTAD
+    w.writeBS(1);                                       // DIMTAD
     w.writeBS(0);                                       // DIMZIN
     w.writeBS(0);                                       // DIMAZIN
-    w.writeBD(hdrDouble(hdr, "$DIMTXT", 2.5));
+    w.writeBD(hdrDouble(hdr, "$DIMTXT", 3.5));
     w.writeBD(hdrDouble(hdr, "$DIMCEN", 2.5));
     w.writeBD(0.0);                                     // DIMTSZ
     w.writeBD(0.03937007874015748);                     // DIMALTF

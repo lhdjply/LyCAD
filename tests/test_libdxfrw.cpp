@@ -197,6 +197,8 @@ private slots:
     void infiniteLinesRoundTripThroughNativeDwg();
     /// 普通几何（直线 / 多段线）经原生 dwgW 写出后坐标必须逐位保真
     void linesAndPolylinesRoundTripThroughNativeDwg();
+    /// 标注经原生 dwgW 写出后定义点与测量值必须原样读回
+    void dimensionsRoundTripThroughNativeDwg();
 
     // ---- 写出后的「打开即见图形」--------------------------------------------
     void writtenActiveViewportCoversDrawing();
@@ -1061,6 +1063,99 @@ void TestLibDxfRw::linesAndPolylinesRoundTripThroughNativeDwg()
     QVERIFY(polyline.vertex(1).point == Point2D(180.0, 0.0));
     QVERIFY(polyline.vertex(2).point == Point2D(180.0, 110.0));
     QVERIFY(polyline.vertex(3).point == Point2D(0.0, 110.0));
+}
+
+// -----------------------------------------------------------------------------
+//  标注的原生 DWG 往返
+//
+//  R2000 标注专属数据区的字段序与公共实体数据不同：拉伸方向是**普通 3BD**
+//  （没有「默认标志位」），其后依次是 2RD 文字中点、BD 高程、RC flag1、……
+//  写出端若套用公共实体数据的 BE 编码，位流从第一个字段就错位，AutoCAD 系
+//  软件（实测 GstarCAD）会把全部标注的定义点解成垃圾值，图形缩成一团挤在
+//  原点。此约定已用 LibreDWG 对照真实 AutoCAD 文件逐字段钉死，这里做写-读
+//  往返防止回退。
+// -----------------------------------------------------------------------------
+void TestLibDxfRw::dimensionsRoundTripThroughNativeDwg()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    Document source;
+    source.beginBatchLoad();
+    {
+        auto linear = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Linear);
+        linear->setFirstPoint(Point2D(180.0, 0.0));
+        linear->setSecondPoint(Point2D(180.0, 110.0));
+        linear->setDimLinePoint(Point2D(198.0, 55.0));
+        linear->setRotation(degToRad(90.0));                    // 竖直尺寸线
+        source.addEntity(std::move(linear));
+    }
+    {
+        auto aligned = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Aligned);
+        aligned->setFirstPoint(Point2D(0.0, 0.0));
+        aligned->setSecondPoint(Point2D(80.0, 0.0));
+        aligned->setDimLinePoint(Point2D(40.0, -15.0));
+        source.addEntity(std::move(aligned));
+    }
+    {
+        auto radial = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Radial);
+        radial->setFirstPoint(Point2D(60.0, 55.0));             // 圆心
+        radial->setSecondPoint(Point2D(77.6776695296637, 72.6776695296637)); // 45°，半径 25
+        source.addEntity(std::move(radial));
+    }
+    {
+        auto diametric = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Diametric);
+        diametric->setFirstPoint(Point2D(95.0, 55.0));
+        diametric->setSecondPoint(Point2D(145.0, 55.0));        // 直径 50
+        source.addEntity(std::move(diametric));
+    }
+    source.endBatchLoad();
+
+    const QString path = dir.filePath(QStringLiteral("dims.dwg"));
+    QVERIFY2(writeDwgWithLibDxfRw(path, source, WriteOptions{}).ok, "DWG 写出失败");
+
+    Document loaded;
+    QVERIFY2(readDwgWithLibDxfRw(path, loaded).ok, "DWG 读回失败");
+
+    // 一条不少：标注一旦被读坏（位流错位 → 定义点成垃圾、测量值为零），
+    // 读取端会把它当坏数据丢弃，数量对不上
+    QCOMPARE(loaded.entityCount(), source.entityCount());
+
+    const DimensionEntity* linear = nullptr;
+    const DimensionEntity* aligned = nullptr;
+    const DimensionEntity* radial = nullptr;
+    const DimensionEntity* diametric = nullptr;
+    for (EntityId id : loaded.drawOrder()) {
+        const Entity* entity = loaded.entity(id);
+        if (!entity || entity->type() != EntityType::Dimension) continue;
+        const auto& dim = static_cast<const DimensionEntity&>(*entity);
+        switch (dim.dimType()) {
+        case DimensionEntity::DimType::Linear:    linear = &dim; break;
+        case DimensionEntity::DimType::Aligned:   aligned = &dim; break;
+        case DimensionEntity::DimType::Radial:    radial = &dim; break;
+        case DimensionEntity::DimType::Diametric: diametric = &dim; break;
+        default: break;
+        }
+    }
+    QVERIFY2(linear && aligned && radial && diametric,
+             "四类标注没有全部读回，DWG 标注编码有误");
+
+    QVERIFY(linear->firstPoint().distanceTo(Point2D(180.0, 0.0)) < kTol);
+    QVERIFY(linear->secondPoint().distanceTo(Point2D(180.0, 110.0)) < kTol);
+    QVERIFY(linear->dimLinePoint().distanceTo(Point2D(198.0, 55.0)) < kTol);
+    QVERIFY(std::abs(linear->measurement() - 110.0) < kTol);
+
+    QVERIFY(aligned->firstPoint().distanceTo(Point2D(0.0, 0.0)) < kTol);
+    QVERIFY(aligned->secondPoint().distanceTo(Point2D(80.0, 0.0)) < kTol);
+    QVERIFY(aligned->dimLinePoint().distanceTo(Point2D(40.0, -15.0)) < kTol);
+    QVERIFY(std::abs(aligned->measurement() - 80.0) < kTol);
+
+    QVERIFY(radial->firstPoint().distanceTo(Point2D(60.0, 55.0)) < kTol);
+    QVERIFY(std::abs(radial->measurement() - 25.0) < kTol);
+
+    QVERIFY(diametric->firstPoint().distanceTo(Point2D(95.0, 55.0)) < kTol);
+    QVERIFY(diametric->secondPoint().distanceTo(Point2D(145.0, 55.0)) < kTol);
+    QVERIFY(std::abs(diametric->measurement() - 50.0) < kTol);
 }
 
 QTEST_MAIN(TestLibDxfRw)
