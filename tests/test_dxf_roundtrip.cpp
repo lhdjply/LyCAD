@@ -57,6 +57,7 @@ class TestDxfRoundTrip : public QObject {
 
 private slots:
     void initTestCase();
+    void dxfVersionCatalog();
     void roundTripR12();
     void roundTripR2000();
     void roundTripNewerDxfVersions();
@@ -454,6 +455,34 @@ bool TestDxfRoundTrip::roundTrip(const QString& version, const QString& fileName
     }
 
     return true;
+}
+
+// -----------------------------------------------------------------------------
+void TestDxfRoundTrip::dxfVersionCatalog()
+{
+    // 版本清单是界面、版本归一化与写出端共用的**唯一来源**，
+    // 它的顺序与默认值都是对外约定：
+    //   · 由旧到新 —— 另存为的类型列表、目标版本下拉都按这个顺序排；
+    //   · 默认 AC1032 —— 普通保存（Ctrl+S）写出的就是这一档。
+    const QStringList versions = WriteOptions::availableDxfVersions();
+    QCOMPARE(versions, QStringList({ QStringLiteral("AC1009"), QStringLiteral("AC1015"),
+                                     QStringLiteral("AC1018"), QStringLiteral("AC1021"),
+                                     QStringLiteral("AC1024"), QStringLiteral("AC1027"),
+                                     QStringLiteral("AC1032") }));
+    QCOMPARE(WriteOptions{}.version, QStringLiteral("AC1032"));
+
+    // 两种名字各司其职：短名进另存为的类型列表（要短），
+    // 全名进消息与提示（带 AC 代号，可追溯）
+    QCOMPARE(WriteOptions::versionShortName(QStringLiteral("AC1018")),
+             QStringLiteral("AutoCAD 2004"));
+    QCOMPARE(WriteOptions::versionDisplayName(QStringLiteral("AC1018")),
+             QStringLiteral("AutoCAD 2004 (AC1018)"));
+
+    // 清单之外的版本按原样回显，不静默换成别的名字
+    QCOMPARE(WriteOptions::versionShortName(QStringLiteral("AC9999")),
+             QStringLiteral("AC9999"));
+    QCOMPARE(WriteOptions::versionDisplayName(QStringLiteral("AC9999")),
+             QStringLiteral("AC9999"));
 }
 
 // -----------------------------------------------------------------------------

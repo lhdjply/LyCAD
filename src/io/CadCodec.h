@@ -31,15 +31,20 @@ class Document;
 //  写出选项
 // -----------------------------------------------------------------------------
 struct WriteOptions {
-    /// 目标格式版本。DXF 支持 R12 ~ 2018，取值见 availableDxfVersions()；
-    /// DWG 的写出版本固定为 R2000，不受此项影响。
-    QString version = QStringLiteral("AC1009");
+    /// 目标格式版本。DXF 支持 R12 ~ 2018，取值见 availableDxfVersions()。
+    /// 默认 AC1032（2018）：现代 CAD 都能打开，实体集完整，文本按 UTF-8 存放，
+    /// 中文不再受代码页限制。DWG 的写出版本固定为 R2000，不受此项影响。
+    QString version = QStringLiteral("AC1032");
 
     /// 输出可直接阅读的缩进版本（体积略增，便于人工排查）
     bool prettyPrint = false;
 
-    /// 版本名称，供界面展示
+    /// 版本名称（含 AC 代号），供消息与提示展示
     static QString versionDisplayName(const QString& version);
+
+    /// 版本短名（不含 AC 代号），用于「另存为」里逐版本的过滤器：
+    /// 列表本身就是版本选择器，因此名字要短。
+    static QString versionShortName(const QString& version);
 
     /// 可写出的 DXF 目标版本代号，按版本从低到高排列。
     /// 这是版本清单的唯一来源：界面、版本归一化、写出端都取自这里。
@@ -115,9 +120,13 @@ public:
     virtual IoResult write(const QString& path, const Document& document,
                            const WriteOptions& options) const = 0;
 
-    /// 供文件对话框使用的过滤器字符串
+    /// 供文件对话框使用的过滤器字符串。
+    ///
+    /// writeFilter 可被子类覆写：写出过滤器要能表达「写成什么」，
+    /// 同一格式若有固定的目标版本（如 DWG 恒为 R2000），名字里就该点明，
+    /// 否则用户只能看到「DWG 图形文件」而不知道写出的到底是哪一版。
     QString readFilter() const;
-    QString writeFilter() const;
+    virtual QString writeFilter() const;
 
 protected:
     /// 由扩展名判定的辅助实现，供子类复用

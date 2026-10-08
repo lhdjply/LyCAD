@@ -58,6 +58,11 @@ public:
     QStringList readExtensions() const override;
     QStringList writeExtensions() const override;
 
+    /// 「另存为」里的过滤器。读侧是通用名「DWG 图形文件」，
+    /// 写侧必须点明版本——DWG 的写出固定 R2000（AC1015），
+    /// 与逐版本的 DXF 条目放在一起时，这一条才说明得了会写成什么。
+    QString writeFilter() const override;
+
     /// 可读写的版本范围（界面据此向用户展示，不表示能力受限）
     QString capabilityNote() const override;
 

@@ -35,6 +35,7 @@
 #include <QDropEvent>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QHash>
 #include <QInputDialog>
 #include <QKeyEvent>
 #include <QLabel>
@@ -43,6 +44,8 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPageLayout>
+#include <QPageSize>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPrinter>
@@ -65,6 +68,17 @@ namespace lycad {
 namespace {
 
 constexpr int kMaxMessageLog = 500;
+
+/// 从文件对话框的过滤器里取出扩展名（不含点）：
+/// "AutoCAD 2004 DXF 文件 (*.dxf)" -> "dxf"，"所有文件 (*)" -> ""
+QString suffixOfFilter(const QString& filter)
+{
+    const int start = filter.indexOf(QStringLiteral("(*."));
+    if (start < 0) return QString();
+    const int end = filter.indexOf(QLatin1Char(')'), start + 3);
+    if (end < 0) return QString();
+    return filter.mid(start + 3, end - start - 3);
+}
 
 /// 可拖入的文件扩展名。
 ///
@@ -110,8 +124,6 @@ MainWindow::MainWindow(QWidget* parent)
 
     // 恢复上次的界面与显示设置
     QSettings settings;
-    m_writeOptions.version = settings.value(QStringLiteral("dxf/version"),
-                                            m_writeOptions.version).toString();
     m_lastDirectory = settings.value(QStringLiteral("path/lastDirectory"),
                                      QDir::homePath()).toString();
 
@@ -214,40 +226,14 @@ void MainWindow::createMenus()
 
     QAction* saveAsAction = fileMenu->addAction(QStringLiteral("另存为(&A)…"));
     saveAsAction->setShortcut(QKeySequence::SaveAs);
+    saveAsAction->setToolTip(QStringLiteral("选择格式与路径另存；存为 DXF 时可在此时挑选目标版本"));
     connect(saveAsAction, &QAction::triggered, this, [this] { saveDocumentAs(); });
 
-    QAction* exportAction = fileMenu->addAction(QStringLiteral("导出为其它格式(&E)…"));
-    connect(exportAction, &QAction::triggered, this, [this] { exportDrawing(); });
-
-    fileMenu->addSeparator();
-
-    QAction* dxfVersionAction = fileMenu->addAction(QStringLiteral("DXF 目标版本…"));
-    connect(dxfVersionAction, &QAction::triggered, this, [this] {
-        const QStringList versions = WriteOptions::availableDxfVersions();
-        QStringList labels;
-        for (const QString& v : versions) labels << WriteOptions::versionDisplayName(v);
-
-        bool ok = false;
-        const QString chosen = QInputDialog::getItem(
-            this, QStringLiteral("DXF 目标版本"),
-            QStringLiteral("保存为 DXF 时使用的版本：\n"
-                           "AC1009 (R12) 兼容性最广，但缺 HATCH/SPLINE 等实体，"
-                           "导出时会被降级；\n"
-                           "AC1015 (2000) 起支持全部已建模图元；\n"
-                           "AC1021 (2007) 起文本按 UTF-8 存放，中文不再受代码页限制。"),
-            labels, static_cast<int>(std::max<qsizetype>(0, versions.indexOf(m_writeOptions.version))),
-            false, &ok);
-        if (!ok) return;
-
-        const int index = labels.indexOf(chosen);
-        if (index >= 0) {
-            m_writeOptions.version = versions.at(index);
-            QSettings settings;
-            settings.setValue(QStringLiteral("dxf/version"), m_writeOptions.version);
-            pushMessage(QStringLiteral("DXF 目标版本已设为 %1。")
-                            .arg(WriteOptions::versionDisplayName(m_writeOptions.version)));
-        }
-    });
+    // 「导出」只剩 PDF 一种去向：打印对话框里另有一条 PDF 通路（见 printDocument），
+    // 那条带着纸张/比例/预览，这条是一步到位的快捷出口。
+    QAction* exportAction = fileMenu->addAction(QStringLiteral("导出(&E)…"));
+    exportAction->setToolTip(QStringLiteral("把当前图纸导出为 PDF 文件"));
+    connect(exportAction, &QAction::triggered, this, [this] { exportPdf(); });
 
     fileMenu->addSeparator();
 
@@ -1098,40 +1084,118 @@ bool MainWindow::openFile(const QString& path)
 bool MainWindow::saveDocument()
 {
     if (m_document->filePath().isEmpty()) return saveDocumentAs();
-    return writeToPath(m_document->filePath());
+    // 普通保存不打断流程：DXF 用默认目标版本（AC1032），要换版本走「另存为」
+    return writeToPath(m_document->filePath(), WriteOptions{});
 }
 
 bool MainWindow::saveDocumentAs()
 {
-    const QString filter = CodecRegistry::instance().exportFilters().join(QStringLiteral(";;"));
+    // 另存为的文件类型列表**就是版本选择器**：DXF 一档一条
+    //（「AutoCAD 2004 DXF 文件」…），选哪条就等于选哪个目标版本，
+    // 因此不需要再弹一个「选择版本」的对话框。
+    //
+    // 按版本由旧到新排列，与版本清单同序；默认选中哪一档不看位置，
+    // 而是取 WriteOptions 的默认目标版本（AC1032）——「保存 DXF 默认用 2018」
+    // 与这里选中的是哪一条，必须是同一件事。
+    WriteOptions options;
+    QStringList filters;
+    QHash<QString, QString> versionOfFilter;      // 过滤器原文 -> 目标版本代号
+    QString defaultFilter;
+    for (const QString& version : WriteOptions::availableDxfVersions()) {
+        const QString filter = QStringLiteral("%1 DXF 文件 (*.dxf)")
+                                   .arg(WriteOptions::versionShortName(version));
+        filters << filter;
+        versionOfFilter.insert(filter, version);
+        if (version.compare(options.version, Qt::CaseInsensitive) == 0) defaultFilter = filter;
+    }
+
+    // 其余可写格式（目前是 DWG）与「所有文件」仍由注册表给出——
+    // 格式的中文名归编解码器所有，界面不重复一份。
+    // DXF 那条用逐版本条目替代掉，否则列表里会出现两个都能存 .dxf 的项。
+    for (const QString& filter : CodecRegistry::instance().exportFilters()) {
+        if (!filter.contains(QStringLiteral("(*.dxf)"))) filters << filter;
+    }
+
     const QString suggested = m_document->filePath().isEmpty()
         ? QDir(m_lastDirectory).filePath(QStringLiteral("drawing.dxf"))
         : m_document->filePath();
 
-    QString selectedFilter = CodecRegistry::instance().defaultExportFilter();
+    QString selectedFilter = defaultFilter.isEmpty() ? filters.first() : defaultFilter;
     const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("保存图形文件"), suggested, filter, &selectedFilter);
+        this, QStringLiteral("保存图形文件"), suggested,
+        filters.join(QStringLiteral(";;")), &selectedFilter);
     if (path.isEmpty()) return false;
 
-    // 用户没有输入扩展名时，按所选过滤器补全；DXF 是本软件的默认格式
+    // 用户没有输入扩展名时按所选过滤器补全；选「所有文件」又没写扩展名则按 DXF
     QString finalPath = path;
-    if (QFileInfo(finalPath).suffix().isEmpty()) {
-        finalPath += QStringLiteral(".dxf");
+    QString suffix = QFileInfo(finalPath).suffix().toLower();
+    if (suffix.isEmpty()) {
+        suffix = suffixOfFilter(selectedFilter);
+        if (suffix.isEmpty()) suffix = QStringLiteral("dxf");
+        finalPath += QLatin1Char('.') + suffix;
     }
 
-    return writeToPath(finalPath);
+    // 目标版本只在写 DXF 时才有意义——DWG 的写出版本固定 R2000。
+    // 扩展名以实际路径为准：选了「AutoCAD 2004 DXF 文件」却把名字写成 .dwg 时，
+    // 该走 DWG 写出，版本参数不该影响它。
+    if (suffix == QLatin1String("dxf")) {
+        const QString version = versionOfFilter.value(selectedFilter);
+        if (!version.isEmpty()) options.version = version;
+    }
+
+    return writeToPath(finalPath, options);
 }
 
-bool MainWindow::exportDrawing()
+bool MainWindow::exportPdf()
 {
-    const QString filter = CodecRegistry::instance().exportFilters().join(QStringLiteral(";;"));
-    const QString suggested = QDir(m_lastDirectory).filePath(QStringLiteral("drawing.dxf"));
+    if (!m_document || m_document->entityCount() == 0) {
+        pushMessage(QStringLiteral("图纸为空，没有可导出的内容。"));
+        return false;
+    }
+
+    const QString baseName = m_document->filePath().isEmpty()
+        ? QStringLiteral("drawing")
+        : QFileInfo(m_document->filePath()).completeBaseName();
+    const QString suggested = QDir(m_lastDirectory).filePath(baseName + QStringLiteral(".pdf"));
 
     const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("导出图形文件"), suggested, filter);
+        this, QStringLiteral("导出 PDF"), suggested, QStringLiteral("PDF 文件 (*.pdf)"));
     if (path.isEmpty()) return false;
 
-    return writeToPath(path);
+    QString finalPath = path;
+    if (QFileInfo(finalPath).suffix().isEmpty()) finalPath += QStringLiteral(".pdf");
+
+    return writePdf(finalPath);
+}
+
+bool MainWindow::writePdf(const QString& path)
+{
+    // 纸张与分辨率与打印对话框的默认值一致（A4 横向、600 dpi 封顶），
+    // 出图比例沿用当前设置；绘制走同一个 PlotRenderer，
+    // 因此「打印预览里是什么样，导出的 PDF 就是什么样」。
+    QPrinter printer;
+    printer.setOutputFormat(QPrinter::PdfFormat);
+    printer.setOutputFileName(path);
+    printer.setPageSize(QPageSize(QPageSize::A4));
+    printer.setPageOrientation(QPageLayout::Landscape);
+    printer.setResolution(std::min(printer.resolution(), 600));
+
+    QPainter painter;
+    if (!painter.begin(&printer)) {
+        QMessageBox::warning(this, QStringLiteral("导出 PDF"),
+                             QStringLiteral("无法写入所选文件：%1").arg(path));
+        return false;
+    }
+    renderAllPages(painter, *m_document,
+                   printer.pageLayout().paintRectPixels(printer.resolution()),
+                   printer.resolution() / 25.4, plotOptions(),
+                   [&printer]() { return printer.newPage(); });
+    painter.end();
+
+    m_lastDirectory = QFileInfo(path).absolutePath();
+    QSettings().setValue(QStringLiteral("path/lastDirectory"), m_lastDirectory);
+    pushMessage(QStringLiteral("已导出 PDF：%1").arg(path));
+    return true;
 }
 
 PlotOptions MainWindow::plotOptions() const
@@ -1184,10 +1248,10 @@ void MainWindow::printDocument()
     }
 }
 
-bool MainWindow::writeToPath(const QString& path)
+bool MainWindow::writeToPath(const QString& path, const WriteOptions& options)
 {
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const IoResult result = CadFile::save(path, *m_document, m_writeOptions);
+    const IoResult result = CadFile::save(path, *m_document, options);
     QApplication::restoreOverrideCursor();
 
     reportIoResult(QStringLiteral("保存文件"), result);

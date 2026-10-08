@@ -121,6 +121,13 @@ QStringList DwgCodec::writeExtensions() const
     return { QStringLiteral("dwg") };
 }
 
+QString DwgCodec::writeFilter() const
+{
+    // 写出版本恒为 AC1015（见 write），过滤器名里点明，
+    // 与「另存为」列表中逐版本的 DXF 条目保持同一套说法。
+    return QStringLiteral("AutoCAD 2000 DWG 文件 (*.dwg)");
+}
+
 bool DwgCodec::probe(QIODevice& device) const
 {
     if (!device.isOpen() && !device.open(QIODevice::ReadOnly)) return false;

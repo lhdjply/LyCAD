@@ -63,9 +63,11 @@ private:
     bool openDocument();
     bool saveDocument();
     bool saveDocumentAs();
-    bool exportDrawing();
+    /// 一步到位的 PDF 导出（「导出」菜单项）。带纸张/比例/预览的 PDF 通路在 printDocument
+    bool exportPdf();
     bool loadFromPath(const QString& path);
-    bool writeToPath(const QString& path);
+    bool writeToPath(const QString& path, const WriteOptions& options);
+    bool writePdf(const QString& path);
     bool maybeSaveChanges();
     void reportIoResult(const QString& title, const IoResult& result);
 
@@ -141,7 +143,6 @@ private:
 
     // 文件状态
     QString m_lastDirectory;
-    WriteOptions m_writeOptions;
     QStringList m_messageLog;
 };
 

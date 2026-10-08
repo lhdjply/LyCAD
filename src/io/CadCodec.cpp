@@ -15,21 +15,35 @@ namespace lycad {
 // -----------------------------------------------------------------------------
 namespace {
 
+/// 一档可写出的 DXF 目标版本
+struct DxfVersionInfo {
+    QString code;         ///< "AC1015"：写进文件头 $ACADVER 的值
+    QString displayName;  ///< "AutoCAD 2000 (AC1015)"：消息与提示里的完整名字
+    QString shortName;    ///< "AutoCAD 2000"：另存为的逐版本过滤器里的名字
+};
+
 /// 可写出的 DXF 目标版本，按版本从低到高排列。
 ///
-/// 这张表是**唯一的版本清单**：界面下拉框、`DxfCodec::write` 的归一化、
+/// 这张表是**唯一的版本清单**：界面下拉/过滤器、`DxfCodec::write` 的归一化、
 /// 以及写出端的 DRW::Version 映射都以它为准，新增版本只需改这一处。
 /// 版本代号与 libdxfrw 的 DRW::Version 一一对应（顺序也一致）。
-const std::vector<std::pair<QString, QString>>& dxfVersionTable()
+const std::vector<DxfVersionInfo>& dxfVersionTable()
 {
-    static const std::vector<std::pair<QString, QString>> kTable = {
-        { QStringLiteral("AC1009"), QStringLiteral("AutoCAD R12 (AC1009)") },
-        { QStringLiteral("AC1015"), QStringLiteral("AutoCAD 2000 (AC1015)") },
-        { QStringLiteral("AC1018"), QStringLiteral("AutoCAD 2004 (AC1018)") },
-        { QStringLiteral("AC1021"), QStringLiteral("AutoCAD 2007 (AC1021)") },
-        { QStringLiteral("AC1024"), QStringLiteral("AutoCAD 2010 (AC1024)") },
-        { QStringLiteral("AC1027"), QStringLiteral("AutoCAD 2013 (AC1027)") },
-        { QStringLiteral("AC1032"), QStringLiteral("AutoCAD 2018 (AC1032)") },
+    static const std::vector<DxfVersionInfo> kTable = {
+        { QStringLiteral("AC1009"), QStringLiteral("AutoCAD R12 (AC1009)"),
+          QStringLiteral("AutoCAD R12") },
+        { QStringLiteral("AC1015"), QStringLiteral("AutoCAD 2000 (AC1015)"),
+          QStringLiteral("AutoCAD 2000") },
+        { QStringLiteral("AC1018"), QStringLiteral("AutoCAD 2004 (AC1018)"),
+          QStringLiteral("AutoCAD 2004") },
+        { QStringLiteral("AC1021"), QStringLiteral("AutoCAD 2007 (AC1021)"),
+          QStringLiteral("AutoCAD 2007") },
+        { QStringLiteral("AC1024"), QStringLiteral("AutoCAD 2010 (AC1024)"),
+          QStringLiteral("AutoCAD 2010") },
+        { QStringLiteral("AC1027"), QStringLiteral("AutoCAD 2013 (AC1027)"),
+          QStringLiteral("AutoCAD 2013") },
+        { QStringLiteral("AC1032"), QStringLiteral("AutoCAD 2018 (AC1032)"),
+          QStringLiteral("AutoCAD 2018") },
     };
     return kTable;
 }
@@ -39,7 +53,15 @@ const std::vector<std::pair<QString, QString>>& dxfVersionTable()
 QString WriteOptions::versionDisplayName(const QString& version)
 {
     for (const auto& entry : dxfVersionTable()) {
-        if (entry.first.compare(version, Qt::CaseInsensitive) == 0) return entry.second;
+        if (entry.code.compare(version, Qt::CaseInsensitive) == 0) return entry.displayName;
+    }
+    return version;
+}
+
+QString WriteOptions::versionShortName(const QString& version)
+{
+    for (const auto& entry : dxfVersionTable()) {
+        if (entry.code.compare(version, Qt::CaseInsensitive) == 0) return entry.shortName;
     }
     return version;
 }
@@ -48,7 +70,7 @@ QStringList WriteOptions::availableDxfVersions()
 {
     QStringList versions;
     versions.reserve(static_cast<qsizetype>(dxfVersionTable().size()));
-    for (const auto& entry : dxfVersionTable()) versions << entry.first;
+    for (const auto& entry : dxfVersionTable()) versions << entry.code;
     return versions;
 }
 

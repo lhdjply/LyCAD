@@ -33,11 +33,15 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
+
+#include <functional>
 #include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QGroupBox>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPageLayout>
@@ -103,10 +107,86 @@ bool capture(QApplication& application, QWidget& widget, const QString& path)
     return true;
 }
 
+/// 让保存对话框指向指定路径。
+///
+/// 别用 QFileDialog::selectFile()：目录模型是异步加载的，它设进去的名字会被
+/// 随后的模型重置吃掉——实测 lineEdit 仍是初始名、selectedFiles() 返回的还是
+/// suggested 路径，结果是文件被写到别处（甚至是仓库里的样例文件）。
+/// 直接改文件名输入框最可靠，200 ms / 600 ms 都验证过。
+void pointSaveDialogAt(QFileDialog& dialog, const QString& path)
+{
+    if (auto* edit = dialog.findChild<QLineEdit*>(QStringLiteral("fileNameEdit"))) {
+        edit->setText(path);
+        return;
+    }
+    dialog.selectFile(path);
+}
+
+/// 驱动一次「保存文件」模态流程：trigger 会在文件对话框的嵌套事件循环里阻塞，
+/// 这里用定时器把对话框找出来，交给 inspect 摆好状态；**inspect 返回 true
+///（目标路径确实已经生效）才接受**。
+///
+/// 三个坑都是实测踩出来的，少一个就会出问题：
+///   · **要轮询，不能只等一次**。只查一次的写法一旦早于对话框弹出（或那一刻
+///     恰好有别的模态框浮在上面），就再也没人关它——工具静静挂死在嵌套事件
+///     循环里，没有输出也没有退出码，看起来就是「卡了」。
+///   · **不能用 selectFile()**：目录模型异步加载，它设进去的名字会被模型重置
+///     吃掉，对话框仍指向初始的 suggested 路径（即「当前图纸所在的目录」）——
+///     照此接受就会把文件写进仓库的 sample/，实测确实写进去过。
+///     改成直接改文件名输入框。
+///   · **要等目标路径真的生效再接受**：只看「非空」不够，初始 suggested 的名字
+///     同样非空。所以每轮都重新摆一次状态，并核对当前值是否已等于目标值。
+/// 另配一个兜底定时器：到点仍未收工就强行关掉挡路的模态框，
+/// 宁可让这项检查失败，也不让工具挂住。
+bool driveSaveDialog(QApplication& application, QWidget& context,
+                     const std::function<bool(QFileDialog&)>& inspect,
+                     const std::function<void()>& trigger)
+{
+    bool handled = false;
+
+    QTimer poll;
+    poll.setInterval(50);
+    QObject::connect(&poll, &QTimer::timeout, &context, [&]() {
+        auto* dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
+        if (!dialog) return;
+        if (!inspect(*dialog)) return;                   // 状态还没就绪，下一轮再来
+
+        // accept() 在 QFileDialog 里是 protected，经 QDialog 的公开接口虚调用过去
+        // 才是合法的（走的仍是 QFileDialog 的重载）
+        static_cast<QDialog*>(dialog)->accept();
+        if (!dialog->isVisible()) {
+            handled = true;
+            poll.stop();
+        }
+    });
+    poll.start();
+
+    QTimer watchdog;
+    watchdog.setSingleShot(true);
+    watchdog.setInterval(8000);
+    QObject::connect(&watchdog, &QTimer::timeout, &context, [&]() {
+        auto* blocker = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+        if (!blocker) return;
+        out() << QStringLiteral("  [警告] 保存对话框未能正常接受，强制关闭以免工具挂住")
+              << Qt::endl;
+        blocker->reject();
+    });
+    watchdog.start();
+
+    trigger();
+    poll.stop();
+    watchdog.stop();
+    settle(application, 200);
+    return handled;
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
 {
+    // 文件对话框一律用 Qt 自绘版本：本工具要在离屏环境里**驱动**它们
+    // （找到模态对话框 → 填路径 → 接受），原生对话框是平台的东西，抓不到也点不动。
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, true);
     QApplication application(argc, argv);
     application.setApplicationName(QStringLiteral("LyCAD-Snapshot"));
     application.setOrganizationName(QStringLiteral("LyCAD-Snapshot"));
@@ -743,6 +823,15 @@ int main(int argc, char* argv[])
                         auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
                         if (!dialog) return;
                         restoredDialog = true;
+                        // PDF 输出必须显式指到工具的目录：这个对话框的默认 PDF 路径
+                        // 是「当前图纸所在目录 + 图纸名.pdf」，不指定就会把文件写进
+                        // 仓库的 sample/（实测写过 lycad_sample_2000.dxf.pdf）。
+                        // 工具的产物一律只落在输出目录里。
+                        if (auto* pathEdit = dialog->findChild<QLineEdit*>(
+                                QStringLiteral("printDialog.pdfPath"))) {
+                            pathEdit->setText(
+                                dir.filePath(QStringLiteral("ui_print_restore.pdf")));
+                        }
                         for (QRadioButton* radio : dialog->findChildren<QRadioButton*>()) {
                             if (radio->text().startsWith(QStringLiteral("适应图纸"))) {
                                 radio->click();
@@ -768,6 +857,142 @@ int main(int argc, char* argv[])
                           << Qt::endl;
                     if (!restored || !restoredDialog) ++failures;
                 }
+            }
+        }
+
+        // ---- 快照 2d：文件菜单——另存为挑版本 / 导出 PDF ----
+        //
+        //  盯两条界面约定：
+        //    · DXF 目标版本不再是常驻菜单项，普通保存一律走默认版本，
+        //      版本选择被收进「另存为」流程里（只有 DXF 才问）；
+        //    · 「导出」只剩 PDF 一种去向，且真的能落下一份 PDF。
+        {
+            const auto findAction = [&window](const QString& text) -> QAction* {
+                for (QAction* action : window.findChildren<QAction*>()) {
+                    if (action->text() == text) return action;
+                }
+                return nullptr;
+            };
+
+            QAction* saveAsAction = findAction(QStringLiteral("另存为(&A)…"));
+            QAction* exportAction = findAction(QStringLiteral("导出(&E)…"));
+            QAction* staleExport = findAction(QStringLiteral("导出为其它格式(&E)…"));
+            QAction* staleVersion = findAction(QStringLiteral("DXF 目标版本…"));
+
+            const bool menuOk = saveAsAction && exportAction && !staleExport && !staleVersion;
+            out() << QStringLiteral("  文件菜单：另存为 %1，导出 %2，"
+                                    "旧「导出为其它格式」%3，旧「DXF 目标版本」%4 → %5")
+                         .arg(saveAsAction ? QStringLiteral("有") : QStringLiteral("缺失"),
+                              exportAction ? QStringLiteral("有") : QStringLiteral("缺失"),
+                              staleExport ? QStringLiteral("仍在") : QStringLiteral("已移除"),
+                              staleVersion ? QStringLiteral("仍在") : QStringLiteral("已移除"),
+                              menuOk ? QStringLiteral("就绪") : QStringLiteral("不符"))
+                  << Qt::endl;
+            if (!menuOk) ++failures;
+
+            // ---- 导出 PDF：动作 → 文件对话框 → 渲染 → 落盘 ----
+            if (exportAction) {
+                // 比较与填写都用绝对路径：QFileDialog 返回的是绝对路径
+                const QString pdfPath =
+                    QFileInfo(dir.filePath(QStringLiteral("ui_export.pdf"))).absoluteFilePath();
+                QFile::remove(pdfPath);
+
+                const bool handled = driveSaveDialog(
+                    application, window,
+                    [&](QFileDialog& dialog) {
+                        pointSaveDialogAt(dialog, pdfPath);
+                        // 目标路径真的生效才放行；否则宁可让看门狗兜底，
+                        // 也不能接受对话框默认的目录（那是当前图纸所在处，
+                        // 会把 PDF 写进仓库的 sample/ —— 实测发生过）
+                        return dialog.selectedFiles().value(0) == pdfPath;
+                    },
+                    [&]() { exportAction->trigger(); });
+
+                QFile pdf(pdfPath);
+                const bool opened = pdf.open(QIODevice::ReadOnly);
+                const QByteArray head = opened ? pdf.read(5) : QByteArray();
+                const qint64 size = opened ? pdf.size() : 0;
+                // 真 PDF 的判据：有 %PDF- 魔数，且不是只有个空壳
+                const bool pdfOk =
+                    handled && opened && head == QByteArray("%PDF-") && size > 1024;
+                out() << QStringLiteral("  导出 PDF：对话框 %1，落盘 %2 字节，头部「%3」→ %4")
+                             .arg(handled ? QStringLiteral("已驱动")
+                                          : QStringLiteral("未出现"),
+                                  QString::number(size), QString::fromLatin1(head),
+                                  pdfOk ? QStringLiteral("正常") : QStringLiteral("异常"))
+                      << Qt::endl;
+                if (!pdfOk) ++failures;
+            }
+
+            // ---- 另存为：文件类型列表就是版本选择器 ----
+            if (saveAsAction) {
+                const QString dxfPath =
+                    QFileInfo(dir.filePath(QStringLiteral("ui_saveas.dxf"))).absoluteFilePath();
+                QFile::remove(dxfPath);
+
+                QStringList typeItems;
+                QString defaultType;
+
+                const bool handled = driveSaveDialog(
+                    application, window,
+                    [&](QFileDialog& dialog) {
+                        // 过滤器只在第一轮记录：后面几轮是我们自己改的，不是初值
+                        if (typeItems.isEmpty()) {
+                            typeItems = dialog.nameFilters();
+                            defaultType = dialog.selectedNameFilter();
+                        }
+
+                        // 挑一个非默认的版本档，回头核对文件头里写的到底是不是它
+                        const QString target =
+                            QStringLiteral("AutoCAD 2004 DXF 文件 (*.dxf)");
+                        if (typeItems.contains(target)
+                            && dialog.selectedNameFilter() != target) {
+                            dialog.selectNameFilter(target);
+                        }
+                        pointSaveDialogAt(dialog, dxfPath);
+                        return dialog.selectedNameFilter() == target
+                               && dialog.selectedFiles().value(0) == dxfPath;
+                    },
+                    [&]() { saveAsAction->trigger(); });
+
+                QString acadVer;
+                QFile saved(dxfPath);
+                if (saved.open(QIODevice::ReadOnly)) {
+                    const QList<QByteArray> lines = saved.readAll().split('\n');
+                    for (int i = 0; i + 3 < lines.size(); ++i) {
+                        if (lines.at(i).trimmed() == "9"
+                            && lines.at(i + 1).trimmed() == "$ACADVER"
+                            && lines.at(i + 2).trimmed() == "1") {
+                            acadVer = QString::fromLatin1(lines.at(i + 3).trimmed());
+                            break;
+                        }
+                    }
+                }
+
+                // 逐版本一条 DXF 条目（共七档），默认选中最新档（AC1032），
+                // 且选中的那一档必须真的写进文件头的 $ACADVER；
+                // DWG 条目也要点明写出版本（恒为 R2000），否则与逐版本的
+                // DXF 条目并列时说明不了会写成什么
+                int dxfTypes = 0;
+                bool dwgNamed = false;
+                for (const QString& type : typeItems) {
+                    if (type.contains(QStringLiteral("(*.dxf)"))) ++dxfTypes;
+                    if (type == QStringLiteral("AutoCAD 2000 DWG 文件 (*.dwg)")) dwgNamed = true;
+                }
+                const bool versionOk = handled && dxfTypes == 7 && dwgNamed
+                                       && defaultType.startsWith(QStringLiteral("AutoCAD 2018"))
+                                       && acadVer == QStringLiteral("AC1018");
+                out() << QStringLiteral("  另存为：类型列表 DXF %1 档，DWG 条目 %2，默认「%3」，"
+                                        "选 2004 后文件头为 %4 → %5")
+                             .arg(dxfTypes)
+                             .arg(dwgNamed ? QStringLiteral("AutoCAD 2000 DWG 文件")
+                                           : QStringLiteral("未按版本命名"),
+                                  defaultType.isEmpty() ? QStringLiteral("未弹出对话框")
+                                                        : defaultType,
+                                  acadVer.isEmpty() ? QStringLiteral("未写出") : acadVer,
+                                  versionOk ? QStringLiteral("正常") : QStringLiteral("异常"))
+                      << Qt::endl;
+                if (!versionOk) ++failures;
             }
         }
 
