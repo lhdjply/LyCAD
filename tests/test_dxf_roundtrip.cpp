@@ -220,6 +220,35 @@ void TestDxfRoundTrip::buildSampleDocument(Document& document)
         diametric->setDimLinePoint(Point2D(60.0, 95.0));
         diametric->setLayerName(QStringLiteral("中心线"));
         document.addEntity(std::move(diametric));
+
+        // 坐标标注：X 型（70 的 bit6 置位）。少了这一位，往返一次就变成量 Y 坐标。
+        auto ordinateX = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Ordinate);
+        ordinateX->setFirstPoint(Point2D(-40.0, 25.0));       // 被测点 (13)
+        ordinateX->setSecondPoint(Point2D(-10.0, -5.0));      // 引线端点 (14)
+        ordinateX->setDimLinePoint(Point2D(0.0, 0.0));        // 坐标基准 (10)
+        ordinateX->setTextPoint(Point2D(-12.0, -8.0));        // 文字位置 (11)
+        ordinateX->setOrdinateXType(true);
+        ordinateX->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(ordinateX));
+
+        // 坐标标注：Y 型
+        auto ordinateY = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Ordinate);
+        ordinateY->setFirstPoint(Point2D(-40.0, 25.0));
+        ordinateY->setSecondPoint(Point2D(-65.0, 55.0));
+        ordinateY->setDimLinePoint(Point2D(0.0, 0.0));
+        ordinateY->setOrdinateXType(false);
+        ordinateY->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(ordinateY));
+
+        // 弧长标注：被测弧半径 50，包角 90°；尺寸弧半径由 10 组码决定（这里 30）
+        auto arcLength = std::make_unique<DimensionEntity>(DimensionEntity::DimType::ArcLength);
+        arcLength->setArcCenter(Point2D(-200.0, -200.0));
+        arcLength->setArcAngles(0.0, kHalfPi);
+        arcLength->setFirstPoint(Point2D(-150.0, -200.0));    // 弧心 + 50·(1,0)
+        arcLength->setSecondPoint(Point2D(-200.0, -150.0));   // 弧心 + 50·(0,1)
+        arcLength->setDimLinePoint(Point2D(-170.0, -200.0));  // 弧心 + 30·(1,0)
+        arcLength->setLayerName(QStringLiteral("中心线"));
+        document.addEntity(std::move(arcLength));
     }
 
     document.endBatchLoad();
@@ -365,6 +394,17 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
                                     + formatDxfDouble(dim.dimLinePoint().y),
                                 formatDxfDouble(radToDeg(dim.rotation()), 6))
                            .arg(dim.textOverride());
+            // 坐标标注的 X/Y 型、弧长标注的弧心与起止参数都不能在往返中丢掉：
+            // 丢掉前者会把「量 X」变成「量 Y」，丢掉后者尺寸弧会整段跑偏。
+            if (dim.dimType() == DimensionEntity::DimType::Ordinate) {
+                geometry += QStringLiteral(";AX=%1").arg(dim.isOrdinateXType() ? 1 : 0);
+            } else if (dim.dimType() == DimensionEntity::DimType::ArcLength) {
+                geometry += QStringLiteral(";C%1;A%2,%3")
+                                .arg(formatDxfDouble(dim.arcCenter().x) + QLatin1Char(',')
+                                         + formatDxfDouble(dim.arcCenter().y),
+                                     formatDxfDouble(dim.arcStartAngle(), 9),
+                                     formatDxfDouble(dim.arcEndAngle(), 9));
+            }
             break;
         }
         case EntityType::Insert: {

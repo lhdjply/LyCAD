@@ -9,8 +9,10 @@
         <file alias="color.svg">icons/color.svg</file>
         <file alias="copy.svg">icons/copy.svg</file>
         <file alias="dim-aligned.svg">icons/dim-aligned.svg</file>
+        <file alias="dim-arc.svg">icons/dim-arc.svg</file>
         <file alias="dim-diameter.svg">icons/dim-diameter.svg</file>
         <file alias="dim-linear.svg">icons/dim-linear.svg</file>
+        <file alias="dim-ordinate.svg">icons/dim-ordinate.svg</file>
         <file alias="dim-radius.svg">icons/dim-radius.svg</file>
         <file alias="ellipse.svg">icons/ellipse.svg</file>
         <file alias="erase.svg">icons/erase.svg</file>

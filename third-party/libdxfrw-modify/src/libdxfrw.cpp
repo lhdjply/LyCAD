@@ -12,6 +12,7 @@
 
 
 #include "libdxfrw.h"
+#include <cstdio>
 #include <fstream>
 #include <algorithm>
 #include <sstream>
@@ -1424,6 +1425,54 @@ bool dxfRW::writeMText(DRW_MText *ent){
     return true;
 }
 
+// 弧长标注与 DIMENSION 共用 AcDbDimension 段，但**实体名不同**（ARC_DIMENSION），
+// 且多一段 AcDbArcDimension。组码 70 的 bit3（值 8）表示弧长类型。
+bool dxfRW::writeArcDimension(DRW_DimArc *ent){
+    writer->writeString(0, "ARC_DIMENSION");
+    writeEntity(ent);
+    writer->writeString(100, "AcDbDimension");
+    if (!ent->getName().empty()) {
+        writer->writeString(2, ent->getName());
+    }
+    writer->writeDouble(10, ent->getDefPoint().x);
+    writer->writeDouble(20, ent->getDefPoint().y);
+    writer->writeDouble(30, ent->getDefPoint().z);
+    writer->writeDouble(11, ent->getTextPoint().x);
+    writer->writeDouble(21, ent->getTextPoint().y);
+    writer->writeDouble(31, ent->getTextPoint().z);
+    if (!(ent->type & 32)) ent->type = ent->type + 32;   // bit5：文字在默认位置
+    writer->writeInt16(70, ent->type);
+    writer->writeDouble(42, ent->getMeasurement());
+    if (!ent->getText().empty()) writer->writeUtf8String(1, ent->getText());
+    writer->writeInt16(71, ent->getAlign());
+    writer->writeUtf8String(3, ent->getStyle().empty() ? "Standard" : ent->getStyle());
+    writer->writeDouble(210, ent->getExtrusion().x);
+    writer->writeDouble(220, ent->getExtrusion().y);
+    writer->writeDouble(230, ent->getExtrusion().z);
+
+    writer->writeString(100, "AcDbArcDimension");
+    writer->writeDouble(13, ent->xline1Pt.x);
+    writer->writeDouble(23, ent->xline1Pt.y);
+    writer->writeDouble(33, ent->xline1Pt.z);
+    writer->writeDouble(14, ent->xline2Pt.x);
+    writer->writeDouble(24, ent->xline2Pt.y);
+    writer->writeDouble(34, ent->xline2Pt.z);
+    writer->writeDouble(15, ent->centerPt.x);
+    writer->writeDouble(25, ent->centerPt.y);
+    writer->writeDouble(35, ent->centerPt.z);
+    writer->writeInt16(70, ent->subFlags);
+    writer->writeDouble(40, ent->arcStartParam);         // 弧度
+    writer->writeDouble(41, ent->arcEndParam);           // 弧度
+    writer->writeInt16(71, ent->hasLeader);
+    writer->writeDouble(16, ent->leader1Pt.x);
+    writer->writeDouble(26, ent->leader1Pt.y);
+    writer->writeDouble(36, ent->leader1Pt.z);
+    writer->writeDouble(17, ent->leader2Pt.x);
+    writer->writeDouble(27, ent->leader2Pt.y);
+    writer->writeDouble(37, ent->leader2Pt.z);
+    return true;
+}
+
 bool dxfRW::writeViewport(DRW_Viewport *ent) {
     writer->writeString(0, "VIEWPORT");
     writeEntity(ent);
@@ -2391,6 +2440,8 @@ bool dxfRW::processEntities(bool isblock) {
             processImage();
         } else if (nextentity == "DIMENSION") {
             processDimension();
+        } else if (nextentity == "ARC_DIMENSION") {
+            processArcDimension();
         } else if (nextentity == "LEADER") {
             processLeader();
         } else if (nextentity == "RAY") {
@@ -2400,6 +2451,7 @@ bool dxfRW::processEntities(bool isblock) {
         } else {
             // 未知实体类型交给应用层计数上报（不认识的类型不能静默吞掉）；
             // 只在 processEntities 上报，processObjects 里的对象不是图元。
+            fprintf(stderr, "[UNKNOWN] %s (code=%d)\n", nextentity.c_str(), code);
             iface->addUnknownEntity(nextentity);
             if (reader->readRec(&code)){
                 if (code == 0)
@@ -2953,7 +3005,36 @@ bool dxfRW::processDimension() {
                 DRW_DimOrdinate d(dim);
                 iface->addDimOrdinate(&d);
                 break; }
+            case 8: {
+                // 弧长标注的另一种写法：DIMENSION 的 70 置 bit3。
+                // 实测 AutoCAD 写的是独立的 ARC_DIMENSION 实体，这里只是兜底。
+                DRW_DimArc d(dim);
+                iface->addDimArc(&d);
+                break; }
             }
+            return true;  //found new entity or ENDSEC, terminate
+        }
+        default:
+            dim.parseCode(code, reader);
+            break;
+        }
+    }
+    return true;
+}
+
+// 弧长标注：DXF 里是一个扩展实体，名字直接就是 ARC_DIMENSION。
+// 它与 DIMENSION 共用 AcDbDimension 段，另加 AcDbArcDimension 段。
+bool dxfRW::processArcDimension() {
+    DRW_DBG("dxfRW::processArcDimension");
+    int code;
+    DRW_DimArc dim;
+    while (reader->readRec(&code)) {
+        DRW_DBG(code); DRW_DBG("\n");
+        switch (code) {
+        case 0: {
+            nextentity = reader->getString();
+            DRW_DBG(nextentity); DRW_DBG("\n");
+            iface->addDimArc(&dim);
             return true;  //found new entity or ENDSEC, terminate
         }
         default:

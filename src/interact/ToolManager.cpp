@@ -147,6 +147,14 @@ void ToolManager::registerBuiltinTools()
                  QStringLiteral("直径标注（拾取圆或圆弧）"),
                  [](ToolContext& c) { return std::make_unique<DrawDimDiametricTool>(c); });
 
+    registerTool(QStringLiteral("DIMORDINATE"), { QStringLiteral("DIMORD"), QStringLiteral("DOR") },
+                 QStringLiteral("坐标标注（被测点 + 引线端点，度量轴由引线方向定）"),
+                 [](ToolContext& c) { return std::make_unique<DrawDimOrdinateTool>(c); });
+
+    registerTool(QStringLiteral("DIMARC"), { QStringLiteral("DAR") },
+                 QStringLiteral("弧长标注（拾取圆弧 + 尺寸弧位置）"),
+                 [](ToolContext& c) { return std::make_unique<DrawDimArcTool>(c); });
+
     // ---- 编辑 ---------------------------------------------------------------
     registerTool(QStringLiteral("MOVE"), { QStringLiteral("M") },
                  QStringLiteral("移动对象"),

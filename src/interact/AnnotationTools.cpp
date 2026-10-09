@@ -68,6 +68,43 @@ void drawRubberBand(QPainter& painter, const EntityRenderer::DrawContext& contex
     painter.restore();
 }
 
+/// 坐标标注量 X 还是量 Y：AutoCAD 按**引线方向**定——引线偏竖直时量 X 坐标，
+/// 偏水平时量 Y 坐标。这与显示几何同源（引线是沿测量轴的垂直方向拉开的）。
+bool ordinateMeasuresX(const Point2D& feature, const Point2D& leader)
+{
+    const Vector2D d = leader - feature;
+    return std::abs(d.y) >= std::abs(d.x);
+}
+
+/// 在文档中拾取距离光标最近的**圆弧**（弧长标注的目标）。
+/// 只认 ARC：圆没有起止参数，也就没有弧长可量。
+bool pickArcGeometry(const ToolContext& context, const Point2D& worldPos,
+                     Point2D* center, double* radius, double* startAngle, double* endAngle)
+{
+    if (!context.document) return false;
+
+    const double tolerance = context.pickToleranceWorld() * 2.0;
+    double best = tolerance;
+    bool found = false;
+
+    for (EntityId id : context.document->drawOrder()) {
+        const Entity* entity = context.document->entity(id);
+        if (!entity || entity->type() != EntityType::Arc) continue;
+
+        const double d = entity->distanceTo(worldPos);
+        if (d > best) continue;
+
+        const auto* arc = static_cast<const ArcEntity*>(entity);
+        *center = arc->center();
+        *radius = arc->radius();
+        *startAngle = arc->startAngle();
+        *endAngle = arc->endAngle();
+        best = d;
+        found = true;
+    }
+    return found;
+}
+
 /// 在文档中拾取距离光标最近的圆或圆弧（半径/直径标注的目标）
 bool pickCircleGeometry(const ToolContext& context, const Point2D& worldPos,
                         Point2D* center, Point2D* onCircle, double* radius)
@@ -601,5 +638,244 @@ QString DrawDimDiametricTool::prompt() const
 }
 QString DrawDimDiametricTool::pickPrompt() const
 { return QStringLiteral("选择圆或圆弧:"); }
+
+// =============================================================================
+//  坐标标注：被测点 -> 引线端点
+// =============================================================================
+QString DrawDimOrdinateTool::name() const { return QStringLiteral("DIMORDINATE"); }
+QString DrawDimOrdinateTool::displayName() const { return QStringLiteral("坐标标注"); }
+QString DrawDimOrdinateTool::prompt() const
+{
+    return m_feature ? QStringLiteral("指定引线端点:")
+                     : QStringLiteral("指定点坐标:");
+}
+
+bool DrawDimOrdinateTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    const ResolvedPoint resolved = resolve(event.worldPos, m_feature);
+    if (!m_feature) {
+        m_feature = resolved.position;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    m_cursor = resolved;
+    m_hasCursor = true;
+    commit();
+    return true;
+}
+
+bool DrawDimOrdinateTool::mouseMove(const CanvasEvent& event)
+{
+    m_cursor = resolve(event.worldPos, m_feature);
+    m_hasCursor = true;
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None
+                            ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                            : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawDimOrdinateTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_U && m_feature) {
+        m_feature.reset();
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+    return false;
+}
+
+bool DrawDimOrdinateTool::textInput(const QString& text)
+{
+    if (!m_feature) {
+        // 第一步也可以直接键入坐标
+        const std::optional<Point2D> point = parsePointInput(text, std::nullopt);
+        if (!point) return true;
+        m_feature = *point;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    const std::optional<Point2D> point = parsePointInput(text, m_feature);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawDimOrdinateTool::paintOverlay(QPainter& painter,
+                                       const EntityRenderer::DrawContext& context)
+{
+    if (!m_feature || !m_hasCursor) return;
+
+    DimensionEntity temp(DimensionEntity::DimType::Ordinate);
+    temp.setFirstPoint(*m_feature);
+    temp.setSecondPoint(m_cursor.position);
+    temp.setDimLinePoint(Point2D(0.0, 0.0));    // 以 WCS 原点为坐标基准
+    temp.setOrdinateXType(ordinateMeasuresX(*m_feature, m_cursor.position));
+    drawPreviewEntity(painter, temp, context);
+}
+
+void DrawDimOrdinateTool::commit()
+{
+    if (!ctx().document || !m_feature) return;
+
+    const Point2D feature = *m_feature;
+    const Point2D leader = m_cursor.position;
+
+    auto dim = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Ordinate);
+    dim->setFirstPoint(feature);                // 13 被测点
+    dim->setSecondPoint(leader);                // 14 引线端点
+    dim->setDimLinePoint(Point2D(0.0, 0.0));    // 10 坐标基准 = WCS 原点
+    dim->setOrdinateXType(ordinateMeasuresX(feature, leader));
+    applyDefaults(*dim, ctx());
+
+    const QString text = dim->displayText();
+    const bool xType = dim->isOrdinateXType();
+    ctx().document->addEntity(std::move(dim));
+
+    message(QStringLiteral("已创建坐标标注：%1 坐标 %2")
+                .arg(xType ? QStringLiteral("X") : QStringLiteral("Y"), text));
+    m_feature.reset();
+    notifyPromptChanged();
+}
+
+void DrawDimOrdinateTool::deactivate()
+{
+    m_feature.reset();
+    m_hasCursor = false;
+}
+
+// =============================================================================
+//  弧长标注：拾取圆弧 -> 指定尺寸弧位置
+// =============================================================================
+QString DrawDimArcTool::name() const { return QStringLiteral("DIMARC"); }
+QString DrawDimArcTool::displayName() const { return QStringLiteral("弧长标注"); }
+QString DrawDimArcTool::prompt() const
+{
+    return m_hasArc ? QStringLiteral("指定尺寸弧位置:")
+                    : QStringLiteral("选择圆弧:");
+}
+
+bool DrawDimArcTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    if (!m_hasArc) {
+        Point2D center;
+        double radius = 0.0;
+        double startAngle = 0.0;
+        double endAngle = 0.0;
+        if (!pickArcGeometry(ctx(), event.worldPos, &center, &radius, &startAngle, &endAngle)) {
+            message(QStringLiteral("未拾取到圆弧——弧长标注只能量圆弧，请点圆弧的边线附近。"));
+            return true;
+        }
+        m_center = center;
+        m_radius = radius;
+        m_startAngle = startAngle;
+        m_endAngle = endAngle;
+        m_hasArc = true;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    const ResolvedPoint resolved = resolve(event.worldPos, m_center);
+    m_cursor = resolved;
+    m_hasCursor = true;
+    commit();
+    return true;
+}
+
+bool DrawDimArcTool::mouseMove(const CanvasEvent& event)
+{
+    m_cursor = resolve(event.worldPos, m_hasArc ? std::optional<Point2D>(m_center) : std::nullopt);
+    m_hasCursor = true;
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None
+                            ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                            : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawDimArcTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_U && m_hasArc) {
+        m_hasArc = false;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+    return false;
+}
+
+bool DrawDimArcTool::textInput(const QString& text)
+{
+    if (!m_hasArc) return false;
+
+    const std::optional<Point2D> point = parsePointInput(text, m_center);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawDimArcTool::paintOverlay(QPainter& painter,
+                                  const EntityRenderer::DrawContext& context)
+{
+    if (!m_hasArc || !m_hasCursor) return;
+
+    // 尺寸弧半径取自光标到弧心的距离；与弧心重合时没有可画的半径，不预览
+    if (m_cursor.position.distanceTo(m_center) <= kGeomTol) return;
+
+    DimensionEntity temp(DimensionEntity::DimType::ArcLength);
+    temp.setArcCenter(m_center);
+    temp.setArcAngles(m_startAngle, m_endAngle);
+    temp.setFirstPoint(m_center + Vector2D(std::cos(m_startAngle), std::sin(m_startAngle)) * m_radius);
+    temp.setSecondPoint(m_center + Vector2D(std::cos(m_endAngle), std::sin(m_endAngle)) * m_radius);
+    temp.setDimLinePoint(m_cursor.position);
+    drawPreviewEntity(painter, temp, context);
+}
+
+void DrawDimArcTool::commit()
+{
+    if (!ctx().document || !m_hasArc) return;
+
+    // 尺寸弧半径 = 光标到弧心的距离。为 0 时尺寸弧退化成一个点，几何算不出来
+    if (m_cursor.position.distanceTo(m_center) <= kGeomTol) {
+        message(QStringLiteral("尺寸弧位置不能落在弧心上，请离开圆心再点一次。"));
+        return;
+    }
+
+    auto dim = std::make_unique<DimensionEntity>(DimensionEntity::DimType::ArcLength);
+    dim->setArcCenter(m_center);                // 15 弧心
+    dim->setArcAngles(m_startAngle, m_endAngle); // 40/41 起止参数（弧度）
+    dim->setFirstPoint(m_center + Vector2D(std::cos(m_startAngle), std::sin(m_startAngle)) * m_radius);
+    dim->setSecondPoint(m_center + Vector2D(std::cos(m_endAngle), std::sin(m_endAngle)) * m_radius);
+    dim->setDimLinePoint(m_cursor.position);    // 10 尺寸弧经过的点
+    applyDefaults(*dim, ctx());
+
+    const double value = dim->measurement();
+    ctx().document->addEntity(std::move(dim));
+
+    message(QStringLiteral("已创建弧长标注：%1").arg(formatLength(value)));
+    m_hasArc = false;
+}
+
+void DrawDimArcTool::deactivate()
+{
+    m_hasArc = false;
+    m_hasCursor = false;
+}
 
 } // namespace lycad

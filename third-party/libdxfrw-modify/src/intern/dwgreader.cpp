@@ -1122,6 +1122,13 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
             e.style = findTableName(DRW::DIMSTYLE, e.dimStyleH.ref);
             intfa.addDimDiametric(&e);
             break; }
+        // 弧长标注：类对象（ARC_DIMENSION），类型号由 DRW_Class::toDwgType 约定
+        case 200: {
+            DRW_DimArc e;
+            ENTRY_PARSE(e)
+            e.style = findTableName(DRW::DIMSTYLE, e.dimStyleH.ref);
+            intfa.addDimArc(&e);
+            break; }
         case 45: {
             DRW_Leader e;
             ENTRY_PARSE(e)

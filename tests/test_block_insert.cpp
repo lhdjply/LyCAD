@@ -11,6 +11,7 @@
 #include "core/Block.h"
 #include "core/CircleEntity.h"
 #include "core/Document.h"
+#include "core/DimensionEntity.h"
 #include "core/InsertEntity.h"
 #include "core/LineEntity.h"
 #include "core/TextEntity.h"
@@ -159,6 +160,7 @@ private slots:
 
     void realSampleIfProvided();
     void dwgAndDxfAgreeOnBlocks();
+    void dwgAndDxfAgreeOnDimensions();
 
 private:
     QTemporaryDir m_dir;
@@ -848,6 +850,100 @@ void TestBlockInsert::realSampleIfProvided()
 //  DWG 的属性对象（ATTRIB）是独立对象、且专属字段只能靠与 DXF 对照来定标，
 //  这条对照测试就是那把尺子：只设 LYCAD_BLOCK_DWG_SAMPLE 时会自动找同名的 .dxf。
 // -----------------------------------------------------------------------------
+// 同一张图的 DXF 与 DWG 必须给出**同一批标注**：类型、定义点、测量值、
+// 弧长标注的弧心与起止参数、坐标标注的 X/Y 型，一项都不能差。
+// 这条测试是为「DXF 里读得出的弧长/坐标标注，DWG 里却整条消失」而写的回归。
+void TestBlockInsert::dwgAndDxfAgreeOnDimensions()
+{
+    const QByteArray dwgSample = qgetenv("LYCAD_BLOCK_DWG_SAMPLE");
+    if (dwgSample.isEmpty()) {
+        QSKIP("未设置 LYCAD_BLOCK_DWG_SAMPLE，跳过 DWG/DXF 标注对照测试");
+    }
+
+    const QString dwgPath = QString::fromLocal8Bit(dwgSample);
+    if (!QFileInfo::exists(dwgPath)) {
+        QSKIP("LYCAD_BLOCK_DWG_SAMPLE 指向的文件不存在");
+    }
+
+    QString dxfPath = QString::fromLocal8Bit(qgetenv("LYCAD_BLOCK_DXF_SAMPLE"));
+    if (dxfPath.isEmpty()) {
+        dxfPath = dwgPath;
+        dxfPath.chop(4);
+        dxfPath += QStringLiteral(".dxf");
+    }
+    if (!QFileInfo::exists(dxfPath)) {
+        QSKIP("找不到与 DWG 同名的 DXF，跳过对照");
+    }
+
+    Document fromDwg;
+    Document fromDxf;
+    QVERIFY2(CadFile::load(dwgPath, fromDwg).ok, "DWG 读取失败");
+    QVERIFY2(CadFile::load(dxfPath, fromDxf).ok, "DXF 读取失败");
+
+    struct DimInfo {
+        DimensionEntity::DimType type;
+        Point2D first;
+        Point2D second;
+        Point2D dimLine;
+        double  measurement = 0.0;
+        bool    ordinateX = true;
+        Point2D arcCenter;
+        double  arcStart = 0.0;
+        double  arcEnd = 0.0;
+    };
+    auto collect = [](const Document& doc) {
+        std::vector<DimInfo> out;
+        for (EntityId id : doc.drawOrder()) {
+            const auto* dim = dynamic_cast<const DimensionEntity*>(doc.entity(id));
+            if (!dim) continue;
+            DimInfo info;
+            info.type        = dim->dimType();
+            info.first       = dim->firstPoint();
+            info.second      = dim->secondPoint();
+            info.dimLine     = dim->dimLinePoint();
+            info.measurement = dim->measurement();
+            info.ordinateX   = dim->isOrdinateXType();
+            info.arcCenter   = dim->arcCenter();
+            info.arcStart    = dim->arcStartAngle();
+            info.arcEnd      = dim->arcEndAngle();
+            out.push_back(info);
+        }
+        return out;
+    };
+
+    const std::vector<DimInfo> dwgDims = collect(fromDwg);
+    const std::vector<DimInfo> dxfDims = collect(fromDxf);
+
+    QCOMPARE(dwgDims.size(), dxfDims.size());
+    QVERIFY(!dxfDims.empty());
+
+    // 同类型必须出现同一批，且逐字段一致
+    for (const DimInfo& expected : dxfDims) {
+        bool matched = false;
+        for (const DimInfo& actual : dwgDims) {
+            if (actual.type != expected.type) continue;
+            if (actual.first.distanceTo(expected.first) > 1e-6) continue;
+
+            matched = true;
+            QVERIFY(actual.second.distanceTo(expected.second) < 1e-6);
+            QVERIFY(actual.dimLine.distanceTo(expected.dimLine) < 1e-6);
+            QVERIFY(std::abs(actual.measurement - expected.measurement) < 1e-6);
+
+            if (expected.type == DimensionEntity::DimType::Ordinate) {
+                // X 型/Y 型搞反，量出来的数会从 X 坐标变成 Y 坐标
+                QCOMPARE(actual.ordinateX, expected.ordinateX);
+            }
+            if (expected.type == DimensionEntity::DimType::ArcLength) {
+                QVERIFY(actual.arcCenter.distanceTo(expected.arcCenter) < 1e-6);
+                QVERIFY(std::abs(actual.arcStart - expected.arcStart) < 1e-9);
+                QVERIFY(std::abs(actual.arcEnd - expected.arcEnd) < 1e-9);
+            }
+            break;
+        }
+        QVERIFY2(matched, "DWG 里缺少 DXF 中存在的标注");
+    }
+}
+
 void TestBlockInsert::dwgAndDxfAgreeOnBlocks()
 {
     const QByteArray dwgSample = qgetenv("LYCAD_BLOCK_DWG_SAMPLE");

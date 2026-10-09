@@ -268,7 +268,13 @@ bool DRW_Entity::parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer* strBu
     duint8 graphFlag = buf->getBit(); //B
     DRW_DBG(" graphFlag: "); DRW_DBG(graphFlag); DRW_DBG("\n");
     if (graphFlag) {
-        duint32 graphDataSize = buf->getRawLong32();  //RL 32bits
+        // 预览/代理图形数据的长度：R13–2007 是 RL（32 位定长），**2010 起是 BLL**
+        //（变长比特编码）。照 RL 读会让后面的字段整体错位、对象解析失败——
+        // 只有带预览数据的对象才会踩到，而类对象（如 ARC_DIMENSION）几乎都带，
+        // 症状就是「某个类对象整体读不出来」。
+        duint32 graphDataSize = (version > DRW::AC1021)
+                                    ? static_cast<duint32>(buf->getBitLongLong())
+                                    : buf->getRawLong32();
         DRW_DBG("graphData in bytes: "); DRW_DBG(graphDataSize); DRW_DBG("\n");
 // RLZ: TODO
         //skip graphData bytes
@@ -1426,6 +1432,90 @@ bool DRW_Attrib::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     return buf->isGood();
 }
 
+// ---------------------------------------------------------------------------
+//  DRW_DimArc（DXF: ARC_DIMENSION / AcDbArcDimension）
+//
+//  这个实体里有两组同号组码，靠子类标记区分：
+//    AcDbDimension 段的 70 = 标注类型、71 = 文字附着点
+//    AcDbArcDimension 段的 70 = 子类标志位、71 = 是否有引线
+//  因此必须先看到 `100 AcDbArcDimension` 才能按弧长语义解释它们——照抄
+//  DRW_Dimension::parseCode 会把子类标志位当成标注类型，类型与文字附着点全错。
+// ---------------------------------------------------------------------------
+void DRW_DimArc::parseCode(int code, dxfReader *reader){
+    if (code == 100) {
+        const std::string subclass = reader->getString();
+        inArcSubclass = (subclass == "AcDbArcDimension");
+        return;
+    }
+
+    if (inArcSubclass) {
+        switch (code) {
+        case 13: xline1Pt.x = reader->getDouble(); return;
+        case 23: xline1Pt.y = reader->getDouble(); return;
+        case 33: xline1Pt.z = reader->getDouble(); return;
+        case 14: xline2Pt.x = reader->getDouble(); return;
+        case 24: xline2Pt.y = reader->getDouble(); return;
+        case 34: xline2Pt.z = reader->getDouble(); return;
+        case 15: centerPt.x = reader->getDouble(); return;
+        case 25: centerPt.y = reader->getDouble(); return;
+        case 35: centerPt.z = reader->getDouble(); return;
+        case 16: leader1Pt.x = reader->getDouble(); return;
+        case 26: leader1Pt.y = reader->getDouble(); return;
+        case 36: leader1Pt.z = reader->getDouble(); return;
+        case 17: leader2Pt.x = reader->getDouble(); return;
+        case 27: leader2Pt.y = reader->getDouble(); return;
+        case 37: leader2Pt.z = reader->getDouble(); return;
+        case 40: arcStartParam = reader->getDouble(); return;   /* 弧度 */
+        case 41: arcEndParam = reader->getDouble(); return;     /* 弧度 */
+        case 70: subFlags = reader->getInt32(); return;
+        case 71: hasLeader = reader->getInt32(); return;
+        default: break;
+        }
+    }
+    DRW_Dimension::parseCode(code, reader);
+}
+
+bool DRW_DimArc::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
+    dwgBuffer sBuff = *buf;
+    dwgBuffer *sBuf = buf;
+    if (version > DRW::AC1018) {//2007+
+        sBuf = &sBuff; //separate buffer for strings
+    }
+    if (!DRW_Entity::parseDwg(version, buf, sBuf, bs)) {
+        DRW_DBG("ARC_DIMENSION: 公共实体数据解析失败\n");
+        return false;
+    }
+    if (!DRW_Dimension::parseDwg(version, buf, sBuf)) {
+        DRW_DBG("ARC_DIMENSION: DIMENSION 公共段解析失败\n");
+        return false;
+    }
+
+    // 弧长标注在 DWG 里是**类对象**（CLASSES 段里登记 ARC_DIMENSION），字段序
+    // 依 libredwg dwg2.spec 的 ARC_DIMENSION（非 DXF 分支）：
+    //   定义点 3BD → 界线 1 3BD → 界线 2 3BD → 弧心 3BD → is_partial 位
+    //   → 起参数 BD → 止参数 BD → has_leader 位 → 引线 1 3BD → 引线 2 3BD
+    // 注意定义点（DXF 10 组码）在 DWG 里是放在子类段里的，与其它标注同构。
+    setDefPoint(buf->get3BitDouble());
+    xline1Pt = buf->get3BitDouble();
+    xline2Pt = buf->get3BitDouble();
+    centerPt = buf->get3BitDouble();
+    subFlags = buf->getBit();
+    arcStartParam = buf->getBitDouble();
+    arcEndParam = buf->getBitDouble();
+    hasLeader = buf->getBit();
+    leader1Pt = buf->get3BitDouble();
+    leader2Pt = buf->get3BitDouble();
+
+    // DWG 的 70 存的是「非默认位置」等标志位，类型由类对象本身决定；
+    // 补上 bit3 让上层与 DXF 路径看到同一个类型值。
+    type |= 8;
+
+    if (!DRW_Entity::parseDwgEntHandle(version, buf)) return false;
+    dimStyleH = buf->getHandle();   /* H 5 DIMSTYLE */
+    blockH = buf->getHandle();      /* H 5 匿名几何块 */
+    return buf->isGood();
+}
+
 bool DRW_Text::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     dwgBuffer sBuff = *buf;
     dwgBuffer *sBuf = buf;
@@ -2561,6 +2651,10 @@ bool DRW_Dimension::parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer *sB
         linesty = buf->getBitShort();
         linefactor = buf->getBitDouble();
         double actMeas = buf->getBitDouble();
+        // 42 组码（实测值）此前只读进局部变量就丢了，DRW_Dimension::measurement
+        // 永远是默认 0——上层拿不到「图里写的测量值」。坐标标注要靠它判断
+        // X 型/Y 型（两条读取路径的标志位不在同一处），所以必须存下来。
+        measurement = actMeas;
         DRW_DBG("\n  actMeas_code42: "); DRW_DBG(actMeas);
         if (version > DRW::AC1018) { //2007+
             bool unk = buf->getBit();

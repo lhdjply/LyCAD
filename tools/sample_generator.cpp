@@ -227,7 +227,9 @@ void buildSample(Document& document)
         document.addEntity(std::move(hatch.clone()));
     }
 
-    // 尺寸标注：对齐 / 线性 / 半径 / 直径 各一个
+    // 尺寸标注：对齐 / 线性 / 半径 / 直径 / 坐标 / 弧长 各一个。
+    // 六类都要有：它们的定义点与 DXF 组码的对应各不相同（坐标标注量的是轴向坐标、
+    // 弧长标注的 10 组码是尺寸弧而不是被测弧），少一类就少一条外部工具能验的路径。
     {
         auto aligned = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Aligned);
         aligned->setFirstPoint(Point2D(0.0, 0.0));
@@ -260,6 +262,33 @@ void buildSample(Document& document)
         diametric->setDimLinePoint(Point2D(120.0, 88.0));    // 文字位置
         diametric->setLayerName(QStringLiteral("标注"));
         document.addEntity(std::move(diametric));
+
+        // 坐标标注：量图框右上角的 X 坐标。引线偏竖直 ⇒ 量 X 轴（AutoCAD 的口径），
+        // 坐标基准是 WCS 原点（10 组码为 0,0），所以测量值就是 180。
+        auto ordinate = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Ordinate);
+        ordinate->setFirstPoint(Point2D(180.0, 110.0));      // 13 被测点：图框右上角
+        ordinate->setSecondPoint(Point2D(196.0, 136.0));     // 14 引线端点（偏竖直）
+        ordinate->setDimLinePoint(Point2D(0.0, 0.0));        // 10 坐标基准
+        ordinate->setOrdinateXType(true);
+        ordinate->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(ordinate));
+
+        // 弧长标注：量上面那条圆弧（圆心 120,55 半径 25，30° 逆时针扫到 250°）。
+        // 尺寸弧半径由 10 组码单独给出（这里 32，比被测弧大），与被测弧半径无关——
+        // 外部工具若把两者混为一谈，读出来的弧长就会不对。
+        auto arcLength = std::make_unique<DimensionEntity>(DimensionEntity::DimType::ArcLength);
+        const Point2D arcCenter(120.0, 55.0);
+        const double measuredRadius = 25.0;
+        arcLength->setArcCenter(arcCenter);                  // 15 弧心
+        arcLength->setArcAngles(degToRad(30.0), degToRad(250.0));   // 40/41 弧度
+        arcLength->setFirstPoint(arcCenter + Vector2D(measuredRadius * std::cos(degToRad(30.0)),
+                                                       measuredRadius * std::sin(degToRad(30.0))));
+        arcLength->setSecondPoint(arcCenter + Vector2D(measuredRadius * std::cos(degToRad(250.0)),
+                                                        measuredRadius * std::sin(degToRad(250.0))));
+        arcLength->setDimLinePoint(arcCenter + Vector2D(32.0 * std::cos(degToRad(140.0)),
+                                                        32.0 * std::sin(degToRad(140.0))));
+        arcLength->setLayerName(QStringLiteral("标注"));
+        document.addEntity(std::move(arcLength));
     }
 
     // 无界直线：构造线（双向）与射线（单向）。

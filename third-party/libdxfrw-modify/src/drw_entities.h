@@ -44,6 +44,7 @@ namespace DRW {
         DIMANGULAR,
         DIMANGULAR3P,
         DIMORDINATE,
+        DIMARC,
         ELLIPSE,
         HATCH,
 //        HELIX,
@@ -1476,6 +1477,77 @@ protected:
     virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs=0);
 };
 
+
+//! Class to handle arc length dimension entries (DXF: ARC_DIMENSION / DIMARC)
+/*!
+ *  AutoCAD 2008 起新增的「弧长标注」。它不是标准的 DIMENSION 子类写法，
+ *  而是 DXF 里的一个扩展实体 ARC_DIMENSION（子类 AcDbArcDimension），
+ *  DWG 里对应一个类对象。除 DIMENSION 的公共定义点外，还多出：
+ *
+ *    13,23,33  被测弧起点（界线 1 的原点）      xline1Pt
+ *    14,24,34  被测弧终点（界线 2 的原点）      xline2Pt
+ *    15,25,35  弧心                            centerPt
+ *    70        子类标志位（注意与 AcDbDimension 的同号组码不同义）
+ *    40,41     被测弧的起止参数（**弧度**）
+ *    71        是否有引线
+ *    16,26,36  引线 1 端点
+ *    17,27,37  引线 2 端点
+ *  @author LyCAD
+ */
+class DRW_DimArc : public DRW_Dimension {
+    SETENTFRIENDS
+public:
+    DRW_DimArc() {
+        eType = DRW::DIMARC;
+        arcStartParam = arcEndParam = 0.0;
+        subFlags = 0;
+        hasLeader = 0;
+        inArcSubclass = false;
+    }
+    DRW_DimArc(const DRW_Dimension& d): DRW_Dimension(d) {
+        eType = DRW::DIMARC;
+        arcStartParam = arcEndParam = 0.0;
+        subFlags = 0;
+        hasLeader = 0;
+        inArcSubclass = false;
+    }
+
+    DRW_Coord getXLine1Point() const {return xline1Pt;}    /*!< 被测弧起点，code 13 */
+    void setXLine1Point(const DRW_Coord p) {xline1Pt = p;}
+    DRW_Coord getXLine2Point() const {return xline2Pt;}    /*!< 被测弧终点，code 14 */
+    void setXLine2Point(const DRW_Coord p) {xline2Pt = p;}
+    DRW_Coord getCenterPoint() const {return centerPt;}    /*!< 弧心，code 15 */
+    void setCenterPoint(const DRW_Coord p) {centerPt = p;}
+    DRW_Coord getLeader1Point() const {return leader1Pt;}  /*!< 引线 1 端点，code 16 */
+    void setLeader1Point(const DRW_Coord p) {leader1Pt = p;}
+    DRW_Coord getLeader2Point() const {return leader2Pt;}  /*!< 引线 2 端点，code 17 */
+    void setLeader2Point(const DRW_Coord p) {leader2Pt = p;}
+
+    double getArcStartParam() const {return arcStartParam;} /*!< 起参数（弧度），code 40 */
+    void setArcStartParam(const double v) {arcStartParam = v;}
+    double getArcEndParam() const {return arcEndParam;}     /*!< 止参数（弧度），code 41 */
+    void setArcEndParam(const double v) {arcEndParam = v;}
+    int getSubFlags() const {return subFlags;}              /*!< 子类标志位 */
+    void setSubFlags(const int v) {subFlags = v;}
+    int getHasLeader() const {return hasLeader;}
+    void setHasLeader(const int v) {hasLeader = v;}
+
+protected:
+    void parseCode(int code, dxfReader *reader);
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs=0);
+
+public:
+    DRW_Coord xline1Pt;    /*!< 13/23/33 被测弧起点 */
+    DRW_Coord xline2Pt;    /*!< 14/24/34 被测弧终点 */
+    DRW_Coord centerPt;    /*!< 15/25/35 弧心 */
+    DRW_Coord leader1Pt;   /*!< 16/26/36 */
+    DRW_Coord leader2Pt;   /*!< 17/27/37 */
+    double arcStartParam;  /*!< 40 起参数（弧度） */
+    double arcEndParam;    /*!< 41 止参数（弧度） */
+    int subFlags;          /*!< 子类 70 */
+    int hasLeader;         /*!< 子类 71 */
+    bool inArcSubclass;    /*!< 是否已进入 AcDbArcDimension 子类（决定 70/71 的含义） */
+};
 
 //! Class to handle leader entity
 /*!

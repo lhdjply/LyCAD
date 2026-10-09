@@ -290,6 +290,8 @@ void MainWindow::createMenus()
         { "线性标注(&N)", "DIMLINEAR" },
         { "半径标注(&U)", "DIMRADIUS" },
         { "直径标注(&M)", "DIMDIAMETER" },
+        { "坐标标注(&D)", "DIMORDINATE" },
+        { "弧长标注(&A)", "DIMARC" },
     };
     for (const DrawEntry& entry : kDrawEntries) {
         if (!entry.label) {
@@ -553,6 +555,13 @@ void MainWindow::createRibbon()
         panel->addSmallCommand(QStringLiteral("dim-diameter"), QStringLiteral("直径标注"),
                                QStringLiteral("DIMDIAMETER"),
                                QStringLiteral("直径标注 (DIMDIAMETER / DDI)"));
+        panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("dim-ordinate"), QStringLiteral("坐标标注"),
+                               QStringLiteral("DIMORDINATE"),
+                               QStringLiteral("坐标标注 (DIMORDINATE / DIMORD)"));
+        panel->addSmallCommand(QStringLiteral("dim-arc"), QStringLiteral("弧长标注"),
+                               QStringLiteral("DIMARC"),
+                               QStringLiteral("弧长标注 (DIMARC / DAR)"));
     }
 
     // ---- 图层 ----

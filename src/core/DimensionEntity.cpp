@@ -21,6 +21,14 @@ constexpr double kExtensionBeyond = 0.30;
 constexpr double kTextOffset = 0.62;
 /// 箭头宽高比
 constexpr double kArrowWidthRatio = 1.0 / 3.0;
+/// 坐标标注：界线起点与被测点之间的间隙（单位：字高）
+constexpr double kOrdinateGap = 0.25;
+/// 坐标标注：折点相对引线端点的回退量（单位：字高）
+constexpr double kOrdinateLanding = 2.0;
+/// 坐标标注：落地小段的长度（单位：字高）
+constexpr double kOrdinateTick = 8.25;
+/// 弧长标注：弧长符号（尺寸弧上的小半圆）半径（单位：字高）
+constexpr double kArcSymbolRadius = 0.933;
 
 /// 估算显示文字宽度（单位：字高）。
 /// 与 TextEntity 的字宽估算保持同一比例（渲染 em = h/0.72），
@@ -58,6 +66,8 @@ QString dimTypeDisplayName(DimensionEntity::DimType type)
     case DimensionEntity::DimType::Aligned:   return QStringLiteral("对齐");
     case DimensionEntity::DimType::Diametric: return QStringLiteral("直径");
     case DimensionEntity::DimType::Radial:    return QStringLiteral("半径");
+    case DimensionEntity::DimType::Ordinate:  return QStringLiteral("坐标");
+    case DimensionEntity::DimType::ArcLength: return QStringLiteral("弧长");
     }
     return QStringLiteral("标注");
 }
@@ -93,6 +103,16 @@ double DimensionEntity::measurement() const noexcept
     case DimType::Radial:
     case DimType::Diametric:
         return m_firstPoint.distanceTo(m_secondPoint);
+    case DimType::Ordinate: {
+        // 坐标标注量的是**被测点在某一轴上的坐标**（相对基准原点 10），
+        // 不是两点距离——这就是它与线性标注的本质区别。
+        const Point2D base = m_dimLinePoint;
+        return m_ordinateX ? (m_firstPoint.x - base.x) : (m_firstPoint.y - base.y);
+    }
+    case DimType::ArcLength: {
+        const double radius = measuredArcRadius();
+        return radius * angleSpanCcw(m_arcStartAngle, m_arcEndAngle);
+    }
     }
     return 0.0;
 }
@@ -102,6 +122,8 @@ QString DimensionEntity::autoText() const
     switch (m_dimType) {
     case DimType::Radial:    return QStringLiteral("R%1").arg(formatLength(measurement()));
     case DimType::Diametric: return QStringLiteral("%1%2").arg(QChar(0x00D8), formatLength(measurement()));
+    // 坐标标注写的就是坐标值本身（formatLength 保留负号与小数位）
+    case DimType::Ordinate:  return formatLength(measurement());
     default:                 return formatLength(measurement());
     }
 }
@@ -225,6 +247,109 @@ DimensionEntity::Geometry DimensionEntity::geometry() const
         geo.textAnchor = anchor;
         break;
     }
+
+    case DimType::Ordinate: {
+        // 坐标标注的形状是一个「L」：沿测量轴从被测点拉出的界线、一段落地线、
+        // 以及端点处的短竖线。**没有箭头**——AutoCAD 的坐标标注就是不带箭头的。
+        // 尺寸比例（间隙/回退/落地段）实测自一张 AutoCAD 图纸的匿名几何块
+        //（*D6：0.25h / 2h / 8.25h，h 为字高），与该块里的三条 LINE 逐点吻合。
+        const Point2D feature = m_firstPoint;
+        const Point2D leader = m_secondPoint;
+
+        const Vector2D axis = m_ordinateX ? Vector2D(1.0, 0.0) : Vector2D(0.0, 1.0);
+        const Vector2D perp = m_ordinateX ? Vector2D(0.0, 1.0) : Vector2D(1.0, 0.0);
+
+        const double dv = dot(leader - feature, perp);
+        const double du = dot(leader - feature, axis);
+        const double side = (dv >= 0.0) ? 1.0 : -1.0;   // 引线朝哪一侧拉开
+
+        const double gap = kOrdinateGap * m_textHeight;
+        const double landing = kOrdinateLanding * m_textHeight;
+        const double tick = kOrdinateTick * m_textHeight;
+
+        const Point2D start = feature + perp * (side * gap);
+        const Point2D elbow = feature + perp * (dv - side * landing);
+        const Point2D landEnd = elbow + axis * du;
+        const Point2D tickEnd = landEnd + perp * (side * tick);
+
+        geo.segments.emplace_back(start, elbow);
+        geo.segments.emplace_back(elbow, landEnd);
+        geo.segments.emplace_back(landEnd, tickEnd);
+
+        // 文字贴在落地小段旁；文件给了 11 组码就用它，否则取小段中点
+        geo.textAngle = 0.0;
+        geo.textAnchor = m_textPoint.value_or(
+            Point2D((landEnd.x + tickEnd.x) * 0.5, (landEnd.y + tickEnd.y) * 0.5));
+        break;
+    }
+
+    case DimType::ArcLength: {
+        // 弧长标注：一段与被测弧同心的**尺寸弧**，两端各有界线连回被测弧，
+        // 弧端各一个沿切线方向的箭头，弧的中点处放弧长符号与测量文字。
+        //
+        // 尺寸参数实测自图纸的匿名几何块（*D4）：
+        //   · 尺寸弧半径 = |弧心 - 10 组码定义点|（不是被测弧半径）
+        //   · 尺寸弧两端各内缩「一个箭头长」对应的圆心角（箭头要占位置）
+        //   · 界线是径向的，从被测弧内侧一点点画到尺寸弧内侧
+        const Point2D center = m_arcCenter;
+        const double rMeasured = measuredArcRadius();
+        const double rDim = center.distanceTo(m_dimLinePoint);
+
+        if (rDim <= kGeomTol || rMeasured <= kGeomTol) {
+            geo.valid = false;
+            return geo;
+        }
+
+        const double span = angleSpanCcw(m_arcStartAngle, m_arcEndAngle);
+        const double inset = std::min(arrowLen / rDim, span * 0.4);
+        const double arcStart = m_arcStartAngle + inset;
+        const double arcEnd = m_arcEndAngle - inset;
+        const double arcSpan = angleSpanCcw(arcStart, arcEnd);
+
+        // 尺寸弧离散成线段：留 0.2% 的矢高余量，屏幕上已看不出折线
+        const int steps = std::max(8, segmentCountForArc(rDim, arcSpan, rDim * 0.002));
+        for (int i = 0; i < steps; ++i) {
+            const double a0 = arcStart + arcSpan * (static_cast<double>(i) / steps);
+            const double a1 = arcStart + arcSpan * (static_cast<double>(i + 1) / steps);
+            geo.segments.emplace_back(center + Vector2D(std::cos(a0), std::sin(a0)) * rDim,
+                                      center + Vector2D(std::cos(a1), std::sin(a1)) * rDim);
+        }
+
+        // 两端界线：径向，留出与被测弧的间隙，并让开尺寸弧上的箭头
+        const double endGap = kExtensionGap * m_textHeight;
+        auto addRadial = [&](double angle) {
+            const Vector2D dir(std::cos(angle), std::sin(angle));
+            const Point2D from = center + dir * (rMeasured - endGap);
+            const Point2D to = center + dir * (rDim - arrowLen * 0.5);
+            if (from.distanceTo(to) > kGeomTol) geo.segments.emplace_back(from, to);
+        };
+        addRadial(m_arcStartAngle);
+        addRadial(m_arcEndAngle);
+
+        // 箭头沿切线，两个都指向弧的中段（与实测的实心三角形方向一致）
+        const Vector2D tangentStart(-std::sin(arcStart), std::cos(arcStart));
+        const Vector2D tangentEnd(-std::sin(arcEnd), std::cos(arcEnd));
+        addArrow(center + Vector2D(std::cos(arcStart), std::sin(arcStart)) * rDim, -tangentStart);
+        addArrow(center + Vector2D(std::cos(arcEnd), std::sin(arcEnd)) * rDim, tangentEnd);
+
+        // 文字方向取尺寸弧中点的切线方向（实测：MTEXT 的 11 组码正是这个方向）
+        const double midAngle = normalizeAngle(arcStart + arcSpan * 0.5);
+        geo.textAngle = readableAngle(midAngle + kHalfPi);
+        geo.textAnchor = m_textPoint.value_or(center + Vector2D(std::cos(midAngle), std::sin(midAngle))
+                                                          * (rDim + m_textHeight * 0.8));
+
+        // 弧长符号：尺寸弧中点上的一个小半圆，朝弧内侧张开
+        const Point2D symbolCenter = center + Vector2D(std::cos(midAngle), std::sin(midAngle)) * rDim;
+        const double symbolRadius = kArcSymbolRadius * m_textHeight;
+        constexpr int kSymbolSteps = 12;
+        for (int i = 0; i < kSymbolSteps; ++i) {
+            const double a0 = midAngle + kHalfPi + kPi * (static_cast<double>(i) / kSymbolSteps);
+            const double a1 = midAngle + kHalfPi + kPi * (static_cast<double>(i + 1) / kSymbolSteps);
+            geo.segments.emplace_back(symbolCenter + Vector2D(std::cos(a0), std::sin(a0)) * symbolRadius,
+                                      symbolCenter + Vector2D(std::cos(a1), std::sin(a1)) * symbolRadius);
+        }
+        break;
+    }
     }
 
     return geo;
@@ -240,6 +365,11 @@ std::unique_ptr<Entity> DimensionEntity::clone() const
     copy->m_rotation      = m_rotation;
     copy->m_textOverride  = m_textOverride;
     copy->m_textHeight    = m_textHeight;
+    copy->m_ordinateX     = m_ordinateX;
+    copy->m_arcCenter     = m_arcCenter;
+    copy->m_arcStartAngle = m_arcStartAngle;
+    copy->m_arcEndAngle   = m_arcEndAngle;
+    copy->m_textPoint     = m_textPoint;
     copyCommonPropertiesTo(*copy);
     return copy;
 }
@@ -305,11 +435,29 @@ void DimensionEntity::transform(const Transform2D& t)
     m_firstPoint = t.apply(m_firstPoint);
     m_secondPoint = t.apply(m_secondPoint);
     m_dimLinePoint = t.apply(m_dimLinePoint);
+    m_arcCenter = t.apply(m_arcCenter);
+    if (m_textPoint) m_textPoint = t.apply(*m_textPoint);
 
-    if (t.isSimilarity()) {
-        m_textHeight *= t.uniformScale();
-        if (m_dimType == DimType::Linear) {
-            m_rotation = normalizeAngle(m_rotation + t.rotationAngle());
+    if (!t.isSimilarity()) return;
+
+    m_textHeight *= t.uniformScale();
+    if (m_dimType == DimType::Linear) {
+        m_rotation = normalizeAngle(m_rotation + t.rotationAngle());
+    }
+    if (m_dimType == DimType::ArcLength) {
+        // 弧参数要跟着方向走。直接加旋转角只在「旋转 + 等比缩放」下成立；
+        // 镜像是唯一会反转绕行方向的变换，此时起止参数必须互换，否则尺寸弧
+        // 会从另一侧绕过去。
+        const Vector2D startDir(std::cos(m_arcStartAngle), std::sin(m_arcStartAngle));
+        const Vector2D endDir(std::cos(m_arcEndAngle), std::sin(m_arcEndAngle));
+        const double newStart = t.applyVector(startDir).angle();
+        const double newEnd = t.applyVector(endDir).angle();
+        if (t.isMirroring()) {
+            m_arcStartAngle = normalizeAngle(newEnd);
+            m_arcEndAngle = normalizeAngle(newStart);
+        } else {
+            m_arcStartAngle = normalizeAngle(newStart);
+            m_arcEndAngle = normalizeAngle(newEnd);
         }
     }
 }
@@ -321,12 +469,14 @@ double DimensionEntity::length() const
 
 std::vector<Point2D> DimensionEntity::snapPoints() const
 {
-    return { m_firstPoint, m_secondPoint, m_dimLinePoint };
+    std::vector<Point2D> points { m_firstPoint, m_secondPoint, m_dimLinePoint };
+    if (m_textPoint) points.push_back(*m_textPoint);
+    return points;
 }
 
 std::vector<Point2D> DimensionEntity::gripPoints() const
 {
-    return { m_firstPoint, m_secondPoint, m_dimLinePoint };
+    return snapPoints();
 }
 
 bool DimensionEntity::moveGrip(std::size_t index, const Point2D& newPos)
@@ -335,6 +485,10 @@ bool DimensionEntity::moveGrip(std::size_t index, const Point2D& newPos)
     case 0: m_firstPoint = newPos; return true;
     case 1: m_secondPoint = newPos; return true;
     case 2: m_dimLinePoint = newPos; return true;
+    case 3:
+        if (!m_textPoint) return false;
+        m_textPoint = newPos;
+        return true;
     default: return false;
     }
 }
@@ -374,6 +528,15 @@ QString DimensionEntity::geometrySummary() const
                             formatLength(m_textHeight));
     if (m_dimType == DimType::Linear) {
         text += QStringLiteral("\n尺寸线角度: %1").arg(formatAngle(m_rotation));
+    }
+    if (m_dimType == DimType::Ordinate) {
+        text += QStringLiteral("\n度量轴: %1").arg(m_ordinateX ? QStringLiteral("X") : QStringLiteral("Y"));
+    }
+    if (m_dimType == DimType::ArcLength) {
+        text += QStringLiteral("\n弧心: %1\n被测弧半径: %2\n包角: %3")
+                    .arg(formatPoint(m_arcCenter),
+                         formatLength(measuredArcRadius()),
+                         formatAngle(angleSpanCcw(m_arcStartAngle, m_arcEndAngle)));
     }
     text += QStringLiteral("\n文字位置: %1").arg(formatPoint(geo.textAnchor));
     return text;

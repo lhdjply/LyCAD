@@ -74,6 +74,8 @@ public:
     DRW_ImageDef *writeImage(DRW_Image *ent, std::string name);
     bool writeLeader(DRW_Leader *ent);
     bool writeDimension(DRW_Dimension *ent);
+    /// 弧长标注：DXF 里是独立实体 ARC_DIMENSION（不是 DIMENSION 的变体）
+    bool writeArcDimension(DRW_DimArc *ent);
     void setEllipseParts(int parts){elParts = parts;} /*!< set parts munber when convert ellipse to polyline */
 
 private:
@@ -119,6 +121,8 @@ private:
     bool processImage();
     bool processImageDef();
     bool processDimension();
+    /// 弧长标注（DXF 扩展实体 ARC_DIMENSION）
+    bool processArcDimension();
     bool processLeader();
 
 //    bool writeHeader();

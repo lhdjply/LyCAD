@@ -338,11 +338,17 @@ dint32 dwgBuffer::getBitLong(){
 
 /**Reads compresed 64 bits Int (max. 56 + 3 bits) little-endian order, returns a unsigned 64 bits (BLL) **/
 duint64 dwgBuffer::getBitLongLong(){
+    // BLL：先 3 位「字节数」，再按**小端**读该长度的字节。
+    //
+    // 这里原来按大端拼。DWG 里所有多字节整数都是小端（libredwg 的 bit_read_BLL
+    // 用 bit_read_RS/RL，同样小端），大端拼接会把 2 字节的长度读反：
+    // 实测某个类对象（ARC_DIMENSION）的预览数据长度 1412（0x0584）被读成
+    // 33797（0x8405），导致其后的字段整体错位、整个对象解析失败——
+    // 凡是带代理图形/预览数据的对象都会踩，而类对象几乎都带。
     dint8 b = get3Bits();
-    duint64 ret=0;
-    for (duint8 i=0; i<b; i++){
-        ret = ret << 8;
-        ret |= getRawChar8();
+    duint64 ret = 0;
+    for (duint8 i = 0; i < b; ++i) {
+        ret |= static_cast<duint64>(getRawChar8()) << (8 * i);
     }
     return ret;
 }

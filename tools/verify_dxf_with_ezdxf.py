@@ -100,8 +100,8 @@ def verify(path: Path, expected_version: str):
     poly_type = "LWPOLYLINE"
     expected_types = {
         "LWPOLYLINE": 3, "LINE": 4, "CIRCLE": 2, "ARC": 1, "ELLIPSE": 2,
-        "SPLINE": 1, "HATCH": 1, "POINT": 1, "TEXT": 2, "DIMENSION": 4,
-        "XLINE": 1, "RAY": 1,
+        "SPLINE": 1, "HATCH": 1, "POINT": 1, "TEXT": 2, "DIMENSION": 5,
+        "ARC_DIMENSION": 1, "XLINE": 1, "RAY": 1,
     }
 
     total = sum(expected_types.values())
@@ -249,11 +249,18 @@ def verify(path: Path, expected_version: str):
             check(got == expected, f"填充边界顶点集合不符: {sorted(got)}")
 
     # ---- 尺寸标注 ----
+    # 坐标标注是 DIMENSION + AcDbOrdinateDimension 子类；弧长标注不是 DIMENSION
+    # 的变体，而是 DXF 的**扩展实体** ARC_DIMENSION（子类 AcDbArcDimension），
+    # 因此要单独查一次。两者都是 DIMARC/DIMORDINATE 的原生表达，不能被降级成
+    # 别的实体，也不能凭空少掉。
     dims = modelspace.query("DIMENSION")
-    check(len(dims) == 4, f"DIMENSION 数应为 4，实际 {len(dims)}")
+    check(len(dims) == 5, f"DIMENSION 数应为 5，实际 {len(dims)}")
     subtypes = sorted(d.dxf.dimtype & 7 for d in dims)
-    check(subtypes == [0, 1, 3, 4],
-          f"标注类型集合应为 线性/对齐/直径/半径，实际 {subtypes}")
+    check(subtypes == [0, 1, 3, 4, 6],
+          f"标注类型集合应为 线性/对齐/直径/半径/坐标，实际 {subtypes}")
+
+    arc_dims = modelspace.query("ARC_DIMENSION")
+    check(len(arc_dims) == 1, f"ARC_DIMENSION 数应为 1，实际 {len(arc_dims)}")
 
     for d in dims:
         subtype = d.dxf.dimtype & 7
@@ -297,6 +304,39 @@ def verify(path: Path, expected_version: str):
                            d.dxf.defpoint4.y - d.dxf.defpoint.y)
             check(close(r, 50.0), f"直径标注两定义点距离应为 50，实际 {r}")
             check(close(measurement, 50.0), f"直径标注测量值应为 50，实际 {measurement}")
+        elif subtype == 6:    # 坐标（X 型：引线偏竖直 ⇒ 量 X 坐标）
+            check(bool(d.dxf.dimtype & 64), "坐标标注应为 X 型（70 的 bit6 置位）")
+            feat = d.dxf.defpoint2      # 13 被测点
+            lead = d.dxf.defpoint3      # 14 引线端点
+            base = d.dxf.defpoint       # 10 坐标基准
+            check(close(feat.x, 180.0) and close(feat.y, 110.0),
+                  f"坐标标注被测点错误: {feat}")
+            check(close(lead.x, 196.0) and close(lead.y, 136.0),
+                  f"坐标标注引线端点错误: {lead}")
+            check(close(base.x, 0.0) and close(base.y, 0.0),
+                  f"坐标标注基准应为 WCS 原点，实际 {base}")
+            check(close(measurement, 180.0, 1e-6),
+                  f"坐标标注测量值应为被测点 X 坐标 180，实际 {measurement}")
+
+    # ---- 弧长标注：量的是圆弧的弧长（半径 × 包角），不是弦长 ----
+    for d in arc_dims:
+        # 被测弧：圆心 (120,55)、半径 25、30° 逆时针扫到 250° ⇒ 弧长 95.9931
+        check(close(measurement, 25.0 * math.radians(220.0), 1e-4),
+              f"弧长标注测量值应为 95.9931，实际 {measurement}")
+
+        block_name = getattr(d.dxf, "geometry", None)
+        check(bool(block_name) and block_name in doc.blocks,
+              f"弧长标注的几何块 {block_name!r} 应存在于 BLOCKS 区")
+        if block_name and block_name in doc.blocks:
+            block_entities = list(doc.blocks.get(block_name))
+            check(len(block_entities) >= 3,
+                  f"几何块 {block_name} 内容过少: {len(block_entities)} 个实体")
+            check(any(e.dxftype() == "TEXT" for e in block_entities),
+                  f"几何块 {block_name} 缺少测量文字")
+            check(any(e.dxftype() == "SOLID" for e in block_entities),
+                  f"几何块 {block_name} 缺少箭头 (SOLID)")
+            check(any(e.dxftype() == "ARC" for e in block_entities),
+                  f"几何块 {block_name} 缺少尺寸弧")
 
     # ---- 回写再读：验证 ezdxf 能无损重写我们的文件 ----
     # 回写产物一律落在临时目录：sample/ 是纳入版本管理的参考图纸目录，

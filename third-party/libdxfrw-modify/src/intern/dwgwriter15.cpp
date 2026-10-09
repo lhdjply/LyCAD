@@ -60,6 +60,7 @@ enum : std::uint16_t {
     kArc           = 0x11,
     kCircle        = 0x12,
     kLine          = 0x13,
+    kDimOrdinate   = 0x14,  // 坐标标注（DIMENSION_ORDINATE）
     kDimLinear     = 0x15,
     kDimAligned    = 0x16,
     kDimRadial     = 0x19,
@@ -98,6 +99,7 @@ constexpr std::uint16_t kClassDictWdf     = 500;   // AcDbDictionaryWithDefault
 constexpr std::uint16_t kClassPlaceholder = 501;   // AcDbPlaceHolder
 constexpr std::uint16_t kClassLayout      = 502;   // AcDbLayout
 constexpr std::uint16_t kClassDictVar     = 503;   // AcDbDictionaryVar
+constexpr std::uint16_t kClassArcDim      = 504;   // AcDbArcDimension（弧长标注）
 
 constexpr std::uint8_t kHcAbsolute = 5;     // 句柄码 5：硬指针（绝对）
 constexpr std::uint8_t kHcSoftPtr  = 4;     // 句柄码 4：软指针（绝对）——实体/控制对象属主
@@ -381,6 +383,31 @@ struct dwgW::Private
     }
 
     /// 厚度/挤出（R2000 风格的可省略编码）
+    void writeDimensionCommon(ObjBuilder& b, DRW_Dimension& ent)
+    {
+        // 拉伸方向这里是普通 3BD，没有公共实体数据那种「默认标志位」
+        const DRW_Coord ext = ent.getExtrusion();
+        b.w.write3BD(ext.x, ext.y, ext.z);
+        const DRW_Coord tp = ent.getTextPoint();
+        b.w.write2RD(tp.x, tp.y);           // 文字中点 (11)
+        b.w.writeBD(tp.z);                  // 文字高程 (31)
+        // flag1 位语义（与读取端对偶）：bit0=文字处于默认位置（读取端据此清除
+        // DXF 70 的 bit7），bit1=引用几何块（读取端还原 bit5，R13 起恒置位）。
+        // 低 3 位的标注子类型由对象类型决定，不在此字节内。
+        b.w.writeRC(0x03);
+        b.w.writeT(ent.getText(), codec);   // 用户文字 (1)
+        b.w.writeBD(0.0);                   // 文字旋转 (53)
+        b.w.writeBD(0.0);                   // 水平方向 (51)
+        b.w.write3BD(1.0, 1.0, 1.0);        // 插入比例（AutoCAD 实测写 (1,1,1)）
+        b.w.writeBD(0.0);                   // 插入旋转 (54)
+        b.w.writeBS(static_cast<dint16>(ent.getAlign()));          // 文字对齐 (71)
+        b.w.writeBS(static_cast<dint16>(ent.getTextLineStyle()));  // 行距样式 (72)
+        b.w.writeBD(ent.getTextLineFactor());                      // 行距系数 (41)
+        b.w.writeBD(ent.getMeasurement());                         // 实测值 (42)
+        b.w.write2RD(0.0, 0.0);             // clone 插入点 (12)
+    }
+
+    /// 厚度/挤出（R2000 风格的可省略编码）
     void writeThickness(ObjBuilder& b, double thickness)
     {
         if (thickness == 0.0) b.w.writeB(true);
@@ -600,6 +627,14 @@ void encodeLType(Private& d, const DRW_LType& ent, std::uint32_t handle)
     // 缺失会导致缓冲区越界、整表解析判失败。
     for (int i = 0; i < 256; ++i) b.w.writeRC(0);
     b.beginHandles();
+    // 句柄流里**每段线型先各占一个**「复杂线型形状样式」句柄（340）：
+    // libredwg 的 LTYPE 规范在非 DXF 分支里无条件读取它（SUB_FIELD_HANDLE
+    // style），句柄流里少一个，读到段尾就会越界进字符串区，
+    // 报 "bit_read_RC buffer overflow"。我们的线型全是简单线型，
+    // 句柄值一律为 0，但**占位不能省**。
+    for (std::size_t i = 0; i < ent.path.size(); ++i) {
+        b.w.writeHandle(kHcAbsolute, 0);
+    }
     d.writeTableHandleTail(b, d.ltypeCtrl);
     if (!ent.path.empty()) {
         b.w.writeHandle(kHcAbsolute, 0);
@@ -1834,6 +1869,45 @@ bool dwgW::writeHatch(DRW_Hatch* ent)
     return true;
 }
 
+// 弧长标注（ARC_DIMENSION）——DWG 里的类对象，对象头写的是类号 kClassArcDim。
+//
+// 字段序依 libredwg dwg2.spec 的 ARC_DIMENSION（非 DXF 分支），与读取端
+// DRW_DimArc::parseDwg 严格对偶：
+//   定义点 3BD → 界线 1 3BD → 界线 2 3BD → 弧心 3BD → is_partial 位
+//   → 起参数 BD → 止参数 BD → has_leader 位 → 引线 1 3BD → 引线 2 3BD
+// 句柄流与其它标注一致：dimstyle 硬指针 + 匿名几何块硬指针。
+//
+// 注意 DIMENSION 的公共数据（DRW_Dimension::parseDwg 那一段）由 writeDimension
+// 的公共流程负责不了——这里整段自己写：先公共实体数据（encodeEntity 已含），
+// 再写 DIMENSION 公共段，最后才是弧长专属字段。
+bool dwgW::writeArcDimension(DRW_DimArc* ent)
+{
+    const std::uint32_t styleH = d->dimstyleHandle(ent->getStyle());
+    const std::uint32_t blockH = d->blockRecordHandle(ent->getName());
+
+    d->encodeEntity(kClassArcDim, *ent, [&](Private::ObjBuilder& b) {
+        // ---- DIMENSION 公共段（与其它标注共用同一份实现）----
+        d->writeDimensionCommon(b, *ent);
+
+        // ---- 弧长专属字段 ----
+        const DRW_Coord def = ent->getDefPoint();
+        b.w.write3BD(def.x, def.y, def.z);
+        b.w.write3BD(ent->xline1Pt.x, ent->xline1Pt.y, ent->xline1Pt.z);
+        b.w.write3BD(ent->xline2Pt.x, ent->xline2Pt.y, ent->xline2Pt.z);
+        b.w.write3BD(ent->centerPt.x, ent->centerPt.y, ent->centerPt.z);
+        b.w.writeB(ent->subFlags != 0);     // is_partial
+        b.w.writeBD(ent->arcStartParam);    // 弧度
+        b.w.writeBD(ent->arcEndParam);      // 弧度
+        b.w.writeB(ent->hasLeader != 0);
+        b.w.write3BD(ent->leader1Pt.x, ent->leader1Pt.y, ent->leader1Pt.z);
+        b.w.write3BD(ent->leader2Pt.x, ent->leader2Pt.y, ent->leader2Pt.z);
+    }, [&](Private::ObjBuilder& b) {
+        b.w.writeHandle(kHcAbsolute, styleH);
+        b.w.writeHandle(kHcAbsolute, blockH);
+    });
+    return true;
+}
+
 bool dwgW::writeText(DRW_Text* ent)
 {
     d->encodeEntity(kText, *ent, [&](Private::ObjBuilder& b) {
@@ -1875,6 +1949,8 @@ bool dwgW::writeDimension(DRW_Dimension* ent)
     // 标注的专属字段分散在各子类且基类访问器为 protected：
     // 逐子类取出后再走统一的公共编码流程。
     DRW_Coord def1, def2, circlePoint;
+    DRW_Coord ordinateFeature, ordinateLeader;
+    bool ordinateXType = false;
     double angle = 0.0, oblique = 0.0, leaderLength = 0.0;
     std::uint16_t otype = 0;
     if (auto* lin = dynamic_cast<DRW_DimLinear*>(ent); lin != nullptr) {
@@ -1896,6 +1972,11 @@ bool dwgW::writeDimension(DRW_Dimension* ent)
         otype = kDimDiametric;
         circlePoint = dia->getDiameter1Point();
         leaderLength = dia->getLeaderLength();
+    } else if (auto* ord = dynamic_cast<DRW_DimOrdinate*>(ent); ord != nullptr) {
+        otype = kDimOrdinate;
+        ordinateFeature = ord->getFirstLine();
+        ordinateLeader = ord->getSecondLine();
+        ordinateXType = (ord->type & 64) != 0;
     } else {
         return false;                       // 其余标注类型暂不支持 DWG 原生写出
     }
@@ -1906,27 +1987,8 @@ bool dwgW::writeDimension(DRW_Dimension* ent)
     const std::uint32_t blockH = d->blockRecordHandle(ent->getName());
 
     d->encodeEntity(otype, *ent, [&](Private::ObjBuilder& b) {
-        // R2000 标注专属数据，字段序与真实 AutoCAD 文件逐字节对齐（LibreDWG 校验通过）：
-        // 拉伸方向这里是普通 3BD，没有公共实体数据那种「默认标志位」。
-        const DRW_Coord ext = ent->getExtrusion();
-        b.w.write3BD(ext.x, ext.y, ext.z);
-        const DRW_Coord tp = ent->getTextPoint();
-        b.w.write2RD(tp.x, tp.y);           // 文字中点 (11)
-        b.w.writeBD(tp.z);                  // 文字高程 (31)
-        // flag1 位语义（与读取端对偶）：bit0=文字处于默认位置（读取端据此清除
-        // DXF 70 的 bit7），bit1=引用几何块（读取端还原 bit5，R13 起恒置位）。
-        // 低 3 位的标注子类型由对象类型决定，不在此字节内。
-        b.w.writeRC(0x03);
-        b.w.writeT(ent->getText(), d->codec);   // 用户文字 (1)
-        b.w.writeBD(0.0);                   // 文字旋转 (53)
-        b.w.writeBD(0.0);                   // 水平方向 (51)
-        b.w.write3BD(1.0, 1.0, 1.0);        // 插入比例（AutoCAD 实测写 (1,1,1)）
-        b.w.writeBD(0.0);                   // 插入旋转 (54)
-        b.w.writeBS(static_cast<dint16>(ent->getAlign()));          // 文字对齐 (71)
-        b.w.writeBS(static_cast<dint16>(ent->getTextLineStyle()));  // 行距样式 (72)
-        b.w.writeBD(ent->getTextLineFactor());                      // 行距系数 (41)
-        b.w.writeBD(ent->getMeasurement());                         // 实测值 (42)
-        b.w.write2RD(0.0, 0.0);             // clone 插入点 (12)
+        // R2000 标注专属数据，字段序与真实 AutoCAD 文件逐字节对齐（LibreDWG 校验通过）
+        d->writeDimensionCommon(b, *ent);
         switch (otype) {
         case kDimLinear:
             b.w.write3BD(def1.x, def1.y, def1.z);
@@ -1950,6 +2012,15 @@ bool dwgW::writeDimension(DRW_Dimension* ent)
             b.w.write3BD(circlePoint.x, circlePoint.y, circlePoint.z);
             b.w.write3BD(defPoint.x, defPoint.y, defPoint.z);
             b.w.writeBD(leaderLength);
+            break;
+        case kDimOrdinate:
+            // 字段序依 libredwg dwg.spec 的 DIMENSION_ORDINATE（非 DXF 分支）：
+            //   定义点 3BD → 被测点 3BD → 引线端点 3BD → 标志字节 RC
+            // 标志字节 bit0 = 1 表示 X 型（量 X 坐标）。
+            b.w.write3BD(defPoint.x, defPoint.y, defPoint.z);
+            b.w.write3BD(ordinateFeature.x, ordinateFeature.y, ordinateFeature.z);
+            b.w.write3BD(ordinateLeader.x, ordinateLeader.y, ordinateLeader.z);
+            b.w.writeRC(ordinateXType ? 1 : 0);
             break;
         default: break;
         }
@@ -2311,6 +2382,9 @@ void writeClassesData(dwgBitWriter& w, dwgW::Private& d, std::uint16_t& nextClas
     writeOneClass(w, d, nextClassNum++, "AcDbPlaceHolder", "ACDBPLACEHOLDER");
     writeOneClass(w, d, nextClassNum++, "AcDbLayout", "LAYOUT");
     writeOneClass(w, d, nextClassNum++, "AcDbDictionaryVar", "DICTIONARYVAR");
+    // 弧长标注（ARC_DIMENSION）在 DWG 里是类对象，没有固定类型号：
+    // 实体写出时用的就是**这里的类号**（kClassArcDim），两处必须一致。
+    writeOneClass(w, d, nextClassNum++, "AcDbArcDimension", "ARC_DIMENSION");
 }
 
 } // namespace

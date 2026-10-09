@@ -65,6 +65,8 @@ private slots:
     void hatchBulgeFormsCircle();
     void dimensionMeasurementAllTypes();
     void dimensionGeometryDerivation();
+    void ordinateDimensionMeasuresAxisCoordinate();
+    void arcLengthDimensionDerivesArcGeometry();
     void dimensionGripsReflowGeometry();
     void dimensionTypeNameIsNotMojibake();
 
@@ -768,6 +770,108 @@ void TestGeometry::dimensionGeometryDerivation()
     QVERIFY(dim.distanceTo(Point2D(50.0, -20.0)) < 1e-9);
     // 远离时距离单调增大
     QVERIFY(dim.distanceTo(Point2D(50.0, 30.0)) > dim.distanceTo(Point2D(50.0, 0.0)));
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::ordinateDimensionMeasuresAxisCoordinate()
+{
+    // 坐标标注量的是**被测点在某一轴上的坐标**（相对 10 组码给出的基准），
+    // 不是两点距离——这正是它与线性标注的分界。
+    DimensionEntity xType(DimensionEntity::DimType::Ordinate);
+    xType.setFirstPoint(Point2D(120.0, -45.0));      // 被测点 13
+    xType.setSecondPoint(Point2D(150.0, -80.0));     // 引线端点 14
+    xType.setDimLinePoint(Point2D(10.0, 5.0));       // 坐标基准 10
+    xType.setOrdinateXType(true);
+    QVERIFY(std::abs(xType.measurement() - 110.0) < 1e-9);   // 120 - 10
+    QCOMPARE(xType.displayText(), QStringLiteral("110"));
+
+    xType.setOrdinateXType(false);
+    QVERIFY(std::abs(xType.measurement() - (-50.0)) < 1e-9); // -45 - 5
+    QCOMPARE(xType.displayText(), QStringLiteral("-50"));
+
+    // 几何：沿测量轴拉到引线端点的「L」形，三段、**无箭头**。
+    // 比例实测自一张 AutoCAD 图纸的匿名几何块（*D6）。
+    xType.setOrdinateXType(true);
+    xType.setTextHeight(2.5);
+    const DimensionEntity::Geometry geo = xType.geometry();
+    QVERIFY(geo.valid);
+    QCOMPARE(geo.segments.size(), std::size_t(3));
+    QCOMPARE(geo.arrows.size(), std::size_t(0));
+
+    // 第一段：在被测点的 X 处沿 Y 拉开
+    QVERIFY(std::abs(geo.segments[0].first.x - 120.0) < 1e-9);
+    QVERIFY(std::abs(geo.segments[0].second.x - 120.0) < 1e-9);
+    // 折点在被测点一侧（引线端点往被测点方向退 2 倍字高）
+    QVERIFY(std::abs(geo.segments[1].first.y - (-80.0 + 5.0)) < 1e-9);
+    // 第二段水平走到引线端点的 X
+    QVERIFY(std::abs(geo.segments[1].second.x - 150.0) < 1e-9);
+    // 第三段是端点处的小竖线，长度 8.25 倍字高
+    QVERIFY(std::abs(geo.segments[2].first.distanceTo(geo.segments[2].second)
+                     - 8.25 * 2.5) < 1e-9);
+
+    // 文字水平、落在小竖线中段附近
+    QVERIFY(std::abs(normalizeAngle(geo.textAngle)) < 1e-9);
+    QVERIFY(std::abs(geo.textAnchor.x - 150.0) < 1e-9);
+
+    // 给了 11 组码时以它为准
+    xType.setTextPoint(Point2D(7.0, -9.0));
+    QVERIFY(xType.geometry().textAnchor.distanceTo(Point2D(7.0, -9.0)) < 1e-9);
+}
+
+// -----------------------------------------------------------------------------
+void TestGeometry::arcLengthDimensionDerivesArcGeometry()
+{
+    // 被测弧：圆心 (0,0)、半径 100、从 0° 逆时针到 90° → 弧长 = 100·π/2
+    DimensionEntity dim(DimensionEntity::DimType::ArcLength);
+    dim.setArcCenter(Point2D(0.0, 0.0));
+    dim.setArcAngles(0.0, kHalfPi);
+    dim.setFirstPoint(Point2D(100.0, 0.0));       // 弧心 + 半径·(1,0)
+    dim.setSecondPoint(Point2D(0.0, 100.0));
+    dim.setDimLinePoint(Point2D(60.0, 0.0));      // 尺寸弧经过的点 → 尺寸弧半径 60
+    dim.setTextHeight(4.0);
+
+    QVERIFY(std::abs(dim.measuredArcRadius() - 100.0) < 1e-9);
+    QVERIFY(std::abs(dim.measurement() - 100.0 * kHalfPi) < 1e-9);
+
+    const DimensionEntity::Geometry geo = dim.geometry();
+    QVERIFY(geo.valid);
+    QCOMPARE(geo.arrows.size(), std::size_t(2));
+
+    // 尺寸弧线上的点都落在半径 60 上（尺寸弧半径由 10 组码决定，不是被测弧半径）
+    int arcPoints = 0;
+    for (const auto& seg : geo.segments) {
+        const double r = seg.first.distanceTo(Point2D(0.0, 0.0));
+        if (std::abs(r - 60.0) < 1e-6) {
+            ++arcPoints;
+            QVERIFY(std::abs(seg.second.distanceTo(Point2D(0.0, 0.0)) - 60.0) < 1e-6);
+        }
+    }
+    QVERIFY(arcPoints >= 8);   // 弧被离散成多段线段
+
+    // 两端有径向界线连回被测弧附近（半径在 60 与 100 之间的线段）
+    bool hasRadial = false;
+    for (const auto& seg : geo.segments) {
+        const double r1 = seg.first.distanceTo(Point2D(0.0, 0.0));
+        const double r2 = seg.second.distanceTo(Point2D(0.0, 0.0));
+        if ((r1 - r2) > 20.0 && r2 > 55.0 && r1 < 101.0) hasRadial = true;
+    }
+    QVERIFY(hasRadial);
+
+    // 文字方向跟着尺寸弧中点的切线走（45° + 90° = 135°）
+    QVERIFY(std::abs(normalizeAngle(geo.textAngle - degToRad(135.0))) < 1e-6
+            || std::abs(normalizeAngle(geo.textAngle - degToRad(135.0 + 180.0))) < 1e-6);
+
+    // 镜像会反转绕行方向：起止参数必须互换，否则尺寸弧会从另一侧绕过去
+    DimensionEntity mirrored(DimensionEntity::DimType::ArcLength);
+    mirrored.setArcCenter(Point2D(0.0, 0.0));
+    mirrored.setArcAngles(0.0, kHalfPi);
+    mirrored.setFirstPoint(Point2D(100.0, 0.0));
+    mirrored.setSecondPoint(Point2D(0.0, 100.0));
+    mirrored.setDimLinePoint(Point2D(60.0, 0.0));
+    mirrored.transform(Transform2D::mirror(Point2D(0.0, 0.0), Point2D(1.0, 0.0)));   // 关于 X 轴镜像
+    QVERIFY(std::abs(mirrored.arcStartAngle() - normalizeAngle(-kHalfPi)) < 1e-9);
+    QVERIFY(std::abs(mirrored.arcEndAngle() - 0.0) < 1e-9);
+    QVERIFY(std::abs(mirrored.measurement() - 100.0 * kHalfPi) < 1e-9);
 }
 
 // -----------------------------------------------------------------------------

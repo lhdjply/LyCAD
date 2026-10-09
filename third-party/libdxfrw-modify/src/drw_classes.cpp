@@ -110,6 +110,11 @@ void DRW_Class::toDwgType(){
         dwgType = 101;
     else if (recName == "IMAGEDEF")
         dwgType = 102;
+    else if (recName == "ARC_DIMENSION")
+        // 弧长标注在 DWG 里只以类对象的形式存在（AutoCAD 2008 起），没有固定的
+        // 对象类型号。这里给它一个本库内部约定的编号，好让 dwgreader 的分派表
+        // 能认出它——文件里存的仍是 CLASSES 段中的类号，两者靠类名对应。
+        dwgType = 200;
     else
         dwgType =0;
 }

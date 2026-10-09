@@ -158,6 +158,12 @@ public:
      * Called for every ordinate dimension entity. 
      */
     virtual void addDimOrdinate(const DRW_DimOrdinate *data) = 0;
+
+    /**
+     * Called for every arc length dimension entity (the ARC_DIMENSION
+     * extended entity in DXF, AcDbArcDimension).
+     */
+    virtual void addDimArc(const DRW_DimArc *data) = 0;
     
     /** 
 	 * Called for every leader start. 

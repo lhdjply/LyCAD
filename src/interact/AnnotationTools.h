@@ -7,7 +7,9 @@
 //      也便于自动化测试用确定性的输入序列驱动）；
 //    · 填充：连续取点构成闭合边界，回车 / 右键闭合后生成填充；
 //    · 线性/对齐标注：三条定义点（两条界线原点 + 尺寸线位置）；
-//    · 半径/直径标注：先拾取圆或圆弧，再指定文字位置。
+//    · 半径/直径标注：先拾取圆或圆弧，再指定文字位置；
+//    · 坐标标注：被测点 + 引线端点（度量轴由引线方向决定，与 AutoCAD 一致）；
+//    · 弧长标注：先拾取圆弧，再指定尺寸弧经过的位置。
 // =============================================================================
 #pragma once
 
@@ -186,6 +188,68 @@ public:
 protected:
     bool diametric() const override { return true; }
     QString pickPrompt() const override;
+};
+
+// -----------------------------------------------------------------------------
+//  坐标标注：被测点 -> 引线端点
+//
+//  度量轴不在第一步就问，而是由**引线方向**定：引线偏竖直量 X 坐标，
+//  偏水平量 Y 坐标——AutoCAD 的 DIMORDINATE 就是这么定的，也与显示几何一致
+//  （引线沿测量轴的垂直方向拉开）。移动鼠标时预览会跟着换轴。
+// -----------------------------------------------------------------------------
+class DrawDimOrdinateTool final : public Tool {
+public:
+    explicit DrawDimOrdinateTool(ToolContext& context) : Tool(context) {}
+
+    QString name() const override;
+    QString displayName() const override;
+    QString prompt() const override;
+
+    bool mousePress(const CanvasEvent& event) override;
+    bool mouseMove(const CanvasEvent& event) override;
+    bool keyPress(QKeyEvent* event) override;
+    bool textInput(const QString& text) override;
+    void paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context) override;
+    void deactivate() override;
+
+private:
+    void commit();
+
+    std::optional<Point2D> m_feature;   ///< 被测点（13）
+    ResolvedPoint m_cursor;
+    bool m_hasCursor = false;
+};
+
+// -----------------------------------------------------------------------------
+//  弧长标注：拾取圆弧 -> 指定尺寸弧位置
+// -----------------------------------------------------------------------------
+class DrawDimArcTool final : public Tool {
+public:
+    explicit DrawDimArcTool(ToolContext& context) : Tool(context) {}
+
+    QString name() const override;
+    QString displayName() const override;
+    QString prompt() const override;
+
+    bool mousePress(const CanvasEvent& event) override;
+    bool mouseMove(const CanvasEvent& event) override;
+    bool keyPress(QKeyEvent* event) override;
+    bool textInput(const QString& text) override;
+    void paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context) override;
+    void deactivate() override;
+
+private:
+    void commit();
+
+    // 拾取阶段拷贝圆弧的几何参数，不持有文档实体指针
+    Point2D m_center;
+    double  m_radius = 0.0;
+    double  m_startAngle = 0.0;
+    double  m_endAngle = 0.0;
+    bool    m_hasArc = false;
+
+    ResolvedPoint m_cursor;
+    bool m_hasCursor = false;
 };
 
 } // namespace lycad

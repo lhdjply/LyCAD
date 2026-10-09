@@ -289,7 +289,8 @@ public:
     void addDimDiametric(const DRW_DimDiametric* data) override;
     void addDimAngular(const DRW_DimAngular*) override { skip(QStringLiteral("DIMANGULAR")); }
     void addDimAngular3P(const DRW_DimAngular3p*) override { skip(QStringLiteral("DIMANGULAR3P")); }
-    void addDimOrdinate(const DRW_DimOrdinate*) override { skip(QStringLiteral("DIMORDINATE")); }
+    void addDimOrdinate(const DRW_DimOrdinate* data) override;
+    void addDimArc(const DRW_DimArc* data) override;
 
     // ---- 其余（未建模，计数后跳过） -------------------------------------------
     void addLeader(const DRW_Leader*) override { skip(QStringLiteral("LEADER")); }
@@ -1394,6 +1395,72 @@ void Builder::addDimRadial(const DRW_DimRadial* data)
     place(std::move(entity));
 }
 
+void Builder::addDimOrdinate(const DRW_DimOrdinate* data)
+{
+    if (!data) return;
+
+    auto entity = std::make_unique<DimensionEntity>(DimensionEntity::DimType::Ordinate);
+
+    // 坐标标注的定义点：13/23 是被测点，14/24 是引线端点，10/20 是**坐标基准**
+    //（量的是被测点相对基准在某一轴上的坐标，不是两点距离）。
+    entity->setFirstPoint(toPoint(data->getFirstLine()));
+    entity->setSecondPoint(toPoint(data->getSecondLine()));
+    entity->setDimLinePoint(toPoint(data->getOriginPoint()));
+
+    // X 型还是 Y 型（量 X 坐标还是 Y 坐标）。这个标志位在两条读取路径上
+    // **不在同一处**：DXF 用 70 的 bit6（值 64），DWG 经 libdxfrw 解码后落在
+    // bit7（128）上，且 bit7 还会被「文字是否在默认位置」那一位干扰。
+    // 因此这里以文件里给出的**实测值**（42 组码）为准：哪个轴的坐标与之吻合
+    // 就是哪一型；42 缺失时才退回按位判断。
+    const double measured = data->getMeasurement();
+    const double axisX = entity->firstPoint().x - entity->dimLinePoint().x;
+    const double axisY = entity->firstPoint().y - entity->dimLinePoint().y;
+    const bool xType = (std::abs(measured) > kGeomTol)
+                           ? (std::abs(measured - axisX) <= std::abs(measured - axisY))
+                           : (data->type & 64) != 0;
+    entity->setOrdinateXType(xType);
+
+    const Point2D textPoint = toPoint(data->getTextPoint());
+    if (textPoint.distanceTo(Point2D(0.0, 0.0)) > kGeomTol
+        || entity->firstPoint().distanceTo(textPoint) > kGeomTol) {
+        entity->setTextPoint(textPoint);
+    }
+
+    const QString override = toQString(data->getText()).trimmed();
+    if (!override.isEmpty() && override != QLatin1String("<>")) entity->setTextOverride(override);
+
+    applyCommon(*entity, *data);
+    place(std::move(entity));
+}
+
+void Builder::addDimArc(const DRW_DimArc* data)
+{
+    if (!data) return;
+
+    // 弧长标注的定义点：13/14 是**被测弧**的两端（也就是尺寸界线的原点），
+    // 15 是弧心，40/41 是起止参数（弧度），10 是尺寸弧经过的点。
+    // 被测弧半径由「弧心 -> 13 点」推出，尺寸弧半径由「弧心 -> 10 点」推出，
+    // 两者不是一回事（实测某图：被测弧 806.6，尺寸弧 391.3）。
+    auto entity = std::make_unique<DimensionEntity>(DimensionEntity::DimType::ArcLength);
+    entity->setArcCenter(toPoint(data->getCenterPoint()));
+    entity->setFirstPoint(toPoint(data->getXLine1Point()));
+    entity->setSecondPoint(toPoint(data->getXLine2Point()));
+    entity->setDimLinePoint(toPoint(data->getDefPoint()));
+    entity->setArcAngles(data->getArcStartParam(), data->getArcEndParam());
+
+    const Point2D textPoint = toPoint(data->getTextPoint());
+    if (textPoint.distanceTo(Point2D(0.0, 0.0)) > kGeomTol
+        || entity->dimLinePoint().distanceTo(textPoint) > kGeomTol) {
+        entity->setTextPoint(textPoint);
+    }
+
+    const QString override = toQString(data->getText()).trimmed();
+    if (!override.isEmpty() && override != QLatin1String("<>")) entity->setTextOverride(override);
+
+    applyCommon(*entity, *data);
+    place(std::move(entity));
+}
+
 void Builder::addDimDiametric(const DRW_DimDiametric* data)
 {
     if (!data) return;
@@ -1912,6 +1979,7 @@ public:
     void addDimAngular(const DRW_DimAngular*) override {}
     void addDimAngular3P(const DRW_DimAngular3p*) override {}
     void addDimOrdinate(const DRW_DimOrdinate*) override {}
+    void addDimArc(const DRW_DimArc*) override {}
     void addLeader(const DRW_Leader*) override {}
     void addHatch(const DRW_Hatch*) override {}
     void addViewport(const DRW_Viewport&) override {}
@@ -2628,8 +2696,46 @@ private:
             auto diametric = std::make_unique<DRW_DimDiametric>();
             diametric->setDefPoint(toCoord(dim.firstPoint()));
             diametric->setDiameter1Point(toCoord(dim.secondPoint()));
+            diametric->setLeaderLength(dim.textHeight());
             record = std::move(diametric);
             break;
+        }
+        case DimensionEntity::DimType::Ordinate: {
+            auto ordinate = std::make_unique<DRW_DimOrdinate>();
+            // 10 是坐标基准（量的是被测点相对基准的轴向坐标），13 被测点，14 引线端点
+            ordinate->setOriginPoint(toCoord(dim.dimLinePoint()));
+            ordinate->setFirstLine(toCoord(dim.firstPoint()));
+            ordinate->setSecondLine(toCoord(dim.secondPoint()));
+            // 70 的低 3 位是类型（6=坐标），bit6（64）置位表示 X 型
+            ordinate->type = static_cast<int>(DimensionEntity::DimType::Ordinate)
+                             | (dim.isOrdinateXType() ? 64 : 0);
+            record = std::move(ordinate);
+            break;
+        }
+        case DimensionEntity::DimType::ArcLength: {
+            // 弧长标注不是 DIMENSION 的变体，实体名也不同，单独走一条写出路径
+            auto arc = std::make_unique<DRW_DimArc>();
+            arc->setDefPoint(toCoord(dim.dimLinePoint()));      // 10 尺寸弧经过的点
+            arc->setXLine1Point(toCoord(dim.firstPoint()));     // 13 被测弧起点
+            arc->setXLine2Point(toCoord(dim.secondPoint()));    // 14 被测弧终点
+            arc->setCenterPoint(toCoord(dim.arcCenter()));      // 15 弧心
+            arc->setArcStartParam(dim.arcStartAngle());         // 40 弧度
+            arc->setArcEndParam(dim.arcEndAngle());             // 41 弧度
+            arc->setSubFlags(0);
+            arc->setHasLeader(0);
+            arc->type = static_cast<int>(DimensionEntity::DimType::ArcLength);
+            arc->setMeasurement(dim.measurement());
+            applyCommonWrite(*arc, dim);
+            if (blockIt != m_dimBlocks.end()) arc->setName(blockIt->second);
+            // 文件里给了 11 组码就用它：自己重算的锚点与图里写的会差在最后一位
+            // （实测 1e-12 量级），往返多次也不会漂。
+            arc->setTextPoint(toCoord(dim.textPoint().value_or(geo.textAnchor)));
+            arc->setStyle("Standard");
+            if (!dim.textOverride().isEmpty() && dim.textOverride() != QLatin1String("<>")) {
+                arc->setText(dim.textOverride().toStdString());
+            }
+            m_rw->writeArcDimension(arc.release());
+            return;
         }
         default:
             return;
@@ -2638,8 +2744,12 @@ private:
         applyCommonWrite(*record, dim);
         if (blockIt != m_dimBlocks.end()) record->setName(blockIt->second);
         record->setTextPoint(toCoord(geo.textAnchor));
-        // bit 32 表示「几何块引用已在文件中」，读取端无需自行重绘
-        record->type = static_cast<int>(dim.dimType()) | 32;
+        // bit 32 表示「几何块引用已在文件中」，读取端无需自行重绘。
+        // 这里只**补**这一位，不覆盖各类型自己写进 70 的值：坐标标注的 70 里
+        // 还带着 bit6（X 型 / Y 型），直接赋值会把它抹掉——实测症状是
+        // 「X 型坐标标注往返一次就变成 Y 型，量出来的数从 X 坐标变成 Y 坐标」。
+        if (record->type == 0) record->type = static_cast<int>(dim.dimType());
+        record->type |= 32;
         record->setMeasurement(dim.measurement());
         record->setStyle("Standard");
         if (!dim.textOverride().isEmpty() && dim.textOverride() != QLatin1String("<>")) {
