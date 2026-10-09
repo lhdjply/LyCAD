@@ -1029,6 +1029,21 @@ void MainWindow::connectSignals()
                 m_document->setLayerLineweight(name, dxfValue);
             });
 
+    // ---- 图层「对象列表」-> 文档 ----
+    //
+    // 隐藏图元后画布不再可以拾取它（隐藏即不可选），属性面板也就无从操作。
+    // 对象列表提供了一条不依赖拾取的恢复通道：直接对图元设置可见性。
+    connect(m_layerPanel, &LayerPanel::layerHighlightChanged, this,
+            [this] { m_layerPanel->refreshObjectList(m_document); });
+    connect(m_layerPanel, &LayerPanel::entityVisibilityChangeRequested, this,
+            [this](const std::vector<EntityId>& ids, bool visible) {
+                m_document->setEntitiesVisible(ids, visible);
+            });
+    connect(m_layerPanel, &LayerPanel::entitySelectionRequested, this,
+            [this](const std::vector<EntityId>& ids) {
+                m_document->selection().setIds(ids);
+            });
+
     // ---- 属性面板 -> 文档 ----
     connect(m_propertyPanel, &PropertyPanel::layerChangeRequested, this,
             [this](const QString& layerName) {
@@ -1430,6 +1445,7 @@ void MainWindow::refreshPanels()
 {
     if (m_layerPanel) {
         m_layerPanel->refresh(m_document->layers(), m_document->layers().currentLayerName());
+        m_layerPanel->refreshObjectList(m_document);
     }
     if (m_propertyPanel) {
         m_propertyPanel->refresh(m_document);

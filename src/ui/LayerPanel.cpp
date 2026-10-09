@@ -4,6 +4,7 @@
 #include "ui/LayerPanel.h"
 
 #include "core/AciPalette.h"
+#include "core/Document.h"
 #include "core/Entity.h"
 #include "core/Layer.h"
 
@@ -16,6 +17,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSet>
 #include <QTableWidget>
 #include <QVBoxLayout>
 
@@ -107,15 +109,59 @@ void LayerPanel::buildUi()
     m_table->setColumnWidth(ColumnName, 110);
     m_table->setColumnWidth(ColumnColor, 70);
 
+    // ---- 下方：选中图层的「对象列表」 ----
+    //
+    // 单纯靠画布拾取无法恢复已隐藏的图元（隐藏后不可选），因此这里提供一条
+    // 独立于画布的恢复通道：选中图层后，列出该图层上的全部图元（含已隐藏者），
+    // 每一行带「显示」复选框，勾选即可重新显示。
+    m_objectTitle = new QLabel(QStringLiteral("对象列表"), this);
+    m_objectTitle->setToolTip(
+        QStringLiteral("选中上方图层后，这里列出该图层上的全部对象（含已隐藏的）。\n"
+                       "取消 / 勾选「显示」列即可隐藏或恢复显示对象。"));
+
+    m_objectTable = new QTableWidget(this);
+    m_objectTable->setColumnCount(ObjectColumnCount);
+    m_objectTable->setHorizontalHeaderLabels({
+        QStringLiteral("显示"), QStringLiteral("类型"),
+        QStringLiteral("#"), QStringLiteral("图层")
+    });
+    m_objectTable->verticalHeader()->setVisible(false);
+    m_objectTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_objectTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_objectTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_objectTable->setAlternatingRowColors(true);
+    m_objectTable->horizontalHeader()->setStretchLastSection(true);
+    m_objectTable->setColumnWidth(ObjectColumnVisible, 46);
+    m_objectTable->setColumnWidth(ObjectColumnType, 90);
+    m_objectTable->setColumnWidth(ObjectColumnId, 60);
+
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(6);
     layout->addLayout(topLayout);
     layout->addWidget(m_table, 1);
+    layout->addWidget(m_objectTitle);
+    layout->addWidget(m_objectTable, 1);
 
     // ---- 信号连接 ----
     connect(m_table, &QTableWidget::itemChanged, this, &LayerPanel::onItemChanged);
     connect(m_table, &QTableWidget::cellDoubleClicked, this, &LayerPanel::onCellDoubleClicked);
+    connect(m_table, &QTableWidget::itemSelectionChanged, this, [this] {
+        // 切换选中图层时刷新其对象列表；这里不改「当前图层」，只重列对象。
+        emit layerHighlightChanged();
+    });
+
+    connect(m_objectTable, &QTableWidget::itemChanged, this,
+            &LayerPanel::onObjectItemChanged);
+    connect(m_objectTable, &QTableWidget::itemSelectionChanged, this,
+            &LayerPanel::onObjectSelectionChanged);
+    connect(m_objectTable, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
+        // 双击行 = 选中该对象（便于到画布上定位），并保持「可见」行为不变
+        if (QTableWidgetItem* idItem = m_objectTable->item(row, ObjectColumnId)) {
+            const EntityId id = idItem->data(Qt::UserRole).toULongLong();
+            if (id != kInvalidEntityId) emit entitySelectionRequested({ id });
+        }
+    });
 
     connect(m_addButton, &QPushButton::clicked, this, &LayerPanel::addLayerRequested);
     connect(m_removeButton, &QPushButton::clicked, this, &LayerPanel::requestRemoveSelected);
@@ -130,6 +176,10 @@ void LayerPanel::buildUi()
 void LayerPanel::refresh(const LayerManager& layers, const QString& currentLayer)
 {
     m_updating = true;
+
+    // 重建前记住当前选中的图层名——setRowCount(0) 会把 currentRow() 复位为 -1，
+    // 若不恢复，后续 refreshObjectList() 就查不到选中图层，对象列表会被清空。
+    const QString keepSelected = selectedLayerName();
 
     m_currentLayerCombo->clear();
     for (const Layer& layer : layers.all()) {
@@ -185,6 +235,11 @@ void LayerPanel::refresh(const LayerManager& layers, const QString& currentLayer
                 }
             }
         }
+
+        // 恢复重建前选中的图层行，使下方对象列表保持可见
+        if (!keepSelected.isEmpty() && layer.name() == keepSelected) {
+            m_table->selectRow(row);
+        }
     }
 
     m_updating = false;
@@ -198,6 +253,110 @@ QString LayerPanel::selectedLayerName() const
         return item->data(Qt::UserRole).toString();
     }
     return QString();
+}
+
+void LayerPanel::refreshObjectList(Document* document)
+{
+    // 若本面板正在处理用户点击（如点选对象行），此时文档选择集变化会同步回调到
+    // 这里。在点击处理栈内销毁表格项会打断 Qt 的选中逻辑，导致列表错乱/消失，
+    // 因此这里记下「稍后重建」，等交互结束后补做一次。
+    if (m_interacting) {
+        m_pendingObjectReload = true;
+        return;
+    }
+
+    m_updatingObjects = true;
+
+    m_objectDocument = document;
+
+    const QString layerName = selectedLayerName();
+    if (!document || layerName.isEmpty()) {
+        m_objectTable->setRowCount(0);
+        m_objectTitle->setText(QStringLiteral("对象列表"));
+        m_updatingObjects = false;
+        return;
+    }
+
+    const std::vector<Entity*> entities = document->entitiesOnLayer(layerName);
+    m_objectTitle->setText(
+        QStringLiteral("对象列表 — 图层 \"%1\"（%2 个）").arg(layerName).arg(entities.size()));
+
+    // 行选中状态直接以文档选择集为准。这样无论来源是画布拾取还是本列表点击，
+    // 列表高亮都与实际选择一致，不会再出现「选了别的行、旧行还亮着」的错位。
+    const std::vector<EntityId>& docSelection = document->selection().ids();
+    QSet<EntityId> selectedIds(docSelection.begin(), docSelection.end());
+
+    m_objectTable->setRowCount(static_cast<int>(entities.size()));
+    m_objectTable->clearSelection();
+    for (int row = 0; row < static_cast<int>(entities.size()); ++row) {
+        Entity* entity = entities[static_cast<std::size_t>(row)];
+        if (!entity) continue;
+
+        // 「显示」复选框：以图元真实的 m_visible 为准
+        m_objectTable->setItem(row, ObjectColumnVisible, makeCheckItem(entity->isVisible()));
+
+        auto* typeItem = makeReadOnlyItem(entity->typeDisplayName());
+        m_objectTable->setItem(row, ObjectColumnType, typeItem);
+
+        auto* idItem = makeReadOnlyItem(QString::number(entity->id()));
+        idItem->setData(Qt::UserRole, static_cast<qulonglong>(entity->id()));
+        m_objectTable->setItem(row, ObjectColumnId, idItem);
+
+        m_objectTable->setItem(row, ObjectColumnLayer, makeReadOnlyItem(entity->layerName()));
+
+        if (selectedIds.contains(entity->id())) {
+            m_objectTable->selectRow(row);
+        }
+    }
+
+    m_updatingObjects = false;
+}
+
+void LayerPanel::onObjectItemChanged(QTableWidgetItem* item)
+{
+    if (m_updatingObjects || !item) return;
+    if (item->column() != ObjectColumnVisible) return;
+
+    QTableWidgetItem* idItem = m_objectTable->item(item->row(), ObjectColumnId);
+    if (!idItem) return;
+    const EntityId id = idItem->data(Qt::UserRole).toULongLong();
+    if (id == kInvalidEntityId) return;
+
+    const bool visible = (item->checkState() == Qt::Checked);
+
+    m_interacting = true;
+    emit entityVisibilityChangeRequested({ id }, visible);
+    m_interacting = false;
+
+    if (m_pendingObjectReload) {
+        m_pendingObjectReload = false;
+        if (Document* doc = m_objectDocument) refreshObjectList(doc);
+    }
+}
+
+void LayerPanel::onObjectSelectionChanged()
+{
+    if (m_updatingObjects) return;
+
+    std::vector<EntityId> ids;
+    const QList<QTableWidgetItem*> selected = m_objectTable->selectedItems();
+    ids.reserve(static_cast<std::size_t>(selected.size()));
+    for (QTableWidgetItem* item : selected) {
+        if (item->column() != ObjectColumnId) continue;
+        const EntityId id = item->data(Qt::UserRole).toULongLong();
+        if (id != kInvalidEntityId) ids.push_back(id);
+    }
+    if (ids.empty()) return;
+
+    m_interacting = true;
+    emit entitySelectionRequested(ids);
+    m_interacting = false;
+
+    if (m_pendingObjectReload) {
+        m_pendingObjectReload = false;
+        // 交互已结束，补做一次刷新，使列表与实际选择集对齐
+        if (Document* doc = m_objectDocument) refreshObjectList(doc);
+    }
 }
 
 void LayerPanel::onItemChanged(QTableWidgetItem* item)

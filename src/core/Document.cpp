@@ -49,6 +49,17 @@ std::vector<Entity*> Document::allEntities() const
     return out;
 }
 
+std::vector<Entity*> Document::entitiesOnLayer(const QString& layerName) const
+{
+    std::vector<Entity*> out;
+    if (layerName.isEmpty()) return out;
+    for (EntityId id : m_order) {
+        Entity* e = entity(id);
+        if (e && e->layerName() == layerName) out.push_back(e);
+    }
+    return out;
+}
+
 bool Document::isSelectable(EntityId id) const
 {
     const Entity* e = entity(id);

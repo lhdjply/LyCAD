@@ -61,6 +61,11 @@ public:
 
     std::vector<Entity*> allEntities() const;
 
+    /// 指定图层上的全部图元（按绘制顺序）。
+    /// 供图层面板的「对象列表」使用——隐藏的图元同样包含在内，
+    /// 否则用户将失去把已隐藏图元重新设为可见的入口。
+    std::vector<Entity*> entitiesOnLayer(const QString& layerName) const;
+
     // ---- 图元编辑（可撤销） ---------------------------------------------------
     /// 追加单个图元，返回其 id
     EntityId addEntity(std::unique_ptr<Entity> entity);
