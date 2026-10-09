@@ -13,6 +13,7 @@
 #include "io/CadCodec.h"
 #include "render/PlotRenderer.h"
 
+#include <QList>
 #include <QMainWindow>
 #include <QStringList>
 
@@ -20,11 +21,13 @@ class QAction;
 class QComboBox;
 class QLabel;
 class QScrollArea;
+class QTabWidget;
 class QToolButton;
 
 namespace lycad {
 
 class Document;
+class DocumentSession;
 class CadCanvas;
 class ToolManager;
 class LayerPanel;
@@ -57,6 +60,23 @@ private:
     void createCentralWidget();
     void createStatusBar();
     void connectSignals();
+
+    // ---- 标签页（多文档） ----
+    /// 新建一个会话（文档+画布+工具管理器）、接线并追加为标签页；
+    /// 新会话继承当前会话的显示设置与交互模式，并立即成为活动会话
+    DocumentSession* createSession();
+    /// 把某个会话设为活动会话：切换快捷指针、选中对应标签页并同步整套界面
+    void setActiveSession(DocumentSession* session);
+    /// 关闭第 index 个标签页（必要时先询问保存）；最后一个标签页不关闭，
+    /// 而是重置为一张空图。confirmSave 为 false 时跳过保存询问
+    /// （供装载失败撤掉刚开的空标签页使用）
+    void closeSession(int index, bool confirmSave = true);
+    /// 会话有未保存修改时询问处理；需要保存时会先切到该标签页
+    bool maybeSaveSession(DocumentSession* session);
+    /// 会话私有的信号接线（文档/画布/工具管理器 -> 全局界面），每个会话连一次
+    void connectSession(DocumentSession* session);
+    /// 刷新某个会话的标签页文字（文件名 + 未保存标记）与提示
+    void updateTabTitle(DocumentSession* session);
 
     // ---- 文件 ----
     void newDocument();
@@ -101,6 +121,9 @@ private:
     void submitCommandLineText(const QString& text);
 
     // ---- 数据成员 ----------------------------------------------------------
+    // 活动会话的快捷指针。多标签页下它们始终指向当前标签页的文档/画布/
+    // 工具管理器（切换标签页时由 setActiveSession 重设），其余代码照旧
+    // 通过这三个指针访问「当前图」，不必处处写会话判断。
     Document*       m_document = nullptr;
     /// 出图比例（适应图纸 / 1:1 / 自定义 1:n），构造时从 QSettings 恢复
     PlotScale       m_plotScale;
@@ -109,6 +132,14 @@ private:
     LayerPanel*     m_layerPanel = nullptr;
     PropertyPanel*  m_propertyPanel = nullptr;
     CommandLineEdit* m_commandLine = nullptr;
+
+    // ---- 标签页 ----
+    QTabWidget*      m_tabs = nullptr;
+    QList<DocumentSession*> m_sessions;
+    /// 当前活动会话；m_document / m_canvas / m_toolManager 均来自它
+    DocumentSession* m_session = nullptr;
+    /// 当前主题（新建标签页的画布要用它初始化配色）
+    bool             m_darkTheme = false;
 
     // 功能区。m_layerCombo 编辑的是「当前图层」，m_colorCombo / m_lineweightCombo
     // 编辑的是当前选择集——前者作用于后续绘制的图元，后两者作用于已有图元，

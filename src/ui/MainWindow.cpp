@@ -14,6 +14,7 @@
 #include "render/CadCanvas.h"
 #include "render/PlotRenderer.h"
 #include "ui/CommandLineEdit.h"
+#include "ui/DocumentSession.h"
 #include "ui/LayerPanel.h"
 #include "ui/PrintDialog.h"
 #include "ui/PropertyChoices.h"
@@ -54,6 +55,8 @@
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
+#include <QTabBar>
+#include <QTabWidget>
 #include <QToolBar>
 #include <QToolButton>
 #include <QUndoStack>
@@ -112,16 +115,6 @@ MainWindow::MainWindow(QWidget* parent)
     resize(1280, 820);
     setAcceptDrops(true);
 
-    // ---- 模型与视图对象 ----
-    m_document = new Document(this);
-    m_canvas = new CadCanvas(this);
-    m_canvas->setDocument(m_document);
-
-    m_toolManager = new ToolManager(this);
-    m_toolManager->setDocument(m_document);
-    m_toolManager->setCanvas(m_canvas);
-    m_canvas->setInputHandler(m_toolManager);
-
     // 恢复上次的界面与显示设置
     QSettings settings;
     m_lastDirectory = settings.value(QStringLiteral("path/lastDirectory"),
@@ -143,19 +136,23 @@ MainWindow::MainWindow(QWidget* parent)
     // 对构造时就要按主题取色的控件（功能区的样式表、图标配色）来说，
     // 事后补救会留下一次不必要的重绘，还容易漏掉某个自绘控件。
     theme::apply(darkTheme);
-
-    m_canvas->display().showGrid = settings.value(QStringLiteral("ui/showGrid"), true).toBool();
-
-    if (m_canvas->document()) {
-        m_toolManager->snapSettings().gridSpacing = m_canvas->display().gridSpacing;
-    }
+    m_darkTheme = darkTheme;
 
     // ---- 界面 ----
-    // 功能区排在状态栏之后构建：其中的视图开关要与状态栏上的同名按钮
-    // 互相绑定，需要那些按钮已经存在。
+    // 先建中央控件（标签页容器 + 命令行），再创建第一个会话——
+    // 后续的菜单、状态栏、功能区都要按「当前画布」的状态初始化，
+    // 它们依赖会话已经存在。
     createActions();
-    createMenus();
     createCentralWidget();
+    createSession();
+    // 会话里的工具管理器注册了全部内置命令，命令行补全源取自它
+    m_commandLine->setCompletionSource(m_toolManager->commandNames());
+    // 第一个标签页画布的网格显示沿用持久化设置（后续标签页由
+    // createSession 从活动画布继承，不需要再读）
+    m_canvas->display().showGrid =
+        settings.value(QStringLiteral("ui/showGrid"), true).toBool();
+
+    createMenus();
     createDockPanels();
     createStatusBar();
     createRibbon();
@@ -237,6 +234,31 @@ void MainWindow::createMenus()
 
     fileMenu->addSeparator();
 
+    fileMenu->addSeparator();
+
+    // 多标签页：关闭当前标签页（最后一个会重置为空图）与来回切换。
+    // Ctrl+Tab / Ctrl+Shift+Tab 是多标签应用的通用约定，不必自定义。
+    QAction* closeTabAction = fileMenu->addAction(QStringLiteral("关闭标签页(&T)"));
+    closeTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+W")));
+    connect(closeTabAction, &QAction::triggered, this, [this] {
+        closeSession(m_tabs->currentIndex());
+    });
+
+    QAction* nextTabAction = fileMenu->addAction(QStringLiteral("下一个标签页(&X)"));
+    nextTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Tab")));
+    connect(nextTabAction, &QAction::triggered, this, [this] {
+        if (m_tabs->count() > 1)
+            m_tabs->setCurrentIndex((m_tabs->currentIndex() + 1) % m_tabs->count());
+    });
+
+    QAction* prevTabAction = fileMenu->addAction(QStringLiteral("上一个标签页(&B)"));
+    prevTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+Tab")));
+    connect(prevTabAction, &QAction::triggered, this, [this] {
+        if (m_tabs->count() > 1)
+            m_tabs->setCurrentIndex((m_tabs->currentIndex() + m_tabs->count() - 1)
+                                        % m_tabs->count());
+    });
+
     // ---- 出图 ----
     // 打印与打印预览共用同一份页面设置与同一段绘制代码（render/PlotRenderer），
     // 因此「预览上是什么样，纸上就是什么样」不是靠两处代码写得一样来保证的。
@@ -307,19 +329,25 @@ void MainWindow::createMenus()
     // ---- 视图 ----
     QMenu* viewMenu = menuBar()->addMenu(QStringLiteral("视图(&V)"));
 
+    // 缩放动作全部经活动画布执行（m_canvas 随标签页切换自动重设），
+    // 菜单动作只需要建一次，不必跟着标签页重连。
     QAction* zoomExtentsAction = viewMenu->addAction(QStringLiteral("缩放至图形范围(&E)"));
-    connect(zoomExtentsAction, &QAction::triggered, m_canvas, &CadCanvas::zoomExtents);
+    connect(zoomExtentsAction, &QAction::triggered, this,
+            [this] { if (m_canvas) m_canvas->zoomExtents(); });
 
     QAction* zoomSelectionAction = viewMenu->addAction(QStringLiteral("缩放至选择集(&S)"));
-    connect(zoomSelectionAction, &QAction::triggered, m_canvas, &CadCanvas::zoomToSelection);
+    connect(zoomSelectionAction, &QAction::triggered, this,
+            [this] { if (m_canvas) m_canvas->zoomToSelection(); });
 
     QAction* zoomInAction = viewMenu->addAction(QStringLiteral("放大(&I)"));
     zoomInAction->setShortcut(QKeySequence::ZoomIn);
-    connect(zoomInAction, &QAction::triggered, m_canvas, &CadCanvas::zoomIn);
+    connect(zoomInAction, &QAction::triggered, this,
+            [this] { if (m_canvas) m_canvas->zoomIn(); });
 
     QAction* zoomOutAction = viewMenu->addAction(QStringLiteral("缩小(&O)"));
     zoomOutAction->setShortcut(QKeySequence::ZoomOut);
-    connect(zoomOutAction, &QAction::triggered, m_canvas, &CadCanvas::zoomOut);
+    connect(zoomOutAction, &QAction::triggered, this,
+            [this] { if (m_canvas) m_canvas->zoomOut(); });
 
     viewMenu->addSeparator();
 
@@ -672,12 +700,15 @@ void MainWindow::createRibbon()
     // ---- 视图 ----
     {
         RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("视图"));
+        // 经活动画布执行，标签页切换后无需重连（与视图菜单同一做法）
         connect(panel->addLarge(QStringLiteral("zoom-extents"), QStringLiteral("缩放范围"),
                                 QStringLiteral("缩放到图形范围")),
-                &QToolButton::clicked, m_canvas, &CadCanvas::zoomExtents);
+                &QToolButton::clicked, this,
+                [this] { if (m_canvas) m_canvas->zoomExtents(); });
         connect(panel->addLarge(QStringLiteral("zoom-selection"), QStringLiteral("缩放选择集"),
                                 QStringLiteral("缩放到当前选择集")),
-                &QToolButton::clicked, m_canvas, &CadCanvas::zoomToSelection);
+                &QToolButton::clicked, this,
+                [this] { if (m_canvas) m_canvas->zoomToSelection(); });
         panel->addSeparator();
 
         // 与状态栏上的同名开关共享状态，见 linkToggles 的说明
@@ -736,14 +767,18 @@ void MainWindow::createCentralWidget()
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
-    layout->addWidget(m_canvas, 1);
+    // 标签页容器：每个标签页是一张图（一个 DocumentSession 的画布）。
+    // 标签可关闭、可拖动重排；具体行为见 closeSession / setActiveSession。
+    m_tabs = new QTabWidget(central);
+    m_tabs->setDocumentMode(true);
+    m_tabs->setTabsClosable(true);
+    m_tabs->setMovable(true);
+    layout->addWidget(m_tabs, 1);
 
     m_commandLine = new CommandLineEdit(central);
-    m_commandLine->setCompletionSource(m_toolManager->commandNames());
     layout->addWidget(m_commandLine);
 
     setCentralWidget(central);
-    m_canvas->setFocus();
 }
 
 void MainWindow::createDockPanels()
@@ -840,129 +875,18 @@ void MainWindow::createStatusBar()
 // -----------------------------------------------------------------------------
 void MainWindow::connectSignals()
 {
-    // ---- 文档 -> 界面 ----
-    connect(m_document, &Document::modificationChanged, this, [this] {
-        updateWindowTitle();
-        updateSelectionDependent();
+    // ---- 标签页 -> 会话切换 ----
+    connect(m_tabs, &QTabWidget::tabCloseRequested, this,
+            [this](int index) { closeSession(index); });
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
+        if (index >= 0 && index < m_sessions.size()) setActiveSession(m_sessions.at(index));
     });
-    connect(m_document, &Document::filePathChanged, this, [this] { updateWindowTitle(); });
-    connect(m_document, &Document::documentReset, this, [this] {
-        updateWindowTitle();
-        refreshPanels();
-        updateSelectionDependent();
-    });
-    connect(m_document, &Document::layersChanged, this, [this] { refreshPanels(); });
-    connect(m_document, &Document::selectionChanged, this, [this] {
-        refreshPanels();
-        updateSelectionDependent();
-    });
-    // 增删图元时除了重绘，还必须刷新状态栏计数与撤销/重做按钮的可用状态。
-    // 这些信息不能只依赖 modificationChanged——「已修改」标记只在
-    // 干净↔脏 的边界翻转一次，连续新增多个图元时不会重复触发。
-    connect(m_document, &Document::entityAdded, this, [this] {
-        m_canvas->update();
-        updateSelectionDependent();
-    });
-    connect(m_document, &Document::entityRemoved, this, [this] {
-        m_canvas->update();
-        updateSelectionDependent();
-    });
-    connect(m_document, &Document::entityChanged, this, [this] { m_canvas->update(); });
-
-    // ---- 画布 -> 界面 ----
-    connect(m_canvas, &CadCanvas::mouseWorldPositionChanged, this,
-            [this](const Point2D& world, const Point2D&) {
-                m_coordinateLabel->setText(QStringLiteral("X: %1   Y: %2")
-                                               .arg(formatLength(world.x, 4), formatLength(world.y, 4)));
-            });
-    connect(m_canvas, &CadCanvas::cursorLeftCanvas, this, [this] {
-        m_coordinateLabel->setText(QStringLiteral("X: --   Y: --"));
-    });
-    connect(m_canvas, &CadCanvas::viewChanged, this, [this] {
-        const double scale = m_canvas->view().scale();
-        m_scaleLabel->setText(QStringLiteral("缩放 1:%1").arg(1.0 / scale, 0, 'g', 3));
-    });
-
-    connect(m_canvas, &CadCanvas::contextMenuRequested, this, [this](const QPoint& globalPos) {
-        QMenu menu(this);
-
-        if (m_toolManager->isCommandRunning()) {
-            menu.addAction(QStringLiteral("取消当前命令"), this, [this] { m_toolManager->cancel(); });
-            menu.addSeparator();
-        } else if (!m_toolManager->lastCommandName().isEmpty()) {
-            menu.addAction(QStringLiteral("重复 %1").arg(m_toolManager->lastCommandName()),
-                           this, [this] { m_toolManager->repeatLastCommand(); });
-            menu.addSeparator();
-        }
-
-        menu.addAction(QStringLiteral("全选"), this, [this] { m_selectAllAction->trigger(); });
-        menu.addAction(QStringLiteral("删除所选"), this, [this] {
-            if (!m_document->selection().isEmpty()) runCommand(QStringLiteral("ERASE"));
+    // 标签可拖动重排：会话列表必须跟着换位，否则按索引找会话会找错标签
+    if (QTabBar* bar = m_tabs->findChild<QTabBar*>()) {
+        connect(bar, &QTabBar::tabMoved, this, [this](int from, int to) {
+            if (from != to) m_sessions.move(from, to);
         });
-        menu.addSeparator();
-        menu.addAction(QStringLiteral("缩放至图形范围"), m_canvas, &CadCanvas::zoomExtents);
-        menu.addAction(QStringLiteral("缩放至选择集"), m_canvas, &CadCanvas::zoomToSelection);
-
-        menu.exec(globalPos);
-    });
-
-    // ---- 工具管理器 -> 命令行 ----
-    connect(m_toolManager, &ToolManager::promptChanged, this, [this](const QString& prompt) {
-        m_commandLine->setPrompt(prompt);
-    });
-    connect(m_toolManager, &ToolManager::commandMessage, this, [this](const QString& text) {
-        pushMessage(text);
-    });
-    connect(m_toolManager, &ToolManager::commandStarted, this, [this](const QString&) {
-        m_canvas->setFocus();
-    });
-    connect(m_toolManager, &ToolManager::commandEnded, this, [this](const QString&) {
-        refreshPanels();
-    });
-
-    // ---- 双击文字 -> 编辑内容 ----
-    connect(m_toolManager, &ToolManager::textEditRequested, this, [this](EntityId id) {
-        Entity* entity = m_document->entity(id);
-        if (!entity || entity->type() != EntityType::Text) return;
-        auto* text = static_cast<TextEntity*>(entity);
-
-        // 多行编辑：MTEXT 降级导入的文字内容里带 '\n'，单行输入框会把它们吃掉，
-        // 而回车又直接提交，用户补不出换行。对话框内 Enter 确认、Alt+Enter 换行。
-        // 同时可在对话框里改字体（初值取图元当前字体）。
-        TextEditDialog dialog(text->content(), text->fontStyle(), this);
-        if (dialog.exec() != QDialog::Accepted) return;
-
-        // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留。
-        const QString newContent = dialog.content().trimmed();
-        if (newContent.isEmpty()) {
-            pushMessage(QStringLiteral("文字内容不能为空，编辑已取消。"));
-            return;
-        }
-        const QString newFont = dialog.fontFamily();
-        const bool contentChanged = newContent != text->content();
-        const bool fontChanged = newFont != text->fontStyle();
-        if (!contentChanged && !fontChanged) return;   // 未变化不产生撤销记录
-
-        // 行数会随内容变化（也可能从单行变成多行，版面与包围盒都不一样），
-        // 命令行里说清楚结果，用户不必自己数。
-        auto replacement = text->clone();
-        auto* edited = static_cast<TextEntity*>(replacement.get());
-        edited->setContent(newContent);
-        if (fontChanged) {
-            // 与特性面板同一口径：先把字体登记进文字样式表（否则导出时会退化成
-            // txt.shx），再把样式名写到图元上。
-            m_document->ensureTextFontStyle(newFont);
-            edited->setFontStyle(newFont);
-        }
-        const int lines = edited->lineCount();
-        if (m_document->replaceEntity(id, std::move(replacement),
-                                      QStringLiteral("编辑文字"))) {
-            pushMessage(lines > 1
-                            ? QStringLiteral("已编辑文字（%1 行）。").arg(lines)
-                            : QStringLiteral("已编辑文字。"));
-            refreshPanels();
-        }
-    });
+    }
 
     // ---- 命令行 ----
     connect(m_commandLine, &CommandLineEdit::submitted, this, &MainWindow::submitCommandLineText);
@@ -1117,25 +1041,304 @@ void MainWindow::connectSignals()
 }
 
 // -----------------------------------------------------------------------------
+//  标签页（多文档会话）
+// -----------------------------------------------------------------------------
+DocumentSession* MainWindow::createSession()
+{
+    auto* session = new DocumentSession(this);
+
+    // 新标签页继承当前会话的显示设置与交互模式：栅格、正交、捕捉这些
+    // 是「看图的习惯」，换一张图不应被重置。第一个会话没有可继承的
+    // 对象，走 DisplaySettings 的默认值。
+    if (m_canvas && m_canvas != session->canvas) {
+        session->canvas->display() = m_canvas->display();
+        session->tools->snapSettings() = m_toolManager->snapSettings();
+        session->tools->setOrthoMode(m_toolManager->orthoMode());
+        session->tools->setPolarTracking(m_toolManager->polarTracking());
+        session->tools->setGridSnap(m_toolManager->gridSnap());
+    }
+    // 新画布按当前主题上色：调色板是全局的，画布配色必须紧跟
+    session->canvas->applyTheme(m_darkTheme);
+
+    m_sessions.append(session);
+    m_tabs->addTab(session->canvas, session->document->displayName());
+    connectSession(session);
+
+    // 新标签页立即成为活动会话：切换标签页的常规路径（currentChanged）
+    // 会把快捷指针与整套界面同步好
+    setActiveSession(session);
+    return session;
+}
+
+void MainWindow::setActiveSession(DocumentSession* session)
+{
+    if (!session || session == m_session) return;
+
+    // 切走前终止旧会话正在执行的命令：工具状态机挂在旧画布上，
+    // 留着只会让下一次回到该标签页时出现「幽灵命令」
+    if (m_toolManager && m_toolManager->isCommandRunning()) m_toolManager->cancel();
+
+    m_session = session;
+    m_document = session->document;
+    m_canvas = session->canvas;
+    m_toolManager = session->tools;
+
+    const int index = m_sessions.indexOf(session);
+    if (m_tabs && m_tabs->currentIndex() != index) {
+        // 屏蔽信号：currentChanged 会再次调回本函数，绕成环
+        QSignalBlocker blocker(m_tabs);
+        m_tabs->setCurrentIndex(index);
+    }
+
+    // 状态栏的坐标标签来自鼠标事件，切页时不会自动刷新，先归位
+    if (m_coordinateLabel) {
+        m_coordinateLabel->setText(QStringLiteral("X: --   Y: --"));
+    }
+    if (m_scaleLabel) {
+        const double scale = m_canvas->view().scale();
+        m_scaleLabel->setText(QStringLiteral("缩放 1:%1").arg(1.0 / scale, 0, 'g', 3));
+    }
+
+    m_canvas->setFocus();
+    updateWindowTitle();
+    refreshPanels();
+    updateStatusModes();
+    updateSelectionDependent();
+}
+
+void MainWindow::closeSession(int index, bool confirmSave)
+{
+    if (index < 0 || index >= m_sessions.size()) return;
+
+    DocumentSession* session = m_sessions.at(index);
+
+    // 最后一个标签页不关闭：关掉它窗口就没有中央控件可显示了，
+    // 改成重置为一张空图（与旧版「新建」的语义一致）
+    if (m_sessions.size() == 1) {
+        if (confirmSave && !maybeSaveSession(session)) return;
+        if (m_toolManager->isCommandRunning()) m_toolManager->cancel();
+        m_document->clear(true);
+        m_document->setFilePath(QString());
+        m_canvas->view().reset();
+        m_canvas->zoomExtents();
+        pushMessage(QStringLiteral("已重置为空图。"));
+        refreshPanels();
+        updateWindowTitle();
+        return;
+    }
+
+    if (confirmSave && !maybeSaveSession(session)) return;
+
+    m_sessions.removeAt(index);
+    m_tabs->removeTab(index);   // 只摘页面，不删除控件；会话由父对象统一回收
+    if (session == m_session) m_session = nullptr;   // 强制下面的重挂到新活动页
+    session->deleteLater();
+
+    pushMessage(QStringLiteral("已关闭 \"%1\"。")
+                    .arg(session->document->displayName()));
+
+    if (!m_sessions.isEmpty()) {
+        setActiveSession(m_sessions.at(qMin(index, m_sessions.size() - 1)));
+    }
+}
+
+bool MainWindow::maybeSaveSession(DocumentSession* session)
+{
+    if (!session->document->isModified()) return true;
+
+    // 先切到该标签页再询问：用户正在决定去留的那张图应当看得见
+    setActiveSession(session);
+    return maybeSaveChanges();
+}
+
+void MainWindow::connectSession(DocumentSession* session)
+{
+    Document* document = session->document;
+    CadCanvas* canvas = session->canvas;
+    ToolManager* tools = session->tools;
+
+    // ---- 文档 -> 界面 ----
+    // 修改与重置涉及标签页文字：文件名或未保存标记变了，标签要跟着变；
+    // 活动会话还须同步窗口标题
+    connect(document, &Document::modificationChanged, this, [this, session] {
+        updateTabTitle(session);
+        updateSelectionDependent();
+        if (session == m_session) updateWindowTitle();
+    });
+    connect(document, &Document::filePathChanged, this, [this, session] {
+        updateTabTitle(session);
+        if (session == m_session) updateWindowTitle();
+    });
+    connect(document, &Document::documentReset, this, [this, session] {
+        updateTabTitle(session);
+        if (session == m_session) {
+            updateWindowTitle();
+            refreshPanels();
+            updateSelectionDependent();
+        }
+    });
+    connect(document, &Document::layersChanged, this, [this, session] {
+        if (session == m_session) refreshPanels();
+    });
+    connect(document, &Document::selectionChanged, this, [this, session] {
+        if (session == m_session) {
+            refreshPanels();
+            updateSelectionDependent();
+        }
+    });
+    // 增删图元时除了重绘，还必须刷新状态栏计数与撤销/重做按钮的可用状态。
+    // 这些信息不能只依赖 modificationChanged——「已修改」标记只在
+    // 干净↔脏 的边界翻转一次，连续新增多个图元时不会重复触发。
+    connect(document, &Document::entityAdded, this, [this, session] {
+        if (session == m_session) {
+            session->canvas->update();
+            updateSelectionDependent();
+        }
+    });
+    connect(document, &Document::entityRemoved, this, [this, session] {
+        if (session == m_session) {
+            session->canvas->update();
+            updateSelectionDependent();
+        }
+    });
+    connect(document, &Document::entityChanged, this, [this, session] {
+        if (session == m_session) session->canvas->update();
+    });
+
+    // ---- 画布 -> 界面 ----
+    // 只有可见（活动）的画布会产生鼠标事件，无需再判会话归属
+    connect(canvas, &CadCanvas::mouseWorldPositionChanged, this,
+            [this](const Point2D& world, const Point2D&) {
+                m_coordinateLabel->setText(QStringLiteral("X: %1   Y: %2")
+                                               .arg(formatLength(world.x, 4), formatLength(world.y, 4)));
+            });
+    connect(canvas, &CadCanvas::cursorLeftCanvas, this, [this] {
+        m_coordinateLabel->setText(QStringLiteral("X: --   Y: --"));
+    });
+    connect(canvas, &CadCanvas::viewChanged, this, [this] {
+        const double scale = m_canvas->view().scale();
+        m_scaleLabel->setText(QStringLiteral("缩放 1:%1").arg(1.0 / scale, 0, 'g', 3));
+    });
+
+    connect(canvas, &CadCanvas::contextMenuRequested, this,
+            [this](const QPoint& globalPos) {
+        QMenu menu(this);
+
+        if (m_toolManager->isCommandRunning()) {
+            menu.addAction(QStringLiteral("取消当前命令"), this, [this] { m_toolManager->cancel(); });
+            menu.addSeparator();
+        } else if (!m_toolManager->lastCommandName().isEmpty()) {
+            menu.addAction(QStringLiteral("重复 %1").arg(m_toolManager->lastCommandName()),
+                           this, [this] { m_toolManager->repeatLastCommand(); });
+            menu.addSeparator();
+        }
+
+        menu.addAction(QStringLiteral("全选"), this, [this] { m_selectAllAction->trigger(); });
+        menu.addAction(QStringLiteral("删除所选"), this, [this] {
+            if (!m_document->selection().isEmpty()) runCommand(QStringLiteral("ERASE"));
+        });
+        menu.addSeparator();
+        menu.addAction(QStringLiteral("缩放至图形范围"), this,
+                       [this] { if (m_canvas) m_canvas->zoomExtents(); });
+        menu.addAction(QStringLiteral("缩放至选择集"), this,
+                       [this] { if (m_canvas) m_canvas->zoomToSelection(); });
+
+        menu.exec(globalPos);
+    });
+
+    // ---- 工具管理器 -> 命令行 ----
+    connect(tools, &ToolManager::promptChanged, this, [this](const QString& prompt) {
+        m_commandLine->setPrompt(prompt);
+    });
+    connect(tools, &ToolManager::commandMessage, this, [this](const QString& text) {
+        pushMessage(text);
+    });
+    connect(tools, &ToolManager::commandStarted, this, [this](const QString&) {
+        m_canvas->setFocus();
+    });
+    connect(tools, &ToolManager::commandEnded, this, [this, session](const QString&) {
+        if (session == m_session) refreshPanels();
+    });
+
+    // ---- 双击文字 -> 编辑内容 ----
+    connect(tools, &ToolManager::textEditRequested, this, [this](EntityId id) {
+        Entity* entity = m_document->entity(id);
+        if (!entity || entity->type() != EntityType::Text) return;
+        auto* text = static_cast<TextEntity*>(entity);
+
+        // 多行编辑：MTEXT 降级导入的文字内容里带 '\n'，单行输入框会把它们吃掉，
+        // 而回车又直接提交，用户补不出换行。对话框内 Enter 确认、Alt+Enter 换行。
+        // 同时可在对话框里改字体（初值取图元当前字体）。
+        TextEditDialog dialog(text->content(), text->fontStyle(), this);
+        if (dialog.exec() != QDialog::Accepted) return;
+
+        // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留。
+        const QString newContent = dialog.content().trimmed();
+        if (newContent.isEmpty()) {
+            pushMessage(QStringLiteral("文字内容不能为空，编辑已取消。"));
+            return;
+        }
+        const QString newFont = dialog.fontFamily();
+        const bool contentChanged = newContent != text->content();
+        const bool fontChanged = newFont != text->fontStyle();
+        if (!contentChanged && !fontChanged) return;   // 未变化不产生撤销记录
+
+        // 行数会随内容变化（也可能从单行变成多行，版面与包围盒都不一样），
+        // 命令行里说清楚结果，用户不必自己数。
+        auto replacement = text->clone();
+        auto* edited = static_cast<TextEntity*>(replacement.get());
+        edited->setContent(newContent);
+        if (fontChanged) {
+            // 与特性面板同一口径：先把字体登记进文字样式表（否则导出时会退化成
+            // txt.shx），再把样式名写到图元上。
+            m_document->ensureTextFontStyle(newFont);
+            edited->setFontStyle(newFont);
+        }
+        const int lines = edited->lineCount();
+        if (m_document->replaceEntity(id, std::move(replacement),
+                                      QStringLiteral("编辑文字"))) {
+            pushMessage(lines > 1
+                            ? QStringLiteral("已编辑文字（%1 行）。").arg(lines)
+                            : QStringLiteral("已编辑文字。"));
+            refreshPanels();
+        }
+    });
+}
+
+void MainWindow::updateTabTitle(DocumentSession* session)
+{
+    if (!m_tabs) return;
+
+    const int index = m_sessions.indexOf(session);
+    if (index < 0) return;
+
+    // 标签页文字 = 文件名 + 未保存标记（窗口标题另由 displayTitle 给出
+    // 带应用名的完整版本，两者不重复同一份内容）
+    QString text = session->document->displayName();
+    if (session->document->isModified()) text += QStringLiteral(" *");
+    m_tabs->setTabText(index, text);
+    m_tabs->setTabToolTip(index, session->document->filePath().isEmpty()
+                                     ? QStringLiteral("未命名图纸")
+                                     : session->document->filePath());
+}
+
+// -----------------------------------------------------------------------------
 //  文件操作
 // -----------------------------------------------------------------------------
 void MainWindow::newDocument()
 {
-    if (!maybeSaveChanges()) return;
-
-    m_document->clear(true);
-    m_document->setFilePath(QString());
-    m_canvas->view().reset();
-    m_canvas->zoomExtents();
-    pushMessage(QStringLiteral("已新建图纸。"));
-    updateWindowTitle();
-    refreshPanels();
+    // 多标签页下「新建」不再清空当前图，而是新开一个标签页——
+    // 当前图原样保留，用户可以在标签页之间随时切回来
+    DocumentSession* session = createSession();
+    session->canvas->zoomExtents();
+    pushMessage(QStringLiteral("已新建图纸（标签页 %1/%2）。")
+                    .arg(m_tabs->currentIndex() + 1)
+                    .arg(m_tabs->count()));
 }
 
 bool MainWindow::openDocument()
 {
-    if (!maybeSaveChanges()) return false;
-
+    // 打开不再要求先保存当前图：文件会开进新的标签页，当前图不受影响
     const QString filter = CodecRegistry::instance().importFilters().join(QStringLiteral(";;"));
     const QString path = QFileDialog::getOpenFileName(
         this, QStringLiteral("打开图形文件"), m_lastDirectory, filter);
@@ -1146,14 +1349,41 @@ bool MainWindow::openDocument()
 
 bool MainWindow::loadFromPath(const QString& path)
 {
+    // 同一文件已在某个标签页打开时直接切换过去，避免同一份图开两份、
+    // 各改各的导致保存时互相覆盖
+    const QString absolute = QFileInfo(path).absoluteFilePath();
+    for (DocumentSession* session : m_sessions) {
+        if (session->document->filePath().isEmpty()) continue;
+        if (QFileInfo(session->document->filePath()).absoluteFilePath() == absolute) {
+            setActiveSession(session);
+            pushMessage(QStringLiteral("已切换到已打开的 %1。")
+                            .arg(QFileInfo(path).fileName()));
+            return true;
+        }
+    }
+
+    // 当前标签页是一张没动过的空图（刚启动/刚被清空）就直接用它装载，
+    // 免得空标签页越积越多；否则新开一个标签页
+    DocumentSession* target;
+    const bool reuseEmpty = m_document->isEmpty() && m_document->filePath().isEmpty()
+                            && !m_document->isModified();
+    if (reuseEmpty) {
+        target = m_session;
+    } else {
+        target = createSession();
+    }
+
     QApplication::setOverrideCursor(Qt::WaitCursor);
 
-    IoResult result = CadFile::load(path, *m_document);
+    IoResult result = CadFile::load(path, *target->document);
 
     QApplication::restoreOverrideCursor();
 
     reportIoResult(QStringLiteral("打开文件"), result);
     if (!result.ok) {
+        // 装载失败时撤掉刚开的空标签页（若复用的是既有标签页则保留）；
+        // 不走保存询问——失败的装载没有值得保留的内容
+        if (!reuseEmpty) closeSession(m_sessions.indexOf(target), false);
         updateWindowTitle();
         refreshPanels();
         return false;
@@ -1163,7 +1393,8 @@ bool MainWindow::loadFromPath(const QString& path)
     QSettings()
         .setValue(QStringLiteral("path/lastDirectory"), m_lastDirectory);
 
-    m_canvas->zoomExtents();
+    target->canvas->zoomExtents();
+    updateTabTitle(target);
     updateWindowTitle();
     refreshPanels();
     updateSelectionDependent();
@@ -1421,6 +1652,12 @@ void MainWindow::updateWindowTitle()
 
 void MainWindow::updateStatusModes()
 {
+    // 屏蔽信号：这里是把按钮同步成工具管理器的现状（例如切换标签页后），
+    // 若让 toggled 再写回去，会在状态栏里留下一条多余的开/关消息
+    QSignalBlocker orthoBlocker(m_orthoButton);
+    QSignalBlocker polarBlocker(m_polarButton);
+    QSignalBlocker snapBlocker(m_snapButton);
+    QSignalBlocker gridBlocker(m_gridButton);
     if (m_orthoButton) m_orthoButton->setChecked(m_toolManager->orthoMode());
     if (m_polarButton) m_polarButton->setChecked(m_toolManager->polarTracking());
     if (m_snapButton) m_snapButton->setChecked(m_toolManager->snapSettings().enabled);
@@ -1547,7 +1784,13 @@ void MainWindow::setDarkInterface(bool dark)
                 .arg(c.ribbonBackground.name()));
     }
 
-    m_canvas->applyTheme(dark);
+    // 深浅切换覆盖全部标签页的画布：隐藏的画布也要跟上，否则切回去时
+    // 会看到一张旧配色的图。新建标签页的画布由 createSession 按当前
+    // 主题初始化，不在遍历里漏掉。
+    m_darkTheme = dark;
+    for (DocumentSession* session : m_sessions) {
+        session->canvas->applyTheme(dark);
+    }
     QSettings().setValue(QStringLiteral("ui/darkTheme"), dark);
 
     // 菜单项与功能区按钮是同一状态的两个入口，这里统一回写两者的勾选状态；
@@ -1665,9 +1908,13 @@ void MainWindow::submitCommandLineText(const QString& text)
 // -----------------------------------------------------------------------------
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    if (!maybeSaveChanges()) {
-        event->ignore();
-        return;
+    // 逐个标签页检查未保存的修改；任一步被取消就放弃退出
+    const QList<DocumentSession*> sessions = m_sessions;
+    for (DocumentSession* session : sessions) {
+        if (!maybeSaveSession(session)) {
+            event->ignore();
+            return;
+        }
     }
 
     QSettings settings;
@@ -1722,10 +1969,10 @@ void MainWindow::dropEvent(QDropEvent* event)
     const QList<QUrl> urls = event->mimeData()->urls();
     if (urls.isEmpty()) return;
 
-    const QString path = urls.first().toLocalFile();
-    if (path.isEmpty()) return;
-
-    if (maybeSaveChanges()) {
+    // 拖入的文件逐个开进各自的标签页；文件不用先保存——当前图不受影响
+    for (const QUrl& url : urls) {
+        const QString path = url.toLocalFile();
+        if (path.isEmpty()) continue;
         loadFromPath(path);
     }
     event->acceptProposedAction();

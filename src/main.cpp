@@ -34,19 +34,15 @@ int main(int argc, char* argv[])
     parser.addVersionOption();
     parser.addPositionalArgument(
         QStringLiteral("file"),
-        QStringLiteral("启动后要打开的图形文件（可省略）"));
+        QStringLiteral("启动后要打开的图形文件（可给多个，每个占一个标签页；可省略）"));
 
     parser.process(application);
 
     lycad::MainWindow window;
     window.show();
 
-    const QStringList positional = parser.positionalArguments();
-    if (!positional.isEmpty()) {
-        const QString path = positional.first();
-        if (QFileInfo::exists(path)) {
-            window.openFile(path);
-        }
+    for (const QString& path : parser.positionalArguments()) {
+        window.openFile(path);
     }
 
     return application.exec();
