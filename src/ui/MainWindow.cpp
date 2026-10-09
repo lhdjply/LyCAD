@@ -488,27 +488,42 @@ void MainWindow::createRibbon()
     // ---- 绘图 ----
     {
         RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("绘图"));
-        panel->addLargeCommand(QStringLiteral("line"), QStringLiteral("直线"),
-                               QStringLiteral("LINE"), QStringLiteral("直线 (LINE / L)"));
-        panel->addLargeCommand(QStringLiteral("polyline"), QStringLiteral("多段线"),
-                               QStringLiteral("PLINE"), QStringLiteral("多段线 (PLINE / PL)"));
-        panel->addLargeCommand(QStringLiteral("circle"), QStringLiteral("圆"),
-                               QStringLiteral("CIRCLE"), QStringLiteral("圆 (CIRCLE / C)"));
-        panel->addLargeCommand(QStringLiteral("arc"), QStringLiteral("圆弧"),
-                               QStringLiteral("ARC"), QStringLiteral("圆弧 (ARC / A)"));
-        panel->addLargeCommand(QStringLiteral("ellipse"), QStringLiteral("椭圆"),
-                               QStringLiteral("ELLIPSE"), QStringLiteral("椭圆 (ELLIPSE / EL)"));
+        // 「画线类」：直线、多段线、构造线、射线都是画线，只是线的形态不同。
+        // 主体保留直线（最常用）。构造线与射线一并收进来——它们是同一族
+        // 非闭合线（有限 / 无界），单独摆一格反而要用户在两处之间找。
+        auto* lineButton =
+            panel->addLargeDropDown(
+                QStringLiteral("line"), QStringLiteral("直线"),
+                QStringLiteral("下拉可切换：直线 / 多段线 / 构造线 / 射线"),
+                QStringLiteral("LINE"));
+        panel->addDropDownItem(lineButton, QStringLiteral("line"), QStringLiteral("直线"),
+                               QStringLiteral("LINE"));
+        panel->addDropDownItem(lineButton, QStringLiteral("polyline"), QStringLiteral("多段线"),
+                               QStringLiteral("PLINE"));
+        panel->addDropDownItem(lineButton, QStringLiteral("xline"), QStringLiteral("构造线"),
+                               QStringLiteral("XLINE"));
+        panel->addDropDownItem(lineButton, QStringLiteral("ray"), QStringLiteral("射线"),
+                               QStringLiteral("RAY"));
+
+        // 「画圆类」：圆、圆弧、椭圆都是曲线轮廓，主体保留圆（单击即用）。
+        auto* circleButton =
+            panel->addLargeDropDown(
+                QStringLiteral("circle"), QStringLiteral("圆"),
+                QStringLiteral("下拉可切换：圆 / 圆弧 / 椭圆"),
+                QStringLiteral("CIRCLE"));
+        panel->addDropDownItem(circleButton, QStringLiteral("circle"), QStringLiteral("圆"),
+                               QStringLiteral("CIRCLE"));
+        panel->addDropDownItem(circleButton, QStringLiteral("arc"), QStringLiteral("圆弧"),
+                               QStringLiteral("ARC"));
+        panel->addDropDownItem(circleButton, QStringLiteral("ellipse"), QStringLiteral("椭圆"),
+                               QStringLiteral("ELLIPSE"));
+
         panel->addSeparator();
+        // 矩形 / 点 / 填充各自独立，正好凑成一列小按钮
         panel->addSmallCommand(QStringLiteral("rectangle"), QStringLiteral("矩形"),
                                QStringLiteral("RECTANGLE"), QStringLiteral("矩形 (RECTANGLE / REC)"));
         panel->addSmallCommand(QStringLiteral("point"), QStringLiteral("点"),
                                QStringLiteral("POINT"), QStringLiteral("点 (POINT / PO)"));
-        panel->addSeparator();
-        panel->addSmallCommand(QStringLiteral("xline"), QStringLiteral("构造线"),
-                               QStringLiteral("XLINE"), QStringLiteral("构造线 (XLINE / XL)"));
-        panel->addSmallCommand(QStringLiteral("ray"), QStringLiteral("射线"),
-                               QStringLiteral("RAY"), QStringLiteral("射线 (RAY)"));
-        panel->addSeparator();
         panel->addSmallCommand(QStringLiteral("hatch"), QStringLiteral("填充"),
                                QStringLiteral("HATCH"), QStringLiteral("图案填充 (HATCH / H)"));
     }
@@ -542,26 +557,28 @@ void MainWindow::createRibbon()
         RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("注释"));
         panel->addLargeCommand(QStringLiteral("text"), QStringLiteral("文字"),
                                QStringLiteral("TEXT"), QStringLiteral("单行文字 (TEXT / DT)"));
-        panel->addLargeCommand(QStringLiteral("dim-linear"), QStringLiteral("线性标注"),
-                               QStringLiteral("DIMLINEAR"),
-                               QStringLiteral("线性标注 (DIMLINEAR / DLI)"));
-        panel->addLargeCommand(QStringLiteral("dim-aligned"), QStringLiteral("对齐标注"),
-                               QStringLiteral("DIMALIGNED"),
-                               QStringLiteral("对齐标注 (DIMALIGNED / DAL)"));
-        panel->addSeparator();
-        panel->addSmallCommand(QStringLiteral("dim-radius"), QStringLiteral("半径标注"),
-                               QStringLiteral("DIMRADIUS"),
-                               QStringLiteral("半径标注 (DIMRADIUS / DRA)"));
-        panel->addSmallCommand(QStringLiteral("dim-diameter"), QStringLiteral("直径标注"),
-                               QStringLiteral("DIMDIAMETER"),
-                               QStringLiteral("直径标注 (DIMDIAMETER / DDI)"));
-        panel->addSeparator();
-        panel->addSmallCommand(QStringLiteral("dim-ordinate"), QStringLiteral("坐标标注"),
-                               QStringLiteral("DIMORDINATE"),
-                               QStringLiteral("坐标标注 (DIMORDINATE / DIMORD)"));
-        panel->addSmallCommand(QStringLiteral("dim-arc"), QStringLiteral("弧长标注"),
-                               QStringLiteral("DIMARC"),
-                               QStringLiteral("弧长标注 (DIMARC / DAR)"));
+        // 六种标注全部收进一个下拉：它们只是量取对象或量取方式不同，用户一次只会
+        // 用到一种，摊成六个按钮会把注释面板撑满。
+        // 按钮文字写的是**当前生效的那一项**（初值 = 最常用的线性标注）：选过别的
+        // 项后按钮会跟着改名（见 RibbonPanel::selectDropDownItem），所以这里不能写
+        // 一个笼统的组名——按钮上写着什么，单击主体就执行什么。
+        auto* dimButton =
+            panel->addLargeDropDown(
+                QStringLiteral("dim-linear"), QStringLiteral("线性标注"),
+                QStringLiteral("下拉可切换：线性 / 对齐 / 弧长 / 半径 / 直径 / 坐标"),
+                QStringLiteral("DIMLINEAR"));
+        panel->addDropDownItem(dimButton, QStringLiteral("dim-linear"),
+                               QStringLiteral("线性标注"), QStringLiteral("DIMLINEAR"));
+        panel->addDropDownItem(dimButton, QStringLiteral("dim-aligned"),
+                               QStringLiteral("对齐标注"), QStringLiteral("DIMALIGNED"));
+        panel->addDropDownItem(dimButton, QStringLiteral("dim-arc"),
+                               QStringLiteral("弧长标注"), QStringLiteral("DIMARC"));
+        panel->addDropDownItem(dimButton, QStringLiteral("dim-radius"),
+                               QStringLiteral("半径标注"), QStringLiteral("DIMRADIUS"));
+        panel->addDropDownItem(dimButton, QStringLiteral("dim-diameter"),
+                               QStringLiteral("直径标注"), QStringLiteral("DIMDIAMETER"));
+        panel->addDropDownItem(dimButton, QStringLiteral("dim-ordinate"),
+                               QStringLiteral("坐标标注"), QStringLiteral("DIMORDINATE"));
     }
 
     // ---- 图层 ----
@@ -586,6 +603,29 @@ void MainWindow::createRibbon()
     {
         RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("特性"));
 
+        // 颜色与线宽是两个互相独立的属性，各自的默认取值都是「随层」。两个下拉
+        // 并排却没有任何文字时，用户看到的是两个一模一样的「随层」，分不清哪个
+        // 管颜色、哪个管线宽——各配一行小字说明。
+        const auto addLabeledField = [panel](const QString& caption, QWidget* field) {
+            auto* column = new QWidget(panel);
+            auto* columnLayout = new QVBoxLayout(column);
+            columnLayout->setContentsMargins(0, 0, 0, 0);
+            columnLayout->setSpacing(1);
+
+            auto* label = new QLabel(caption, column);
+            label->setObjectName(QStringLiteral("ribbonFieldCaption"));
+            // 与面板标题同一档字号：说明性文字，不跟控件正文抢视觉
+            QFont captionFont = label->font();
+            captionFont.setPointSizeF(std::max(6.0, captionFont.pointSizeF() - 1.5));
+            label->setFont(captionFont);
+
+            // 说明文字放在控件**下方**：功能区各面板的标题本来就在底部，
+            // 标签与标题同在下侧，整条功能区的「字在下」格局才统一。
+            columnLayout->addWidget(field);
+            columnLayout->addWidget(label);
+            panel->addWidget(column);
+        };
+
         m_colorCombo = new QComboBox(panel);
         for (int aci : propertyChoices::colors()) {
             // 注意 Qt 的带图标重载是「图标在前、文字在后」
@@ -604,7 +644,7 @@ void MainWindow::createRibbon()
                                 .arg(propertyChoices::colorText(aci)));
             }
         });
-        panel->addWidget(m_colorCombo);
+        addLabeledField(QStringLiteral("颜色"), m_colorCombo);
 
         m_lineweightCombo = new QComboBox(panel);
         for (int value : propertyChoices::lineweights()) {
@@ -622,7 +662,7 @@ void MainWindow::createRibbon()
                                 .arg(propertyChoices::lineweightText(value)));
             }
         });
-        panel->addWidget(m_lineweightCombo);
+        addLabeledField(QStringLiteral("线宽"), m_lineweightCombo);
     }
 
     // ---- 视图 ----

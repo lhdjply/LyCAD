@@ -277,22 +277,25 @@ int main(int argc, char* argv[])
         // 唯独绘图面板上没有按钮时，用户看到的和「没实现」没有区别——而这类
         // 缺口不会让任何单元测试变红，只有把按钮点一遍才暴露得出来。
         {
+            // 椭圆与圆共用一个下拉按钮，「椭圆」是菜单项而不是独立按钮：
+            // 相应地改为在功能区的下拉菜单里找它（菜单项对应的 QAction）。
             auto* ribbonBar = window.findChild<RibbonBar*>();
-            QToolButton* ellipseButton = nullptr;
+            QAction* ellipseAction = nullptr;
             if (ribbonBar) {
-                for (QToolButton* button : ribbonBar->findChildren<QToolButton*>()) {
-                    if (button->text() == QStringLiteral("椭圆")) {
-                        ellipseButton = button;
+                for (QAction* action : ribbonBar->findChildren<QAction*>()) {
+                    if (action->text() == QStringLiteral("椭圆")) {
+                        ellipseAction = action;
                         break;
                     }
                 }
             }
 
-            if (!ellipseButton) {
-                out() << QStringLiteral("  功能区「绘图」面板上没有椭圆按钮。") << Qt::endl;
+            if (!ellipseAction) {
+                out() << QStringLiteral("  功能区「绘图」面板的下拉菜单里没有椭圆入口。")
+                      << Qt::endl;
                 ++failures;
             } else if (!tools->hasCommand(QStringLiteral("ELLIPSE"))) {
-                out() << QStringLiteral("  椭圆按钮存在，但 ELLIPSE 命令没有注册。") << Qt::endl;
+                out() << QStringLiteral("  椭圆入口存在，但 ELLIPSE 命令没有注册。") << Qt::endl;
                 ++failures;
             } else if (canvas->document()) {
                 Document* target = canvas->document();
@@ -304,8 +307,29 @@ int main(int argc, char* argv[])
 
                 // ① 只走视觉与方向反馈：按钮 → 定轴的第一点 → 在正方向附近移动光标
                 //    → 两点定轴 → 移动光标预览 → 截图
-                ellipseButton->click();
+                //
+                // 触发前先记住按钮文字：菜单项被选中后，下拉按钮本身要切换成那一项
+                // （图标 + 文字一起换）。这是「选过哪项、按钮就是哪项」的行为，不
+                // 盯住它，后续重构很容易悄悄退化回「永远显示圆」。
+                auto* dropDownButton = [&]() -> QToolButton* {
+                    QObject* menu = ellipseAction->parent();
+                    return menu ? qobject_cast<QToolButton*>(menu->parent()) : nullptr;
+                }();
+                const QString textBefore = dropDownButton ? dropDownButton->text() : QString();
+
+                ellipseAction->trigger();
                 settle(application, 150);
+
+                if (dropDownButton) {
+                    const bool switched = dropDownButton->text() == QStringLiteral("椭圆")
+                                          && textBefore != QStringLiteral("椭圆");
+                    out() << QStringLiteral("  下拉按钮随选择切换（%1 → %2）: %3")
+                                 .arg(textBefore, dropDownButton->text(),
+                                      switched ? QStringLiteral("通过")
+                                               : QStringLiteral("失败"))
+                          << Qt::endl;
+                    if (!switched) ++failures;
+                }
 
                 // 光标移动直接送进工具管理器，而不是走 QTest::mouseMove：
                 // 离屏平台下合成移动会被合并/丢弃（实测三次里只有一次到达），
@@ -380,7 +404,7 @@ int main(int argc, char* argv[])
                 //    另一条半轴 90 → 中心 (100150,100000)、长半轴 150、比值 0.6
                 const int undoBefore = target->undoStack()->index();
 
-                ellipseButton->click();
+                ellipseAction->trigger();
                 settle(application, 120);
                 tools->submitText(QStringLiteral("100000,100000"));
                 tools->submitText(QStringLiteral("100300,100000"));

@@ -47,6 +47,29 @@ public:
     QToolButton* addSmallCommand(const QString& iconName, const QString& text,
                                  const QString& command, const QString& tooltip);
 
+    /// 大按钮 + 下拉菜单：主体点击执行 primaryCommand，右侧箭头展开菜单，
+    /// 菜单项由 addDropDownItem 追加。
+    ///
+    /// 用途是「同一族的命令」——圆与椭圆这类只是参数不同、用户不会同时用到的
+    /// 命令合成一格：主体仍是主命令（保留了单击即用的手感），备选项收在箭头里，
+    /// 面板不至于被一族命令各占一格撑满。
+    QToolButton* addLargeDropDown(const QString& iconName, const QString& text,
+                                  const QString& tooltip, const QString& primaryCommand);
+
+    /// 往下拉按钮的菜单追加一项（button 须为 addLargeDropDown 的返回值）。
+    /// 菜单项同样参与主题换色：图标名也记在 action 上，供 refreshIcons 重取。
+    void addDropDownItem(QToolButton* button, const QString& iconName,
+                         const QString& text, const QString& command);
+
+    /// 小按钮 + 下拉菜单：与 addLargeDropDown 同一套分工，只是按钮形态是
+    /// 图标在左、文字在右的紧凑样式。
+    ///
+    /// 目前功能区的小按钮（矩形 / 点 / 填充）各自独立、没有合并，本方法暂无
+    /// 调用者。保留它是为了与 addLargeDropDown 对称——再遇到「一族小按钮该合成
+    /// 一格」时直接可用，不必回头补一套。
+    QToolButton* addSmallDropDown(const QString& iconName, const QString& text,
+                                  const QString& tooltip, const QString& primaryCommand);
+
     /// 嵌入任意控件（下拉框等），与按钮一样靠面板顶部对齐
     void addWidget(QWidget* widget);
 
@@ -71,6 +94,12 @@ private:
     void flushColumn();
     /// 结束当前列并新开一列小按钮
     QVBoxLayout* startColumn();
+
+    /// 把下拉按钮切换成刚选中的那一项：图标、文字、当前主命令、最小宽度一起更新。
+    /// 这是 AutoCAD 下拉按钮的既有行为——选过哪一项，按钮上显示的就是哪一项，
+    /// 下次直接单击主体即可重复使用，不必每次展开菜单。
+    void selectDropDownItem(QToolButton* button, const QString& iconName,
+                            const QString& text, const QString& command);
 
     QHBoxLayout* m_body = nullptr;
     QVBoxLayout* m_column = nullptr;
