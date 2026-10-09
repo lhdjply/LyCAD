@@ -224,6 +224,7 @@ bool textValuesOf(const Entity* entity, TextPropertyValues& values)
     values.rotation = text->rotation();
     values.hAlign = text->hAlign();
     values.vAlign = text->vAlign();
+    values.fontStyle = text->fontStyle();
     return true;
 }
 
@@ -236,6 +237,7 @@ void TextPropertyCommand::assign(TextEntity& text, const TextPropertyValues& val
     if (values.rotation) text.setRotation(*values.rotation);
     if (values.hAlign) text.setHAlign(*values.hAlign);
     if (values.vAlign) text.setVAlign(*values.vAlign);
+    if (values.fontStyle) text.setFontStyle(*values.fontStyle);
 }
 
 TextPropertyCommand::TextPropertyCommand(Document* document,

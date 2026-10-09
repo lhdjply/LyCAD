@@ -884,7 +884,8 @@ void MainWindow::connectSignals()
 
         // 多行编辑：MTEXT 降级导入的文字内容里带 '\n'，单行输入框会把它们吃掉，
         // 而回车又直接提交，用户补不出换行。对话框内 Enter 确认、Alt+Enter 换行。
-        TextEditDialog dialog(text->content(), this);
+        // 同时可在对话框里改字体（初值取图元当前字体）。
+        TextEditDialog dialog(text->content(), text->fontStyle(), this);
         if (dialog.exec() != QDialog::Accepted) return;
 
         // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留。
@@ -893,13 +894,22 @@ void MainWindow::connectSignals()
             pushMessage(QStringLiteral("文字内容不能为空，编辑已取消。"));
             return;
         }
-        if (newContent == text->content()) return;   // 未变化不产生撤销记录
+        const QString newFont = dialog.fontFamily();
+        const bool contentChanged = newContent != text->content();
+        const bool fontChanged = newFont != text->fontStyle();
+        if (!contentChanged && !fontChanged) return;   // 未变化不产生撤销记录
 
         // 行数会随内容变化（也可能从单行变成多行，版面与包围盒都不一样），
         // 命令行里说清楚结果，用户不必自己数。
         auto replacement = text->clone();
         auto* edited = static_cast<TextEntity*>(replacement.get());
         edited->setContent(newContent);
+        if (fontChanged) {
+            // 与特性面板同一口径：先把字体登记进文字样式表（否则导出时会退化成
+            // txt.shx），再把样式名写到图元上。
+            m_document->ensureTextFontStyle(newFont);
+            edited->setFontStyle(newFont);
+        }
         const int lines = edited->lineCount();
         if (m_document->replaceEntity(id, std::move(replacement),
                                       QStringLiteral("编辑文字"))) {
@@ -1021,6 +1031,13 @@ void MainWindow::connectSignals()
     connect(m_propertyPanel, &PropertyPanel::textVAlignChangeRequested, this,
             [this](TextEntity::VAlign vAlign) {
                 m_document->setEntitiesTextVAlign(m_document->selection().ids(), vAlign);
+                m_propertyPanel->refresh(m_document);
+            });
+    // 字体：选择即写入选中文字的样式名（空串 = 回退默认字体）。Document 会把该
+    // 字体登记进文字样式表，保证导出 DXF 时字体信息不丢。
+    connect(m_propertyPanel, &PropertyPanel::textFontChangeRequested, this,
+            [this](const QString& family) {
+                m_document->setEntitiesTextFont(m_document->selection().ids(), family);
                 m_propertyPanel->refresh(m_document);
             });
 

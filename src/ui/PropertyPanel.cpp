@@ -13,6 +13,8 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QFont>
+#include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QLabel>
@@ -75,6 +77,19 @@ PropertyPanel::PropertyPanel(QWidget* parent)
     // 字高与旋转是连续量，用 spin box 让用户直接键入数值；对齐是离散枚举，用下拉框。
     // 两个 spin box 都关掉 keyboardTracking：否则键入「12」会先按「1」发一次
     // valueChanged、再按「12」发一次，撤销栈里就多出一条「修改字高 1」的记录。
+
+    // 字体下拉：首项「（默认）」的数据是空串（图元 fontStyle 为空 = 用系统默认字体），
+    // 其余为系统已安装的字体族。每项用该字体自身渲染，选择前就能看到字形。
+    m_textFont = new QComboBox(this);
+    m_textFont->addItem(QStringLiteral("（默认）"), QString());
+    for (const QString& family : QFontDatabase::families()) {
+        m_textFont->addItem(family, family);
+        m_textFont->setItemData(m_textFont->count() - 1, QFont(family), Qt::FontRole);
+    }
+    m_textFont->setObjectName(QStringLiteral("propertyPanel.textFont"));
+    m_textFont->setToolTip(QStringLiteral(
+        "文字所用的字体；「（默认）」表示不指定，由系统默认字体绘制"));
+
     m_textHeight = new QDoubleSpinBox(this);
     m_textHeight->setDecimals(2);
     m_textHeight->setRange(0.01, 100000.0);
@@ -114,6 +129,7 @@ PropertyPanel::PropertyPanel(QWidget* parent)
 
     auto* textForm = new QFormLayout();
     textForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    textForm->addRow(QStringLiteral("字体"), m_textFont);
     textForm->addRow(QStringLiteral("字高"), m_textHeight);
     textForm->addRow(QStringLiteral("旋转"), m_textRotation);
     textForm->addRow(QStringLiteral("水平对齐"), m_textHAlign);
@@ -207,6 +223,11 @@ PropertyPanel::PropertyPanel(QWidget* parent)
         emit visibleChangeRequested(checked);
     });
 
+    connect(m_textFont, &QComboBox::currentIndexChanged, this, [this](int index) {
+        // index < 0 = 列表被清空后的「多种取值」状态，此时不构成一次用户改动
+        if (m_updating || index < 0) return;
+        emit textFontChangeRequested(m_textFont->itemData(index).toString());
+    });
     connect(m_textHeight, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         if (m_updating) return;
         emit textHeightChangeRequested(value);
@@ -262,6 +283,7 @@ void PropertyPanel::setEnabledState(bool enabled)
     m_lineweightCombo->setEnabled(enabled);
     m_visibleCheck->setEnabled(enabled);
 
+    m_textFont->setEnabled(enabled);
     m_textHeight->setEnabled(enabled);
     m_textRotation->setEnabled(enabled);
     m_textHAlign->setEnabled(enabled);
@@ -415,6 +437,7 @@ void PropertyPanel::refresh(const Document* document)
         bool sameRotation = true;
         bool sameHAlign = true;
         bool sameVAlign = true;
+        bool sameFont = true;
         const long long firstHeight = displayKey(first->height(), 100.0);
         const long long firstRotation = displayKey(radToDeg(first->rotation()), 100.0);
 
@@ -424,6 +447,21 @@ void PropertyPanel::refresh(const Document* document)
                            && displayKey(radToDeg(text->rotation()), 100.0) == firstRotation;
             sameHAlign = sameHAlign && text->hAlign() == first->hAlign();
             sameVAlign = sameVAlign && text->vAlign() == first->vAlign();
+            sameFont = sameFont && text->fontStyle() == first->fontStyle();
+        }
+
+        // 字体：取值一致时定位到对应项（空串落在「（默认）」上，它带的数据也是空串）；
+        // 文档引用的字体本机没装（不在系统字体列表里）时临时补一项显示原名，
+        // 否则会被误显示成「（默认）」，用户以为字体设置丢了。
+        if (sameFont) {
+            int index = m_textFont->findData(first->fontStyle());
+            if (index < 0 && !first->fontStyle().isEmpty()) {
+                m_textFont->addItem(first->fontStyle(), first->fontStyle());
+                index = m_textFont->count() - 1;
+            }
+            m_textFont->setCurrentIndex(index);
+        } else {
+            m_textFont->setCurrentIndex(-1);
         }
 
         if (sameHeight) m_textHeight->setValue(first->height());

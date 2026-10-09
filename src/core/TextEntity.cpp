@@ -296,8 +296,12 @@ QString TextEntity::geometrySummary() const
     if (m_backwards) flags += QStringLiteral("水平镜像 ");
     if (m_upsideDown) flags += QStringLiteral("垂直镜像 ");
 
-    return QStringLiteral("内容: %1\n插入点: %2\n字高: %3\n旋转: %4\n对齐: %5/%6\n宽度因子: %7\n%8")
+    // 字体为空表示「未指定，用系统默认字体」，与属性面板「（默认）」一项同一口径
+    const QString font = m_fontStyle.isEmpty() ? QStringLiteral("（默认）") : m_fontStyle;
+
+    return QStringLiteral("内容: %1\n字体: %2\n插入点: %3\n字高: %4\n旋转: %5\n对齐: %6/%7\n宽度因子: %8\n%9")
         .arg(displayString(),
+             font,
              formatPoint(effectivePosition()),
              formatLength(m_height),
              formatAngle(m_rotation))

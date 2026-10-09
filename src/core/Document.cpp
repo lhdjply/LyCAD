@@ -457,6 +457,48 @@ bool Document::setEntitiesTextVAlign(const std::vector<EntityId>& ids, TextEntit
     return true;
 }
 
+void Document::ensureTextFontStyle(const QString& fontFamily)
+{
+    const QString family = fontFamily.trimmed();
+    // Standard 是默认样式，始终在表里，且带的是中文兜底 SHX 字体——
+    // 那不是用户选定的字体族，不应被这里改写。
+    if (family.isEmpty()
+        || family.compare(QStringLiteral("Standard"), Qt::CaseInsensitive) == 0) {
+        return;
+    }
+
+    TextStyle& style = m_textStyles.ensure(family);
+    if (style.hasFontInfo()) return;   // 已有字体信息（如文件读入的同名样式），保持原样
+
+    // SHX 字体（"simplex.shx"）走主字体文件名；其余按 TrueType 族名登记，
+    // 导出时写成 1000 扩展数据，渲染时按族名匹配系统字体。
+    if (family.endsWith(QLatin1String(".shx"), Qt::CaseInsensitive)) {
+        style.setFontFile(family);
+    } else {
+        style.setTtfName(family);
+    }
+}
+
+bool Document::setEntitiesTextFont(const std::vector<EntityId>& ids, const QString& fontFamily)
+{
+    const QString family = fontFamily.trimmed();
+
+    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    // 先登记样式、再让图元引用它。顺序反过来的话，导出时样式表里还没有这条样式，
+    // 字体信息会被兜底成 txt.shx，选择在文件往返后就丢了。
+    // 样式条目的新增不随撤销回退（与 AutoCAD 一致，多余样式需 PURGE 清理），
+    // 但图元上的样式名引用是可撤销的——那才是用户感知到的这次修改。
+    ensureTextFontStyle(family);
+
+    TextPropertyValues values;
+    values.fontStyle = family;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改文字字体")));
+    return true;
+}
+
 bool Document::setEntitiesInsertScale(const std::vector<EntityId>& ids,
                                       double scaleX, double scaleY)
 {

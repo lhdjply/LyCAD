@@ -48,6 +48,8 @@ signals:
     void textHAlignChangeRequested(TextEntity::HAlign hAlign);
     /// 垂直对齐（DXF 73）
     void textVAlignChangeRequested(TextEntity::VAlign vAlign);
+    /// 字体（字体族名；空串表示回退到默认字体）
+    void textFontChangeRequested(const QString& fontFamily);
 
     /// 块参照插入比例（X / Y；Z 保持不变）
     void blockScaleChangeRequested(double scaleX, double scaleY);
@@ -66,6 +68,7 @@ private:
     QCheckBox*      m_visibleCheck = nullptr;
 
     QGroupBox*      m_textGroup = nullptr;
+    QComboBox*      m_textFont = nullptr;          ///< 字体族；首项「（默认）」的数据为空串
     QDoubleSpinBox* m_textHeight = nullptr;
     QDoubleSpinBox* m_textRotation = nullptr;      ///< 显示单位是度
     QComboBox*      m_textHAlign = nullptr;

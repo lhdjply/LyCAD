@@ -153,6 +153,9 @@ struct TextPropertyValues {
     std::optional<double> rotation;                             ///< 弧度
     std::optional<TextEntity::HAlign> hAlign;
     std::optional<TextEntity::VAlign> vAlign;
+    /// 字体（DXF 7 样式名，同时也是渲染所用的字体族名）。空串表示「不指定、
+    /// 用默认字体」，因此这里用 optional 区分「本次不动」与「清空字体」。
+    std::optional<QString> fontStyle;
 };
 
 class TextPropertyCommand : public QUndoCommand {

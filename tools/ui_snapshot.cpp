@@ -1154,12 +1154,15 @@ int main(int argc, char* argv[])
             auto* vAlignBox = panel ? panel->findChild<QComboBox*>(
                                           QStringLiteral("propertyPanel.textVAlign"))
                                     : nullptr;
+            auto* fontBox = panel ? panel->findChild<QComboBox*>(
+                                        QStringLiteral("propertyPanel.textFont"))
+                                  : nullptr;
             auto* textGroup = panel ? panel->findChild<QGroupBox*>(
                                           QStringLiteral("propertyPanel.textGroup"))
                                     : nullptr;
 
             if (!propertyDoc || !heightBox || !rotationBox || !hAlignBox || !vAlignBox
-                || !textGroup) {
+                || !fontBox || !textGroup) {
                 out() << QStringLiteral("  找不到特性面板的文字属性控件。") << Qt::endl;
                 ++failures;
             } else {
@@ -1184,6 +1187,7 @@ int main(int argc, char* argv[])
                     const double originalRotation = before->rotation();
                     const TextEntity::HAlign originalHAlign = before->hAlign();
                     const TextEntity::VAlign originalVAlign = before->vAlign();
+                    const QString originalFont = before->fontStyle();
                     const int records = propertyDoc->undoStack()->index();
 
                     if (!textGroup->isVisible()) {
@@ -1193,7 +1197,7 @@ int main(int argc, char* argv[])
 
                     // 目标值必须与当前值**确实不同**：这个工具要能跑在任意图纸上，
                     // 而被选中的文字本来就可能是 90° 或居中——设成同一个值不会产生
-                    // 撤销记录，后面的「+4 条记录」断言就会莫名其妙地失败。
+                    // 撤销记录，后面的「+4/+5 条记录」断言就会莫名其妙地失败。
                     const double targetHeight =
                         std::abs(originalHeight - 4.0) > 1e-6 ? 4.0 : 6.0;
                     const double targetRotationDeg =
@@ -1205,13 +1209,24 @@ int main(int argc, char* argv[])
                         originalVAlign == TextEntity::VAlign::Top ? TextEntity::VAlign::Baseline
                                                                   : TextEntity::VAlign::Top;
 
-                    // 逐项驱动：字高、旋转、水平对齐、垂直对齐
+                    // 字体：目标同样要与当前值不同——当前已有字体就切回「（默认）」
+                    // （数据是空串），本来就是默认则挑第一款系统字体。
+                    const QString targetFont =
+                        originalFont.isEmpty() && fontBox->count() > 1
+                            ? fontBox->itemData(1).toString()
+                            : QString();
+                    const bool fontChanges = targetFont != originalFont;
+
+                    // 逐项驱动：字高、旋转、水平对齐、垂直对齐、字体
                     heightBox->setValue(targetHeight);
                     rotationBox->setValue(targetRotationDeg);          // 面板给的是度
                     hAlignBox->setCurrentIndex(
                         hAlignBox->findData(static_cast<int>(targetHAlign)));
                     vAlignBox->setCurrentIndex(
                         vAlignBox->findData(static_cast<int>(targetVAlign)));
+                    if (fontChanges) {
+                        fontBox->setCurrentIndex(fontBox->findData(targetFont));
+                    }
                     settle(application, 120);
 
                     const auto* after =
@@ -1221,18 +1236,22 @@ int main(int argc, char* argv[])
                         std::abs(after->rotation() - degToRad(targetRotationDeg)) < 1e-6;
                     const bool hAlignOk = after->hAlign() == targetHAlign;
                     const bool vAlignOk = after->vAlign() == targetVAlign;
-                    const bool undoOk = propertyDoc->undoStack()->index() == records + 4;
+                    const bool fontOk = !fontChanges || after->fontStyle() == targetFont;
+                    const bool undoOk =
+                        propertyDoc->undoStack()->index() == records + 4 + (fontChanges ? 1 : 0);
 
                     out() << QStringLiteral("  特性面板文字组：字高 %1 / 旋转 %2 / 水平对齐 %3 / "
-                                            "垂直对齐 %4 / 撤销记录 %5")
+                                            "垂直对齐 %4 / 字体 %5 / 撤销记录 %6")
                                  .arg(heightOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       rotationOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       hAlignOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       vAlignOk ? QStringLiteral("通过") : QStringLiteral("失败"),
-                                      undoOk ? QStringLiteral("+4")
+                                      fontOk ? QStringLiteral("通过") : QStringLiteral("失败"))
+                                 .arg(undoOk ? QStringLiteral("+%1").arg(4 + (fontChanges ? 1 : 0))
                                              : QStringLiteral("异常"))
                           << Qt::endl;
-                    if (!heightOk || !rotationOk || !hAlignOk || !vAlignOk || !undoOk) {
+                    if (!heightOk || !rotationOk || !hAlignOk || !vAlignOk || !fontOk
+                        || !undoOk) {
                         ++failures;
                     }
 
@@ -1245,7 +1264,8 @@ int main(int argc, char* argv[])
                     if (std::abs(restored->height() - originalHeight) > 1e-9
                         || std::abs(restored->rotation() - originalRotation) > 1e-9
                         || restored->hAlign() != originalHAlign
-                        || restored->vAlign() != originalVAlign) {
+                        || restored->vAlign() != originalVAlign
+                        || restored->fontStyle() != originalFont) {
                         out() << QStringLiteral("  撤销后文字属性没有回到原值。") << Qt::endl;
                         ++failures;
                     }

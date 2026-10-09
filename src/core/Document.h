@@ -104,6 +104,9 @@ public:
     bool setEntitiesTextHAlign(const std::vector<EntityId>& ids, TextEntity::HAlign hAlign);
     /// 修改垂直对齐（DXF 73）
     bool setEntitiesTextVAlign(const std::vector<EntityId>& ids, TextEntity::VAlign vAlign);
+    /// 修改文字字体（字体族名；同名的真实字体在渲染时被采用）。
+    /// 空串表示清除字体设置、回退到默认字体。
+    bool setEntitiesTextFont(const std::vector<EntityId>& ids, const QString& fontFamily);
 
     // ---- 块参照属性（只作用于选择集里的块参照，其它类型忽略） -------------------
     //
@@ -143,6 +146,13 @@ public:
     /// 文字样式表：图元只带样式名（DXF 7），字体按名在这里解析
     TextStyleTable& textStyles() noexcept { return m_textStyles; }
     const TextStyleTable& textStyles() const noexcept { return m_textStyles; }
+
+    /// 把某个字体族登记为一条同名文字样式（幂等、不进撤销栈）。
+    ///
+    /// 字体信息是文档级数据：图元只引用样式名，字体本体存在 STYLE 表里。
+    /// 若只改图元的样式名而不登记样式，导出时该样式没有字体信息，
+    /// 会被兜底成 txt.shx——字体选择在文件往返后就丢了。
+    void ensureTextFontStyle(const QString& fontFamily);
 
     bool addLayer(const Layer& layer, QString* error = nullptr);
     bool removeLayer(const QString& name, bool moveEntitiesToDefault = true,

@@ -3,8 +3,12 @@
 // =============================================================================
 #include "ui/TextEditDialog.h"
 
+#include <QComboBox>
 #include <QDialogButtonBox>
+#include <QFont>
+#include <QFontDatabase>
 #include <QFontMetrics>
+#include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QPlainTextEdit>
@@ -55,11 +59,38 @@ protected:
 
 } // namespace
 
-TextEditDialog::TextEditDialog(const QString& content, QWidget* parent)
+TextEditDialog::TextEditDialog(const QString& content,
+                               const QString& fontFamily,
+                               QWidget* parent)
     : QDialog(parent)
 {
     setWindowTitle(QStringLiteral("编辑文字"));
     setModal(true);
+
+    // 字体选择：与特性面板同一套表达——首项「（默认）」的数据是空串。
+    // 编辑内容时顺手改字体是常见诉求（换一批标注的字体），不必再回特性面板。
+    m_font = new QComboBox(this);
+    m_font->setObjectName(QStringLiteral("textEditDialog.font"));
+    m_font->addItem(QStringLiteral("（默认）"), QString());
+    for (const QString& family : QFontDatabase::families()) {
+        m_font->addItem(family, family);
+        m_font->setItemData(m_font->count() - 1, QFont(family), Qt::FontRole);
+    }
+    m_font->setToolTip(QStringLiteral(
+        "文字所用字体；「（默认）」表示不指定，由系统默认字体绘制"));
+    // 当前字体可能是本机没装的（文件带来的）：补一项显示原名，不要显示成「（默认）」
+    const QString currentFont = fontFamily.trimmed();
+    int fontIndex = m_font->findData(currentFont);
+    if (fontIndex < 0 && !currentFont.isEmpty()) {
+        m_font->addItem(currentFont, currentFont);
+        fontIndex = m_font->count() - 1;
+    }
+    m_font->setCurrentIndex(fontIndex >= 0 ? fontIndex : 0);
+
+    auto* fontRow = new QHBoxLayout();
+    fontRow->setContentsMargins(0, 0, 0, 0);
+    fontRow->addWidget(new QLabel(QStringLiteral("字体"), this));
+    fontRow->addWidget(m_font, 1);
 
     m_edit = new ContentEdit(this);
     m_edit->setPlainText(content);
@@ -80,6 +111,7 @@ TextEditDialog::TextEditDialog(const QString& content, QWidget* parent)
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     auto* layout = new QVBoxLayout(this);
+    layout->addLayout(fontRow);
     layout->addWidget(m_edit, 1);
     layout->addWidget(hint);
     layout->addWidget(buttons);
@@ -111,6 +143,11 @@ QString TextEditDialog::content() const
 int TextEditDialog::lineCount() const
 {
     return m_edit->document()->blockCount();
+}
+
+QString TextEditDialog::fontFamily() const
+{
+    return m_font->currentData().toString();
 }
 
 } // namespace lycad

@@ -16,6 +16,7 @@
 
 #include <QDialog>
 
+class QComboBox;
 class QPlainTextEdit;
 
 namespace lycad {
@@ -25,15 +26,22 @@ class TextEditDialog : public QDialog {
 
 public:
     /// content 里的 '\n' 会原样显示为换行（不转换成任何转义形式）。
-    explicit TextEditDialog(const QString& content, QWidget* parent = nullptr);
+    /// fontFamily 是图元当前的字体（空串 = 未指定/默认），用于字体下拉的初始选中。
+    explicit TextEditDialog(const QString& content,
+                            const QString& fontFamily,
+                            QWidget* parent = nullptr);
 
     /// 编辑后的内容，换行是真换行（'\n'），与 TextEntity::content() 同一口径。
     QString content() const;
     /// 内容占用的行数（用于界面提示与测试断言）
     int lineCount() const;
 
+    /// 用户选定的字体族名；空串表示「（默认）」，即不指定字体。
+    QString fontFamily() const;
+
 private:
     QPlainTextEdit* m_edit = nullptr;
+    QComboBox*      m_font = nullptr;
 };
 
 } // namespace lycad
