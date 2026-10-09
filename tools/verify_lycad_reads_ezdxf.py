@@ -7,8 +7,8 @@
 本脚本验证「独立实现写出的文件能被 LyCAD 读懂」。
 
 刻意覆盖 LyCAD 内部并非原生建模、需要做语义转换的内容：
-  · 块定义 + INSERT 引用（LyCAD 在导入时按插入点/比例/旋转展开）
-  · 嵌套 INSERT（块中引用块）
+  · 块定义 + INSERT 引用（导入不炸开：块定义进块表，INSERT 保留为块参照）
+  · 嵌套 INSERT（块中引用块，同样保留为引用）
   · 旧式 POLYLINE/VERTEX（非 LWPOLYLINE）
   · 文字 / 填充 / 尺寸标注（已建模，验证内容与测量值正确还原）
   · MTEXT：不建模但会**降级**为单行文字导入（计入 TEXT，警告中如实告知）
@@ -176,11 +176,13 @@ def main():
 
     # ---- 从参考文档推导期望值，避免写死数字 ----
     #
-    # LyCAD 在导入时把 INSERT 展开为独立图元（块内 0 层图元继承 INSERT 图层），
-    # 未建模的实体（MTEXT 等）被跳过。期望值按同一规则从源文档算出，
-    # 再与 LyCAD 的读取结果逐项比对。
+    # LyCAD 的导入策略是「块定义 + 引用」：块内容留在块定义里，INSERT 保留为
+    # 块参照（需要平面化时由 分解(EXPLODE) 显式触发，见 README 第 2 节）。
+    # 因此模型空间的期望值 = 源文档模型空间的**直接图元**（INSERT 计为图元
+    # 类型 INSERT），不再展开块内图元；块内图元按 0 层继承等语义的还原
+    # 由 test_block_insert 的单元测试盯住。
     SUPPORTED = {"LINE", "CIRCLE", "ARC", "POINT", "LWPOLYLINE", "POLYLINE",
-                 "TEXT", "HATCH", "DIMENSION"}
+                 "TEXT", "HATCH", "DIMENSION", "INSERT"}
     # LyCAD 内部把 LWPOLYLINE 与旧式 POLYLINE 统一表示为多段线
     NORMALIZE = {"POLYLINE": "LWPOLYLINE"}
     # 不建模、但导入时会降级为等价图元的类型（降级后计入目标类型，
@@ -204,25 +206,12 @@ def main():
         else:
             unsupported_types.add(dxftype)
 
-    def walk(entities_iter, inherited_layer):
-        for ent in entities_iter:
-            dxftype = ent.dxftype()
-            layer = ent.dxf.layer
-            # 块内位于 0 层的图元继承 INSERT 的图层
-            if inherited_layer and layer == "0":
-                layer = inherited_layer
-
-            if dxftype == "INSERT":
-                block = reference.blocks.get(ent.dxf.name)
-                if block is None:
-                    continue
-                walk(block, layer)
-            elif dxftype in ("ATTDEF", "ATTRIB", "SEQEND", "VERTEX"):
-                continue
-            else:
-                account(dxftype, layer)
-
-    walk(reference.modelspace(), None)
+    for ent in reference.modelspace():
+        dxftype = ent.dxftype()
+        # 属性定义/序号终结符等伴随实体不单独计数
+        if dxftype in ("ATTDEF", "ATTRIB", "SEQEND", "VERTEX"):
+            continue
+        account(dxftype, ent.dxf.layer)
 
     print(f"  期望（按源文档推导）: 类型={expected_types}")
     print(f"                        图层={expected_layers}")
@@ -244,8 +233,10 @@ def main():
     for dxftype in unsupported_types:
         check(dxftype in joined_warnings,
               f"未报告跳过 {dxftype}：{summary['warnings']}")
-    check("INSERT" in joined_warnings or "块引用" in joined_warnings,
-          f"未报告块引用展开：{summary['warnings']}")
+    # 块参照策略必须如实告知（保留为引用而不是静默展开或丢失）
+    check("块参照" in joined_warnings or "块引用" in joined_warnings
+          or "INSERT" in joined_warnings,
+          f"未报告块参照策略：{summary['warnings']}")
 
     # 中文图层名必须正确解码
     check("轮廓" in summary["layers"], f"中文图层「轮廓」丢失: {list(summary['layers'])}")
@@ -264,11 +255,16 @@ def main():
     colored = [e for e in by_type.get("CIRCLE", []) if e.get("color") == "3"]
     check(len(colored) == 1, f"显式颜色索引 3 应有 1 个圆，实际 {len(colored)}")
 
-    # 块展开的几何正确性：半径 20 的顶层圆与按比例缩放后的块内圆
+    # 顶层圆的几何：半径 20 ⇒ 周长 125.6637。块内圆（缩放/嵌套）不再展开到
+    # 模型空间，其还原由 test_block_insert 的单元测试按新口径盯住。
     lengths = sorted(round(float(e["len"]), 4) for e in by_type.get("CIRCLE", []))
-    expected_lengths = sorted(round(2 * math.pi * r, 4) for r in (20.0, 6.0, 3.0, 1.5, 1.5))
+    expected_lengths = sorted(round(2 * math.pi * r, 4) for r in (20.0,))
     check(all(any(close(a, b, 1e-3) for b in lengths) for a in expected_lengths),
           f"圆的周长集合不符: {lengths}，期望约 {expected_lengths}")
+
+    # 块参照：3 个 INSERT 必须保留为引用（2 个螺孔 + 1 个嵌套的螺孔组）
+    check(len(by_type.get("INSERT", [])) == 3,
+          f"应保留 3 个块参照，实际 {len(by_type.get('INSERT', []))}")
 
     # 闭合的旧式 POLYLINE 周长必须包含收尾段：40 + 30 + 50 = 120
     poly_lengths = sorted(round(float(e["len"]), 4) for e in by_type.get("LWPOLYLINE", []))

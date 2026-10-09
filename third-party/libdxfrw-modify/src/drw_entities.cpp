@@ -1047,6 +1047,650 @@ void DRW_Insert::parseCode(int code, dxfReader *reader){
     }
 }
 
+// DRW_Table 的完整解析在 dxfRW::processTable 里完成（两段子类标记需要
+// 上下文状态，单靠 parseCode 无法区分同名组码）。这里只处理兜底路径——
+// 当调用方直接把组码喂进来时，能解析的就解析。
+void DRW_Table::parseCode(int code, dxfReader *reader){
+    switch (code) {
+    case 2:
+        tableStyle = reader->getUtf8String();
+        break;
+    case 91:
+        numRows = reader->getInt32();
+        break;
+    case 92:
+        numCols = reader->getInt32();
+        break;
+    case 141:
+        rowHeights.push_back(reader->getDouble());
+        break;
+    case 142:
+        colWidths.push_back(reader->getDouble());
+        break;
+    default:
+        DRW_Point::parseCode(code, reader);
+        break;
+    }
+}
+
+namespace {
+
+// 行列数上限：垃圾计数（错位解析出的天文数字）不至于撑爆内存。
+constexpr dint32 kTableMaxDim = 5000;
+
+dint32 tableSafeCount(dint32 raw, dint32 cap = kTableMaxDim)
+{
+    if (raw < 0) return 0;
+    return raw > cap ? cap : raw;
+}
+
+/// UTF-16LE 字节串 → UTF-8。AcDbCellValue 的字符串值带 2 字节结尾 NUL。
+std::string tableUtf16ToUtf8(const duint8* data, dint32 bytes)
+{
+    std::string out;
+    if (!data || bytes <= 0) return out;
+    const dint32 units = bytes / 2;
+    out.reserve(static_cast<std::size_t>(units));
+    for (dint32 i = 0; i < units; ++i) {
+        const duint32 u = static_cast<duint32>(data[2 * i])
+                        | (static_cast<duint32>(data[2 * i + 1]) << 8);
+        if (u == 0) break;                       // 结尾 NUL
+        if (u < 0x80) {
+            out += static_cast<char>(u);
+        } else if (u < 0x800) {
+            out += static_cast<char>(0xC0 | (u >> 6));
+            out += static_cast<char>(0x80 | (u & 0x3F));
+        } else {
+            out += static_cast<char>(0xE0 | (u >> 12));
+            out += static_cast<char>(0x80 | ((u >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (u & 0x3F));
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+bool DRW_Table::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
+    // ACAD_TABLE 的 DWG 二进制布局（依据 opencadcodec 的 read_table /
+    // read_table_content / read_table_cell 系列实测位布局移植；旧实现的
+    // 「cells 编码未知」段落已按参考实现补全）。
+    //
+    // ★ 身份判定：ACAD_TABLE 是**实体**（entity），不是对象（object）。
+    //   判据来自 example.dwg 的 CLASSES 段实测：item_class_id 498 (0x1F2)
+    //   即判定为实体。公共头是实体公共数据（owner/link/layer 句柄链、preview
+    //   标志、entmode、numReactors…），由 DRW_Entity::parseDwg 负责。
+    //
+    // ★ 对象数据分三股流，需要三个独立游标：
+    //   · 数据流  buf ：实体公共数据之后继续；
+    //   · 句柄流  hbuf：自 objSize 位偏移起（R2000/2004/2007 是 bitsize RL，
+    //     2010+ 是「总位数 - UMC 句柄流位数」，两者都落在同一约定上）；
+    //   · 字符串流 sbuf：2007+（AC1021 及以上）才有，起点由 objSize-1 位上的
+    //     标志位给出——定位逻辑与 DRW_Entity::parseDwg 的 strBuf 完全一致；
+    //     2007 以下文字内联在数据流，sbuf 即 buf。
+    //
+    //   两条解析路径：
+    //   · R2000 ~ R2007（< AC1024）：扁平格式 —— 90 标志 / 11 水平方向 /
+    //     92 列数 / 91 行数 / 142 列宽×n / 141 行高×n / 表样式句柄（句柄流）/
+    //     rows×cols 单元格 / 4 个表级替代 bit；
+    //     单元格 = BS 类型 + RC 边框标志 + B merged + B autofit + BL 跨列 +
+    //     BL 跨行 + BD 旋转 + 值句柄（句柄流）+ [文字 TV（2007 以下内联）]
+    //     + [单元格样式替代] + [2007+ AcDbCellValue]。
+    //   · R2010+（≥ AC1024）：完整 TABLECONTENT —— 未知 RC/H/BL/(BL|B) 后接
+    //     列表（列名/自定义/样式/列宽）、行表（每行 ncells 个单元格）、
+    //     字段句柄表、基样式、合并区（top/left/bottom/right）、表样式句柄、
+    //     未知 BS、水平方向、断裂信息。
+    //
+    //   任一环节解析失败即清空结构化数据，上层退回 *Tnn 几何块反推兜底，
+    //   不会比旧行为更差。
+    DRW_DBG("\n************************** parsing ACAD_TABLE *****************************************\n");
+
+    // ---- 实体公共数据（含 bitsize/handle/EED/preview/entmode/numReactors/颜色…）----
+    if (!DRW_Entity::parseDwg(version, buf, nullptr, bs))
+        return false;
+    DRW_DBG(" objSize: "); DRW_DBG(objSize);
+    DRW_DBG(", numReactors: "); DRW_DBG(numReactors); DRW_DBG("\n");
+
+    // ---- AcDbBlockReference 段落（数据流） --------------------------------
+    basePoint.x = buf->getBitDouble();
+    basePoint.y = buf->getBitDouble();
+    basePoint.z = buf->getBitDouble();
+    DRW_DBG("insertion point: "); DRW_DBGPT(basePoint.x, basePoint.y, basePoint.z); DRW_DBG("\n");
+
+    // 比例编码与 INSERT 相同（bit pair）：
+    //   0 = 三个都读；1 = x 默认 1、y/z 可随 1；2 = x==y==z；3 = 全 1,1,1。
+    duint8 scaleFlag = buf->get2Bits();
+    if (scaleFlag == 0) {
+        xscale = buf->getRawDouble();
+        yscale = buf->getDefaultDouble(xscale);
+        zscale = buf->getDefaultDouble(xscale);
+    } else if (scaleFlag == 1) {
+        xscale = 1.0;
+        yscale = buf->getDefaultDouble(1.0);
+        zscale = buf->getDefaultDouble(1.0);
+    } else if (scaleFlag == 2) {
+        xscale = buf->getRawDouble();
+        yscale = zscale = xscale;
+    } else { // 3
+        xscale = yscale = zscale = 1.0;
+    }
+    DRW_DBG("scale : "); DRW_DBGPT(xscale, yscale, zscale); DRW_DBG("\n");
+
+    angle = buf->getBitDouble();
+    DRW_DBG(", angle: "); DRW_DBG(angle); DRW_DBG("\n");
+
+    extPoint = buf->getExtrusion(false); //3BD R14 style
+
+    bool hasAttrib = buf->getBit();
+    DRW_DBG("   has Attrib: "); DRW_DBG(hasAttrib);
+
+    // 2004+ 有属性个数
+    dint32 numOwned = 0;
+    if (version > DRW::AC1015) {
+        numOwned = buf->getBitLong();
+        DRW_DBG(", numOwned: "); DRW_DBG(numOwned);
+    }
+    DRW_DBG("\n");
+
+    // ---- 三个游标就位 -------------------------------------------------------
+    // 句柄流：克隆一份缓冲，绝对定位到 objSize 位偏移。
+    dwgBuffer hbuf = *buf;
+    hbuf.setPosition(objSize >> 3);
+    hbuf.setBitPos(objSize & 7);
+
+    // 字符串流：2007+ 才独立存在；克隆后按标志位舞步定位（与 parseDwg 一致）。
+    dwgBuffer sbufStore = *buf;
+    sbufStore.resetPosition();
+    dwgBuffer* sbuf = buf;
+    if (version > DRW::AC1018) {
+        sbufStore.moveBitPos(objSize - 1);
+        if (sbufStore.getBit() == 1) {
+            sbufStore.moveBitPos(-17);
+            duint16 strDataSize = sbufStore.getRawShort16();
+            if ((strDataSize & 0x8000) == 0x8000) {
+                sbufStore.moveBitPos(-33);
+                duint16 hiSize = sbufStore.getRawShort16();
+                strDataSize = static_cast<duint16>((strDataSize & 0x7FFF) | (hiSize << 15));
+            }
+            sbufStore.moveBitPos(-static_cast<dint32>(strDataSize) - 16);
+        }
+        sbuf = &sbufStore;
+    }
+
+    cells.clear();
+    merges.clear();
+
+    // 变长文本：2007+ 走字符串流，2000/2004 内联（TV = BS 长度 + 代码页字节）。
+    auto tvString = [&](bool& ok) -> UTF8STRING {
+        if (!ok) return UTF8STRING();
+        const UTF8STRING s = sbuf->getVariableText(version, false);
+        if (!sbuf->isGood()) ok = false;
+        return s;
+    };
+
+    // AcDbCellValue（2007+ 的单元格值）。只取文字，其余类型按位布局读掉。
+    auto readCadValue = [&](bool& ok) -> UTF8STRING {
+        if (!ok) return UTF8STRING();
+        const dint32 flags = buf->getBitLong();          // 值标志（bit0 抑制值体）
+        const dint32 tc = buf->getBitLong();             // 类型码
+        UTF8STRING text;
+        if ((flags & 1) == 0) {
+            switch (tc) {
+            case 0: case 1:
+                buf->getBitLong();                        // 整数
+                break;
+            case 2:
+                buf->getBitDouble();                      // 实数
+                break;
+            case 4: case 0x200: {
+                // BL 字节数 + UTF-16LE（含 2 字节结尾 NUL）
+                const dint32 len = tableSafeCount(buf->getBitLong(), 1 << 20);
+                if (len > 0) {
+                    std::vector<duint8> bytes(static_cast<std::size_t>(len));
+                    ok = buf->getBytes(bytes.data(), len) && buf->isGood();
+                    if (ok) text = tableUtf16ToUtf8(bytes.data(), len);
+                }
+                break;
+            }
+            case 8: {                                     // 二进制
+                const dint32 n = tableSafeCount(buf->getBitLong(), 1 << 24);
+                for (dint32 i = 0; ok && i < n; ++i) buf->getRawChar8();
+                break;
+            }
+            case 0x10: {                                  // 2D 点
+                const dint32 n = tableSafeCount(buf->getBitLong(), 1 << 24);
+                for (dint32 i = 0; ok && i < n; ++i) { buf->getRawDouble(); buf->getRawDouble(); }
+                break;
+            }
+            case 0x20: {                                  // 3D 点
+                const dint32 n = tableSafeCount(buf->getBitLong(), 1 << 24);
+                for (dint32 i = 0; ok && i < n; ++i) { buf->getRawDouble(); buf->getRawDouble(); buf->getRawDouble(); }
+                break;
+            }
+            case 0x40:
+                hbuf.getHandle();                         // 句柄值
+                break;
+            case 0x80: case 0x100:                        // 无体
+            default:
+                break;
+            }
+        }
+        if (ok) {
+            const dint32 unit = buf->getBitLong();        // 单位类型
+            tvString(ok);                                 // 格式串
+            if (unit != 12) tvString(ok);                 // 已格式化值
+        }
+        if (!buf->isGood() || !hbuf.isGood()) ok = false;
+        return text;
+    };
+
+    // 内容格式（对齐/旋转/文字样式…）。返回对齐方式（1~9，越界归 5）。
+    auto readContentFormat = [&](bool& ok) -> int {
+        if (!ok) return 5;
+        buf->getBitLong();                                // 替代标志
+        buf->getBitLong();                                // 属性标志
+        buf->getBitLong();                                // 值数据类型
+        buf->getBitLong();                                // 值单位类型
+        tvString(ok);                                     // 值格式串
+        buf->getBitDouble();                              // 旋转
+        buf->getBitDouble();                              // 缩放
+        int align = static_cast<int>(buf->getBitLong());  // 对齐
+        buf->getCmColor(version);                         // 内容颜色
+        hbuf.getHandle();                                 // 文字样式
+        buf->getBitDouble();                              // 文字高度
+        if (align < 1 || align > 9) align = 5;
+        if (!buf->isGood() || !hbuf.isGood()) ok = false;
+        return align;
+    };
+
+    // 单元格/行/列/基样式共用的样式块。dataFlags == 0 即无数据。
+    auto readCellStyle = [&](bool& ok) {
+        if (!ok) return;
+        buf->getBitLong();                                // 样式类型
+        const dint16 dataFlags = buf->getBitShort();
+        if (dataFlags == 0) return;
+        buf->getBitLong();                                // 替代标志
+        buf->getBitLong();                                // 属性标志
+        buf->getCmColor(version);                         // 背景色
+        buf->getBitLong();                                // 布局标志
+        readContentFormat(ok);
+        const dint16 marginFlags = buf->getBitShort();
+        if (marginFlags & 0x01) {
+            for (int i = 0; ok && i < 6; ++i) buf->getBitDouble();   // 四边距+横竖间距
+        }
+        const dint32 nBorders = tableSafeCount(buf->getBitLong());
+        for (dint32 i = 0; ok && i < nBorders; ++i) {
+            const duint32 edge = static_cast<duint32>(buf->getBitLong());
+            if (edge == 1 || edge == 2 || edge == 4 || edge == 8
+                || edge == 0x10 || edge == 0x20) {
+                buf->getBitLong();                        // 替代标志
+                buf->getBitLong();                        // 边框类型
+                buf->getCmColor(version);                 // 颜色
+                buf->getBitLong();                        // 线宽
+                hbuf.getHandle();                         // 线型
+                buf->getBitLong();                        // 不可见
+                buf->getBitDouble();                      // 双线间距
+            }
+            if (!buf->isGood() || !hbuf.isGood()) ok = false;
+        }
+        if (!buf->isGood() || !hbuf.isGood()) ok = false;
+    };
+
+    // ---- 句柄流公共段：owner/xdic/reactors/prev/next/layer → block_header
+    //      → [attribs…seqend] → tablestyle（仅 2010 以前在此处）------------
+    auto advanceCommonHandles = [&]() -> bool {
+        if (!DRW_Entity::parseDwgEntHandle(version, &hbuf))
+            return false;
+        blockRecH = hbuf.getHandle();
+        DRW_DBG("BLOCK HEADER Handle: "); DRW_DBGHL(blockRecH.code, blockRecH.size, blockRecH.ref); DRW_DBG("\n");
+        if (hasAttrib) {
+            if (version < DRW::AC1018) {          // 2000-
+                hbuf.getHandle();                 // first attrib
+                hbuf.getHandle();                 // last attrib
+            } else {
+                for (dint32 i = 0; i < numOwned && i < 10000; ++i)
+                    hbuf.getHandle();
+            }
+            hbuf.getHandle();                     // seqend
+        }
+        if (version < DRW::AC1024) {
+            tableStyleH = hbuf.getHandle();
+            DRW_DBG("tableStyle handle: "); DRW_DBGHL(tableStyleH.code, tableStyleH.size, tableStyleH.ref); DRW_DBG("\n");
+        }
+        return hbuf.isGood();
+    };
+
+    if (version < DRW::AC1024) {
+        // ---- R2000 ~ R2007：扁平格式（数据流） ----------------------------
+        if (version >= DRW::AC1015) {
+            buf->getBitShort();                   /* 90 flag_for_table_value */
+            buf->get3BitDouble();                 /* 11/21/31 水平方向（丢弃） */
+
+            numCols = tableSafeCount(buf->getBitLong());
+            numRows = tableSafeCount(buf->getBitLong());
+            DRW_DBG("rows: "); DRW_DBG(numRows); DRW_DBG(", cols: "); DRW_DBG(numCols); DRW_DBG("\n");
+
+            if (numCols > 0) {
+                colWidths.reserve(static_cast<size_t>(numCols));
+                for (int i = 0; i < numCols; ++i)
+                    colWidths.push_back(buf->getBitDouble());
+            } else {
+                numCols = 0;
+            }
+            if (numRows > 0) {
+                rowHeights.reserve(static_cast<size_t>(numRows));
+                for (int i = 0; i < numRows; ++i)
+                    rowHeights.push_back(buf->getBitDouble());
+            } else {
+                numRows = 0;
+            }
+
+            // 句柄流公共段先走完，之后才是各单元格的值句柄
+            advanceCommonHandles();
+            bool ok = buf->isGood() && hbuf.isGood();
+
+            for (int r = 0; ok && r < numRows; ++r) {
+                for (int c = 0; ok && c < numCols; ++c) {
+                    const dint16 ctype = buf->getBitShort();   // 1 文字 / 2 块 / 0 空
+                    buf->getRawChar8();                        // 边框标志
+                    buf->getBit();                             // merged
+                    buf->getBit();                             // auto fit
+                    const dint32 mergeW = buf->getBitLong();   // 跨列数
+                    const dint32 mergeH = buf->getBitLong();   // 跨行数
+                    buf->getBitDouble();                       // 旋转
+                    const dwgHandle valueH = hbuf.getHandle(); // 单元格值句柄
+                    int align = 5;
+
+                    if (ctype == 1) {
+                        if (version < DRW::AC1021 && valueH.ref == 0) {
+                            // 2000/2004：文字内联（TV）；值句柄非 0 时文字在别处
+                            Cell cell;
+                            cell.row = r;
+                            cell.col = c;
+                            cell.text = buf->getVariableText(version, false);
+                            if (!buf->isGood()) ok = false;
+                            if (ok && !cell.text.empty()) cells.push_back(cell);
+                        }
+                    } else if (ctype == 2) {
+                        buf->getBitDouble();                   // 块缩放
+                        if (buf->getBit()) {
+                            const dint16 natts = buf->getBitShort();
+                            for (dint16 a = 0; ok && a < natts; ++a) {
+                                hbuf.getHandle();              // 属性定义
+                                buf->getBitShort();            // 索引
+                                buf->getVariableText(version, false);   // 值
+                            }
+                        }
+                    }
+
+                    if (buf->getBit()) {                       // 单元格样式替代
+                        const dint32 flags = buf->getBitLong();
+                        buf->getRawChar8();                    // virtual edge
+                        if (flags & 0x01) align = buf->getBitShort();
+                        if (flags & 0x02) buf->getBit();       // fill
+                        if (flags & 0x04) buf->getCmColor(version);   // 背景色
+                        if (flags & 0x08) buf->getCmColor(version);   // 内容色
+                        if (flags & 0x10) hbuf.getHandle();    // 文字样式
+                        if (flags & 0x20) buf->getBitDouble(); // 文字高度
+                        for (int edge = 0; ok && edge < 4; ++edge) {
+                            const dint32 colorBit = 0x40 << edge;
+                            const dint32 lwBit = 0x400 << edge;
+                            if (flags & colorBit) buf->getCmColor(version);
+                            if (flags & lwBit) { buf->getBitShort(); buf->getBitShort(); }
+                        }
+                        if (align < 1 || align > 9) align = 5;
+                    }
+
+                    if (ok && version >= DRW::AC1021) {
+                        // 2007+：AcDbCellValue（数据流内联），携带单元格文字
+                        Cell cell;
+                        cell.row = r;
+                        cell.col = c;
+                        cell.text = readCadValue(ok);
+                        if (ok && !cell.text.empty()) cells.push_back(cell);
+                    }
+
+                    if (ok && (mergeW > 1 || mergeH > 1)) {
+                        Merge merge;
+                        merge.row = r;
+                        merge.col = c;
+                        merge.rowSpan = static_cast<int>(std::min<dint32>(mergeH, numRows - r));
+                        merge.colSpan = static_cast<int>(std::min<dint32>(mergeW, numCols - c));
+                        if (merge.rowSpan > 1 || merge.colSpan > 1) merges.push_back(merge);
+                    }
+
+                    if (!buf->isGood() || !hbuf.isGood()) ok = false;
+                }
+            }
+
+            if (ok) {
+                // 表级替代：4 个 bit 门控（通常全 0，读掉以保持对齐）
+                auto readBorderList = [&](bool colors) {
+                    const dint32 flags = buf->getBitLong();
+                    for (int bit = 0; bit < 18; ++bit) {
+                        if (flags & (1 << bit)) {
+                            if (colors) buf->getCmColor(version);
+                            else buf->getBitShort();
+                        }
+                    }
+                };
+                if (buf->getBit()) {
+                    // 表样式替代
+                    const dint32 flags = buf->getBitLong();
+                    if (flags & 0x0001) buf->getBit();
+                    if (flags & 0x0002) buf->getBit();
+                    if (flags & 0x0004) buf->getBitShort();
+                    if (flags & 0x0008) buf->getBitDouble();
+                    if (flags & 0x0010) buf->getBitDouble();
+                    for (int bit : {0x0020, 0x0040, 0x0080})
+                        if (flags & bit) buf->getCmColor(version);
+                    for (int bit : {0x0100, 0x0200, 0x0400})
+                        if (flags & bit) buf->getBit();
+                    for (int bit : {0x0800, 0x1000, 0x2000})
+                        if (flags & bit) buf->getCmColor(version);
+                    for (int bit : {0x4000, 0x8000, 0x10000})
+                        if (flags & bit) buf->getBitShort();
+                    for (int bit : {0x20000, 0x40000, 0x80000})
+                        if (flags & bit) hbuf.getHandle();
+                    for (int bit : {0x100000, 0x200000, 0x400000})
+                        if (flags & bit) buf->getBitDouble();
+                }
+                if (buf->getBit()) readBorderList(true);      // 边框颜色替代
+                if (buf->getBit()) readBorderList(false);     // 边框线宽替代
+                if (buf->getBit()) readBorderList(false);     // 边框可见性替代
+                ok = buf->isGood() && hbuf.isGood();
+            }
+
+            if (!ok) {
+                // 解析失败：清空结构化数据，上层退回 *Tnn 几何块反推兜底
+                DRW_DBG("ACAD_TABLE flat cells parse failed, fallback to geometry\n");
+                cells.clear();
+                merges.clear();
+            }
+        }
+    } else {
+        // ---- R2010+：完整 TABLECONTENT（AcDbLinkedTableData） -------------
+        // 单元格内容里的文字/合并区按参考实现逐字段读出。
+        buf->getRawChar8();                       // 未知字节
+        hbuf.getHandle();                         // 未知句柄
+        buf->getBitLong();                        // 未知长整数
+        if (version >= DRW::AC1027) buf->getBitLong();
+        else buf->getBit();                       // R2010 是单个 bit
+
+        bool ok = buf->isGood() && hbuf.isGood();
+
+        // 单元格（行内第 k 格）。首个 Value 内容的文字即单元格文字。
+        auto readTableCell = [&](int r, int k) {
+            buf->getBitLong();                    // 状态
+            tvString(ok);                         // 提示
+            buf->getBitLong();                    // custom
+            const dint32 nItems = tableSafeCount(buf->getBitLong());
+            for (dint32 i = 0; ok && i < nItems; ++i) {
+                tvString(ok);                     // 自定义名
+                readCadValue(ok);                 // 自定义值
+            }
+            if (buf->getBitLong() == 1) {         // 链接数据
+                hbuf.getHandle();
+                buf->getBitLong(); buf->getBitLong(); buf->getBitLong();
+            }
+            const dint32 nContents = tableSafeCount(buf->getBitLong(), 1000);
+            int align = 5;
+            UTF8STRING text;
+            for (dint32 i = 0; ok && i < nContents; ++i) {
+                const dint32 ct = buf->getBitLong();
+                if (ct == 1) {                    // 值
+                    const UTF8STRING t = readCadValue(ok);
+                    if (text.empty()) text = t;
+                } else if (ct == 2) {             // FIELD
+                    hbuf.getHandle();
+                } else if (ct == 4) {             // 块
+                    hbuf.getHandle();
+                } else {
+                    // 未知内容类型：无体
+                }
+                const dint32 nAtts = tableSafeCount(buf->getBitLong());
+                for (dint32 a = 0; ok && a < nAtts; ++a) {
+                    hbuf.getHandle();             // 属性定义
+                    tvString(ok);                 // 属性值
+                    buf->getBitLong();            // 索引
+                }
+                if (buf->getBitShort() != 0) {
+                    const int a = readContentFormat(ok);
+                    if (a >= 1 && a <= 9) align = a;
+                }
+            }
+            readCellStyle(ok);
+            buf->getBitLong();                    // style id
+            if (buf->getBitLong() != 0) {         // 单元格几何
+                buf->getBitLong();                // 几何标志
+                buf->getBitDouble();              // 含间隙宽
+                buf->getBitDouble();              // 含间隙高
+                hbuf.getHandle();
+                const dint32 nGeom = tableSafeCount(buf->getBitLong());
+                for (dint32 g = 0; ok && g < nGeom; ++g) {
+                    buf->get3BitDouble();         // 到左上距离
+                    buf->get3BitDouble();         // 到中心距离
+                    buf->getBitDouble();          // 宽
+                    buf->getBitDouble();          // 高
+                    buf->getBitDouble();          // 外宽
+                    buf->getBitDouble();          // 外高
+                    buf->getBitLong();            // 标志
+                }
+            }
+            if (ok && !text.empty()) {
+                Cell cell;
+                cell.row = r;
+                cell.col = k;
+                cell.text = text;
+                cell.align = align;
+                cells.push_back(cell);
+            }
+            if (!buf->isGood() || !hbuf.isGood()) ok = false;
+        };
+
+        if (ok) {
+            tvString(ok);                         // 表名
+            tvString(ok);                         // 描述
+
+            numCols = tableSafeCount(buf->getBitLong());
+            for (int c = 0; ok && c < numCols; ++c) {
+                tvString(ok);                     // 列名
+                buf->getBitLong();                // custom
+                const dint32 nItems = tableSafeCount(buf->getBitLong());
+                for (dint32 i = 0; ok && i < nItems; ++i) {
+                    tvString(ok);
+                    readCadValue(ok);
+                }
+                readCellStyle(ok);                // 列样式
+                buf->getBitLong();                // style id
+                if (ok) colWidths.push_back(buf->getBitDouble());
+            }
+            if (!buf->isGood() || !hbuf.isGood()) ok = false;
+            if (!ok) numCols = 0;
+
+            numRows = tableSafeCount(buf->getBitLong());
+            for (int r = 0; ok && r < numRows; ++r) {
+                const dint32 ncells = tableSafeCount(buf->getBitLong());
+                for (dint32 k = 0; ok && k < ncells; ++k)
+                    readTableCell(r, static_cast<int>(k));
+                buf->getBitLong();                // custom
+                const dint32 nItems = tableSafeCount(buf->getBitLong());
+                for (dint32 i = 0; ok && i < nItems; ++i) {
+                    tvString(ok);
+                    readCadValue(ok);
+                }
+                readCellStyle(ok);                // 行样式
+                buf->getBitLong();                // style id
+                if (ok) rowHeights.push_back(buf->getBitDouble());
+            }
+            if (!buf->isGood() || !hbuf.isGood()) ok = false;
+            if (!ok) numRows = 0;
+
+            const dint32 nFields = tableSafeCount(buf->getBitLong());
+            for (dint32 i = 0; ok && i < nFields; ++i)
+                hbuf.getHandle();
+            readCellStyle(ok);                    // 基样式
+
+            const dint32 nRanges = tableSafeCount(buf->getBitLong());
+            for (dint32 i = 0; ok && i < nRanges; ++i) {
+                const dint32 top = buf->getBitLong();
+                const dint32 left = buf->getBitLong();
+                const dint32 bottom = buf->getBitLong();
+                const dint32 right = buf->getBitLong();
+                if (top >= 0 && left >= 0 && bottom >= top && right >= left) {
+                    Merge merge;
+                    merge.row = top;
+                    merge.col = left;
+                    merge.rowSpan = bottom - top + 1;
+                    merge.colSpan = right - left + 1;
+                    merges.push_back(merge);
+                }
+            }
+
+            tableStyleH = hbuf.getHandle();       // H 342 表样式
+            DRW_DBG("tableStyle handle: "); DRW_DBGHL(tableStyleH.code, tableStyleH.size, tableStyleH.ref); DRW_DBG("\n");
+
+            buf->getBitShort();                   // 未知 BS
+            buf->get3BitDouble();                 // 11/21/31 水平方向（丢弃）
+            if (buf->getBitLong() == 1) {         // 断裂数据
+                buf->getBitLong();                // 选项
+                buf->getBitLong();                // 流向
+                buf->getBitDouble();              // 间距
+                buf->getBitLong();
+                buf->getBitLong();
+                const dint32 n = tableSafeCount(buf->getBitLong());
+                for (dint32 i = 0; ok && i < n; ++i) {
+                    buf->get3BitDouble();         // 位置
+                    buf->getBitDouble();          // 高
+                    buf->getBitLong();            // 标志
+                }
+            }
+            const dint32 nBreakRanges = tableSafeCount(buf->getBitLong());
+            for (dint32 i = 0; ok && i < nBreakRanges; ++i) {
+                buf->get3BitDouble();             // 位置
+                buf->getBitLong();                // 起始行
+                buf->getBitLong();                // 结束行
+            }
+
+            ok = buf->isGood() && hbuf.isGood();
+        }
+
+        if (!ok) {
+            // 解析失败：清空结构化数据，上层退回 *Tnn 几何块反推兜底
+            DRW_DBG("ACAD_TABLE content parse failed, fallback to geometry\n");
+            cells.clear();
+            merges.clear();
+            rowHeights.clear();
+            colWidths.clear();
+            numRows = 0;
+            numCols = 0;
+        }
+    }
+
+    DRW_DBG("   Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n");
+    return buf->isGood();
+}
+
 bool DRW_Insert::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     dint32 objCount = 0;
     bool ret = DRW_Entity::parseDwg(version, buf, NULL, bs);

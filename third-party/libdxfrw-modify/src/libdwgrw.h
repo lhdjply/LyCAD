@@ -145,6 +145,10 @@ public:
     bool writePolyline(DRW_Polyline* ent);
     bool writeSpline(DRW_Spline* ent);
     bool writeHatch(DRW_Hatch* ent);
+    /// 表格：DWG 里是类对象（CLASSES 段的 ACAD_TABLE，类号随段内顺序而定）。
+    /// 对象头写类号；专属字段 = AcDbBlockReference 段 + AcDbTable 段。
+    /// 几何（网格线/单元文字）仍存在 *Tnn 匿名块里，由本实体按名字引用。
+    bool writeTable(DRW_Table* ent);
     bool writeDimension(DRW_Dimension* ent);
     /// 弧长标注：DWG 里是类对象（CLASSES 段的 ARC_DIMENSION），
     /// 对象头写类号而非固定类型号。

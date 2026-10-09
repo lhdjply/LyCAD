@@ -16,6 +16,7 @@
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/SplineEntity.h"
+#include "core/TableEntity.h"
 #include "core/TextEntity.h"
 
 #include <QFontDatabase>
@@ -504,6 +505,108 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
 }
 
 // -----------------------------------------------------------------------------
+//  表格
+// -----------------------------------------------------------------------------
+/// 单元格对齐（表格枚举）-> 文字图元的水平/垂直对齐
+void mapCellAlign(TableCellAlign align, TextEntity::HAlign& h, TextEntity::VAlign& v)
+{
+    switch (align) {
+    case TableCellAlign::TopLeft:      h = TextEntity::HAlign::Left;   v = TextEntity::VAlign::Top;    break;
+    case TableCellAlign::TopCenter:    h = TextEntity::HAlign::Center; v = TextEntity::VAlign::Top;    break;
+    case TableCellAlign::TopRight:     h = TextEntity::HAlign::Right;  v = TextEntity::VAlign::Top;    break;
+    case TableCellAlign::MiddleLeft:   h = TextEntity::HAlign::Left;   v = TextEntity::VAlign::Middle; break;
+    case TableCellAlign::MiddleCenter: h = TextEntity::HAlign::Center; v = TextEntity::VAlign::Middle; break;
+    case TableCellAlign::MiddleRight:  h = TextEntity::HAlign::Right;  v = TextEntity::VAlign::Middle; break;
+    case TableCellAlign::BottomLeft:   h = TextEntity::HAlign::Left;   v = TextEntity::VAlign::Bottom; break;
+    case TableCellAlign::BottomCenter: h = TextEntity::HAlign::Center; v = TextEntity::VAlign::Bottom; break;
+    case TableCellAlign::BottomRight:  h = TextEntity::HAlign::Right;  v = TextEntity::VAlign::Bottom; break;
+    }
+}
+
+void drawTableEntity(QPainter& painter, const TableEntity& table,
+                     const DrawContext& context, const QColor& color)
+{
+    const std::vector<double> rows = table.rowBoundaries();
+    const std::vector<double> cols = table.columnBoundaries();
+    const std::size_t rowCount = table.rowCount();
+    const std::size_t colCount = table.columnCount();
+    if (rowCount == 0 || colCount == 0) return;
+
+    // 网格线：逐段画（合并区内部已被 TableEntity 擦除），颜色沿用图元自身颜色。
+    // 用稍细的 1px 画笔，避免线宽把单元格文字挤没。
+    QPen gridPen(color);
+    gridPen.setWidthF(1.0);
+    gridPen.setCosmetic(true);
+    painter.setPen(gridPen);
+    painter.setBrush(Qt::NoBrush);
+
+    // 直接把每个矩形四条边逐条绘制：相邻单元格的公共边会重复画一次，
+    // 但对 1px 相似色描边而言视觉无差别，换来的是不必处理合并区的擦除逻辑
+    // 之外的额外边界情况。合并区内部边由 TableEntity 提供的外框表达。
+    for (std::size_t r = 0; r < rowCount; ++r) {
+        for (std::size_t c = 0; c < colCount; ++c) {
+            // 若该单元格是合并区的一员且不是左上角，则跳过其内部网格
+            const auto merge = table.mergeContaining(r, c);
+            if (merge && (static_cast<int>(r) != merge->row
+                          || static_cast<int>(c) != merge->col)) {
+                continue;
+            }
+
+            int rEnd = static_cast<int>(r);
+            int cEnd = static_cast<int>(c);
+            if (merge) {
+                rEnd = merge->row + merge->rowSpan - 1;
+                cEnd = merge->col + merge->colSpan - 1;
+            }
+            if (static_cast<std::size_t>(rEnd) >= rowCount) rEnd = static_cast<int>(rowCount) - 1;
+            if (static_cast<std::size_t>(cEnd) >= colCount) cEnd = static_cast<int>(colCount) - 1;
+
+            const Point2D lt = context.view->toDevice(table.toWorld(Point2D(cols[c], rows[r])));
+            const Point2D rb = context.view->toDevice(table.toWorld(Point2D(cols[cEnd + 1], rows[rEnd + 1])));
+
+            painter.drawLine(QPointF(lt.x, lt.y), QPointF(rb.x, lt.y));
+            painter.drawLine(QPointF(rb.x, lt.y), QPointF(rb.x, rb.y));
+            painter.drawLine(QPointF(rb.x, rb.y), QPointF(lt.x, rb.y));
+            painter.drawLine(QPointF(lt.x, rb.y), QPointF(lt.x, lt.y));
+        }
+    }
+
+    // 单元格文字：字高取所在行高的 0.5，居中对齐（除非单元格显式指定对齐）
+    for (std::size_t r = 0; r < rowCount; ++r) {
+        for (std::size_t c = 0; c < colCount; ++c) {
+            const TableCell cell = table.cell(r, c);
+            if (cell.text.isEmpty()) continue;
+
+            // 合并区：只有左上角单元格显示文字，且用整个合并区的中心定位
+            const auto merge = table.mergeContaining(r, c);
+            int rEnd = static_cast<int>(r);
+            int cEnd = static_cast<int>(c);
+            if (merge) {
+                if (static_cast<int>(r) != merge->row || static_cast<int>(c) != merge->col) continue;
+                rEnd = std::min(merge->row + merge->rowSpan - 1, static_cast<int>(rowCount) - 1);
+                cEnd = std::min(merge->col + merge->colSpan - 1, static_cast<int>(colCount) - 1);
+            }
+
+            const double cx = 0.5 * (cols[c] + cols[cEnd + 1]);
+            const double cy = 0.5 * (rows[r] + rows[rEnd + 1]);
+
+            const double rowHeight = rows[r] - rows[rEnd + 1];
+            const double textHeight = std::max(rowHeight * 0.5, 1e-6);
+
+            TextEntity label(cell.text, table.toWorld(Point2D(cx, cy)), textHeight,
+                             table.rotation());
+            TextEntity::HAlign hAlign = TextEntity::HAlign::Center;
+            TextEntity::VAlign vAlign = TextEntity::VAlign::Middle;
+            mapCellAlign(cell.align, hAlign, vAlign);
+            label.setHAlign(hAlign);
+            label.setVAlign(vAlign);
+
+            drawTextEntity(painter, label, context);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 //  填充
 // -----------------------------------------------------------------------------
 void drawHatchEntity(QPainter& painter, const HatchEntity& hatch, const DrawContext& context)
@@ -848,6 +951,10 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
 
             draw(painter, *child, context, childColor, childLineweight, childLinetype);
         }
+        break;
+    }
+    case EntityType::Table: {
+        drawTableEntity(painter, static_cast<const TableEntity&>(entity), context, color);
         break;
     }
     }

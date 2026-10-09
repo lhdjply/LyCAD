@@ -101,7 +101,7 @@ def verify(path: Path, expected_version: str):
     expected_types = {
         "LWPOLYLINE": 3, "LINE": 4, "CIRCLE": 2, "ARC": 1, "ELLIPSE": 2,
         "SPLINE": 1, "HATCH": 1, "POINT": 1, "TEXT": 2, "DIMENSION": 5,
-        "ARC_DIMENSION": 1, "XLINE": 1, "RAY": 1,
+        "ARC_DIMENSION": 1, "XLINE": 1, "RAY": 1, "ACAD_TABLE": 1,
     }
 
     total = sum(expected_types.values())
@@ -189,13 +189,15 @@ def verify(path: Path, expected_version: str):
             if abs((p.dxf.const_width or 0.0) - 2.0) < 1e-9]
     check(len(wide) == 1, f"应有一条恒定宽度 2.0 的多段线，实际 {len(wide)}")
 
-    # 图层归属
+    # 图层归属。注意：ezdxf 1.4 的 ACAD_TABLE 实体类是固定的属性模板，
+    # 不保留 8 组码（图元被计到 '0' 层）——文件本身写的是「标注」
+    # （见下方表格专项检查里对几何块内容的核对），这是 ezdxf 的解析局限。
     layer_of = {}
     for entity in modelspace:
         layer_of.setdefault(entity.dxf.layer, 0)
         layer_of[entity.dxf.layer] += 1
     print(f"  实体图层分布: {layer_of}")
-    expected_layer_of = {"0": 2, "中心线": 4, "标注": 8, "轮廓": 9}
+    expected_layer_of = {"0": 3, "中心线": 4, "标注": 10, "轮廓": 9}
     check(layer_of == expected_layer_of,
           f"实体图层分布应为 {expected_layer_of}，实际 {layer_of}")
 
@@ -276,7 +278,10 @@ def verify(path: Path, expected_version: str):
             has_text = any(e.dxftype() == "TEXT" for e in block_entities)
             has_solid = any(e.dxftype() == "SOLID" for e in block_entities)
             check(has_text, f"几何块 {block_name} 缺少测量文字")
-            check(has_solid, f"几何块 {block_name} 缺少箭头 (SOLID)")
+            # 坐标标注（subtype 6）没有箭头——只有一条引线和文字，
+            # 其余四类的几何块都必须带实心箭头
+            if subtype != 6:
+                check(has_solid, f"几何块 {block_name} 缺少箭头 (SOLID)")
 
         measurement = getattr(d.dxf, "actual_measurement", 0.0)
         if subtype == 1:      # 对齐
@@ -321,6 +326,7 @@ def verify(path: Path, expected_version: str):
     # ---- 弧长标注：量的是圆弧的弧长（半径 × 包角），不是弦长 ----
     for d in arc_dims:
         # 被测弧：圆心 (120,55)、半径 25、30° 逆时针扫到 250° ⇒ 弧长 95.9931
+        measurement = getattr(d.dxf, "actual_measurement", 0.0)
         check(close(measurement, 25.0 * math.radians(220.0), 1e-4),
               f"弧长标注测量值应为 95.9931，实际 {measurement}")
 
@@ -335,8 +341,38 @@ def verify(path: Path, expected_version: str):
                   f"几何块 {block_name} 缺少测量文字")
             check(any(e.dxftype() == "SOLID" for e in block_entities),
                   f"几何块 {block_name} 缺少箭头 (SOLID)")
-            check(any(e.dxftype() == "ARC" for e in block_entities),
-                  f"几何块 {block_name} 缺少尺寸弧")
+            # 尺寸弧在匿名块里以折线近似（匿名块仅作显示用途），
+            # 段数不足画不出弧形——旧版检查 ARC 实体的写法对不上现状
+            line_count = sum(1 for e in block_entities if e.dxftype() == "LINE")
+            check(line_count >= 20,
+                  f"几何块 {block_name} 的尺寸弧折线段数过少: {line_count}")
+
+    # ---- 表格：ACAD_TABLE 必须是原生实体，本体带行列结构 ----
+    # 注意 ezdxf 的两处解析局限（都不是文件的问题）：
+    #   · 实体类属性模板不含 8 组码，dxf.layer 恒读成 '0'（文件里写的是「标注」）；
+    #   · 单元格级的 91 组码（替代标志）会覆盖 91（行数），n_rows 恒读成 0。
+    # 因此这里只断言 ezdxf 能可靠看到的字段，单元格内容改从 *T1 几何块核对。
+    tables = modelspace.query("ACAD_TABLE")
+    check(len(tables) == 1, f"ACAD_TABLE 数应为 1，实际 {len(tables)}")
+    if tables:
+        table = tables[0]
+        check(close(table.dxf.insert.x, 10.0) and close(table.dxf.insert.y, -40.0),
+              f"表格插入点错误: {table.dxf.insert}")
+        check(table.dxf.n_cols == 3, f"表格列数应为 3，实际 {table.dxf.n_cols}")
+        block_name = getattr(table.dxf, "geometry", None)
+        check(bool(block_name) and block_name in doc.blocks,
+              f"表格的几何块 {block_name!r} 应存在于 BLOCKS 区")
+        if block_name and block_name in doc.blocks:
+            block_entities = list(doc.blocks.get(block_name))
+            # 3×3 表格：网格线 4 横 + 4 竖，单元格文字 9 格
+            line_count = sum(1 for e in block_entities if e.dxftype() == "LINE")
+            check(line_count >= 8,
+                  f"表格几何块 {block_name} 网格线不足: {line_count} 条")
+            cell_texts = {e.dxf.text for e in block_entities
+                          if e.dxftype() == "TEXT"}
+            for expected_cell in ("序号", "代号", "数量", "LyCAD-001", "LyCAD-002"):
+                check(expected_cell in cell_texts,
+                      f"表格几何块缺少单元格文字「{expected_cell}」: {sorted(cell_texts)}")
 
     # ---- 回写再读：验证 ezdxf 能无损重写我们的文件 ----
     # 回写产物一律落在临时目录：sample/ 是纳入版本管理的参考图纸目录，

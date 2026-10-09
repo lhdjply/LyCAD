@@ -115,6 +115,11 @@ void DRW_Class::toDwgType(){
         // 对象类型号。这里给它一个本库内部约定的编号，好让 dwgreader 的分派表
         // 能认出它——文件里存的仍是 CLASSES 段中的类号，两者靠类名对应。
         dwgType = 200;
+    else if (recName == "ACAD_TABLE")
+        // 表格同样是类对象（AcDbTable 继承 AcDbBlockReference），无固定对象类型号。
+        // 用内部约定编号 201 让 dwgreader 能认出来；几何挂在它引用的 *Tnn 块里，
+        // 不解析本体时表格会整张消失（实体流里没有别的图元引用那个块）。
+        dwgType = 201;
     else
         dwgType =0;
 }

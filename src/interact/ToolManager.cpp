@@ -122,6 +122,10 @@ void ToolManager::registerBuiltinTools()
                  QStringLiteral("绘制矩形（两个对角点）"),
                  [](ToolContext& c) { return std::make_unique<DrawRectangleTool>(c); });
 
+    registerTool(QStringLiteral("TABLE"), { QStringLiteral("TB") },
+                 QStringLiteral("插入表格（插入点 + 对角点；R 行数 / C 列数）"),
+                 [](ToolContext& c) { return std::make_unique<DrawTableTool>(c); });
+
     // ---- 注释 ---------------------------------------------------------------
     registerTool(QStringLiteral("TEXT"), { QStringLiteral("DT") },
                  QStringLiteral("标注文字（先输入内容，再指定插入点）"),

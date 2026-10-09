@@ -62,6 +62,8 @@ public:
     bool writeBlockRecord(std::string name);
     bool writeBlock(DRW_Block *ent);
     bool writeInsert(DRW_Insert *ent);
+    /// ACAD_TABLE（表格）：AcDbBlockReference 子类，几何在它引用的 *Tnn 块里
+    bool writeTable(DRW_Table *ent);
     bool writeMText(DRW_MText *ent);
     bool writeText(DRW_Text *ent);
     bool writeAttrib(DRW_Attrib *ent);
@@ -117,6 +119,7 @@ private:
     bool processHatch();
     bool processSpline();
     bool process3dface();
+    bool processTable();
     bool processViewport();
     bool processImage();
     bool processImageDef();

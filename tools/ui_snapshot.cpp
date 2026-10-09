@@ -18,6 +18,7 @@
 #include "core/Document.h"
 #include "core/EllipseEntity.h"
 #include "core/Layer.h"
+#include "core/TableEntity.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
@@ -472,6 +473,110 @@ int main(int argc, char* argv[])
 
                 // 后面几条链路（双击编辑、面板自检）都会数撤销记录，先把命令状态
                 // 清干净，再撤掉这个测试用的椭圆，保证后续断言不受影响
+                while (target->undoStack()->index() > undoBefore) {
+                    target->undoStack()->undo();
+                }
+                settle(application, 120);
+            }
+        }
+
+        // ---- 快照 2b-2：表格工具 ----
+        //
+        //  表格是原生图元（不是一堆线段），因此这一段盯三件事：
+        //    · 入口——功能区的「表格」按钮与 TABLE 命令是否都接上了；
+        //    · 落点——按坐标精确插入一张表，行列数、插入点、尺寸都要对；
+        //    · 选项——R / C 选项能改行列数，且断言它真的作用到了新表上。
+        {
+            auto* ribbonBar = window.findChild<RibbonBar*>();
+            QToolButton* tableButton = nullptr;
+            if (ribbonBar) {
+                for (QToolButton* button : ribbonBar->findChildren<QToolButton*>()) {
+                    if (button->text() == QStringLiteral("表格")) { tableButton = button; break; }
+                }
+            }
+
+            const bool entryOk = tableButton != nullptr
+                                 && tools->hasCommand(QStringLiteral("TABLE"));
+            out() << QStringLiteral("  表格入口：功能区按钮 %1，TABLE 命令 %2")
+                         .arg(tableButton ? QStringLiteral("1 个") : QStringLiteral("缺失"),
+                              tools->hasCommand(QStringLiteral("TABLE"))
+                                  ? QStringLiteral("已注册") : QStringLiteral("未注册"))
+                  << Qt::endl;
+            if (!entryOk) ++failures;
+
+            if (tableButton && canvas->document()) {
+                Document* target = canvas->document();
+                const SnapSettings savedSnap = tools->snapSettings();
+                tools->snapSettings().enabled = false;
+                const int undoBefore = target->undoStack()->index();
+
+                // ① 经按钮进入，用 R / C 设成 5 行 × 2 列，再按坐标落表
+                //    （小块按钮没有 QAction，直接点它触发 commandTriggered）
+                tableButton->click();
+                settle(application, 150);
+                tools->submitText(QStringLiteral("R"));
+                tools->submitText(QStringLiteral("5"));
+                tools->submitText(QStringLiteral("C"));
+                tools->submitText(QStringLiteral("2"));
+                tools->submitText(QStringLiteral("300000,300000"));   // 插入点（左上角）
+                tools->submitText(QStringLiteral("300200,299900"));   // 对角点：宽 200 高 100
+                settle(application, 150);
+
+                const TableEntity* created = nullptr;
+                for (EntityId id : target->drawOrder()) {
+                    const Entity* entity = target->entity(id);
+                    if (!entity || entity->type() != EntityType::Table) continue;
+                    const auto* candidate = static_cast<const TableEntity*>(entity);
+                    if (std::abs(candidate->insertionPoint().x - 300000.0) < 1.0) {
+                        created = candidate;
+                    }
+                }
+
+                if (!created) {
+                    out() << QStringLiteral("  点击表格按钮并输入坐标后没有生成表格。") << Qt::endl;
+                    ++failures;
+                } else {
+                    const bool rowsOk = created->rowCount() == 5;
+                    const bool colsOk = created->columnCount() == 2;
+                    const bool insertOk =
+                        std::abs(created->insertionPoint().x - 300000.0) < 1.0
+                        && std::abs(created->insertionPoint().y - 300000.0) < 1.0;
+                    // 总尺寸：宽 200 高 100（对角点之差）
+                    const bool sizeOk = std::abs(created->totalWidth() - 200.0) < 1.0
+                                        && std::abs(created->totalHeight() - 100.0) < 1.0;
+                    const bool recordsOk = target->undoStack()->index() == undoBefore + 1;
+
+                    out() << QStringLiteral("  表格工具：%1 行 %2 列 / 插入点 %3 / 尺寸 %4 / "
+                                            "撤销记录 %5")
+                                 .arg(created->rowCount())
+                                 .arg(created->columnCount())
+                                 .arg(insertOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      sizeOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      recordsOk ? QStringLiteral("+1")
+                                                : QStringLiteral("异常"))
+                          << Qt::endl;
+                    if (!rowsOk || !colsOk || !insertOk || !sizeOk || !recordsOk) ++failures;
+                }
+
+                // ② 退化输入（两个角点重合）必须被拦下，且不留下撤销记录
+                const std::size_t beforeDegenerate = target->entityCount();
+                const int undoAtDegenerate = target->undoStack()->index();
+                tools->submitText(QStringLiteral("400000,400000"));
+                tools->submitText(QStringLiteral("400000,400000"));
+                settle(application, 120);
+                const bool degenerateRejected =
+                    target->entityCount() == beforeDegenerate
+                    && target->undoStack()->index() == undoAtDegenerate;
+                out() << QStringLiteral("  表格退化输入（角点重合）：%1")
+                             .arg(degenerateRejected ? QStringLiteral("已拦下")
+                                                     : QStringLiteral("产生了图元"))
+                      << Qt::endl;
+                if (!degenerateRejected) ++failures;
+
+                tools->cancel();
+                tools->snapSettings() = savedSnap;
+                settle(application, 120);
+
                 while (target->undoStack()->index() > undoBefore) {
                     target->undoStack()->undo();
                 }

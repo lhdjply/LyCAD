@@ -1129,6 +1129,16 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
             e.style = findTableName(DRW::DIMSTYLE, e.dimStyleH.ref);
             intfa.addDimArc(&e);
             break; }
+        // 表格：类对象（ACAD_TABLE，AcDbBlockReference 派生），类型号 201 同样由
+        // DRW_Class::toDwgType 约定。不在这里分派的话表格会落进 default 分支被当作
+        // 未解析对象丢弃，而它的几何全挂在引用的 *Tnn 块里 —— 没有别的实体引用那个块，
+        // 结果就是「整张表格在图上凭空消失」。
+        case 201: {
+            DRW_Table e;
+            ENTRY_PARSE(e)
+            e.name = findTableName(DRW::BLOCK_RECORD, e.blockRecH.ref);
+            intfa.addTable(e);
+            break; }
         case 45: {
             DRW_Leader e;
             ENTRY_PARSE(e)
@@ -1256,11 +1266,28 @@ bool dwgReader::readDwgObject(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
         //oType are set parsing entities
         dint16 oType = obj.type;
 
+        // 类对象的 type 存的是「类号」（>=500），要再经 CLASSES 段换算成本库内部
+        // 约定的类型号，才能与下面的分派表对上（与 readDwgEntity 同一套规则）。
+        // 表格（ACAD_TABLE，类号 528）就落在这一档：它的几何挂在引用的 *Tnn 块里，
+        // 不在这里补这一跳，整张表会被塞进 remainingMap 静默丢掉。
+        if (oType > 499) {
+            std::map<duint32, DRW_Class*>::iterator it = classesmap.find(oType);
+            if (it != classesmap.end() && it->second->dwgType != 0)
+                oType = it->second->dwgType;
+        }
+
         switch (oType){
         case 102: {
             DRW_ImageDef e;
             ret = e.parseDwg(version, &buff, bs);
             intfa.linkImage(&e);
+            break; }
+        // 表格：ACAD_TABLE（类号 528）。几何在 *Tnn 块里，这里只需取块名 + 插入点。
+        case 201: {
+            DRW_Table e;
+            ret = e.parseDwg(version, &buff, bs);
+            e.name = findTableName(DRW::BLOCK_RECORD, e.blockRecH.ref);
+            intfa.addTable(e);
             break; }
         default:
             //not supported object or entity add to remaining map for debug

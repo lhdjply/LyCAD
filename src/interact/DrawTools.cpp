@@ -12,6 +12,7 @@
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
+#include "core/TableEntity.h"
 #include "core/XLineEntity.h"
 #include "render/CadCanvas.h"
 
@@ -1523,6 +1524,193 @@ void DrawInfiniteLineTool::paintOverlay(QPainter& painter,
 }
 
 void DrawInfiniteLineTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
+//  表格
+// =============================================================================
+DrawTableTool::DrawTableTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString DrawTableTool::name() const { return QStringLiteral("TABLE"); }
+QString DrawTableTool::displayName() const { return QStringLiteral("表格"); }
+
+QString DrawTableTool::prompt() const
+{
+    if (m_pending == PendingNumber::Rows) {
+        return QStringLiteral("输入行数 <%1>:").arg(m_rows);
+    }
+    if (m_pending == PendingNumber::Columns) {
+        return QStringLiteral("输入列数 <%1>:").arg(m_columns);
+    }
+    if (!m_first) {
+        return QStringLiteral("指定表格插入点 [行数(R)/列数(C)] <%1 行 × %2 列>:")
+            .arg(m_rows)
+            .arg(m_columns);
+    }
+    return QStringLiteral("指定表格另一个角点 <回车结束>:");
+}
+
+void DrawTableTool::spanOf(const Point2D& a, const Point2D& b, double& width, double& height)
+{
+    width = std::abs(b.x - a.x);
+    height = std::abs(b.y - a.y);
+}
+
+void DrawTableTool::commit(const Point2D& insertion, const Point2D& opposite)
+{
+    double width = 0.0;
+    double height = 0.0;
+    spanOf(insertion, opposite, width, height);
+
+    if (width <= kGeomTol || height <= kGeomTol) {
+        message(QStringLiteral("退化的表格（宽或高为零），已忽略。"));
+        m_first.reset();
+        notifyPromptChanged();
+        repaint();
+        return;
+    }
+
+    // 插入点始终取左上角：用户从左下往右上拖时，把插入点上移到实际左上角。
+    Point2D topLeft = insertion;
+    if (opposite.y > insertion.y) topLeft.y = opposite.y;   // 向上展开
+    if (opposite.x < insertion.x) topLeft.x = opposite.x;   // 向左展开
+
+    auto table = std::make_unique<TableEntity>(m_rows, m_columns);
+    table->setInsertionPoint(topLeft);
+    // 行列尺寸按总尺寸均分（行列数由选项 R/C 设定）
+    for (std::size_t r = 0; r < m_rows; ++r) {
+        table->setRowHeight(r, height / static_cast<double>(m_rows));
+    }
+    for (std::size_t c = 0; c < m_columns; ++c) {
+        table->setColumnWidth(c, width / static_cast<double>(m_columns));
+    }
+    applyDefaults(*table, ctx());
+    ctx().document->addEntity(std::move(table));
+
+    message(QStringLiteral("已创建表格：%1 行 × %2 列，%3 × %4")
+                .arg(m_rows)
+                .arg(m_columns)
+                .arg(width, 0, 'g', 6)
+                .arg(height, 0, 'g', 6));
+
+    m_first.reset();
+    notifyPromptChanged();
+    repaint();
+}
+
+bool DrawTableTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+    if (m_pending != PendingNumber::None) return true;   // 正在等待数值输入
+
+    const ResolvedPoint resolved = resolve(event.worldPos, m_first);
+
+    if (!m_first) {
+        m_first = resolved.position;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    commit(*m_first, resolved.position);
+    return true;
+}
+
+bool DrawTableTool::mouseMove(const CanvasEvent& event)
+{
+    m_cursor = resolve(event.worldPos, m_first);
+    m_hasCursor = true;
+    ctx().setSnapMarker(m_cursor.kind != SnapKind::None
+                            ? std::optional<SnapResult>(m_cursor.toSnapResult())
+                            : std::nullopt);
+    repaint();
+    return true;
+}
+
+bool DrawTableTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return
+        || event->key() == Qt::Key_Enter) {
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool DrawTableTool::textInput(const QString& text)
+{
+    const QString trimmed = text.trimmed();
+
+    // 正在等待行数 / 列数
+    if (m_pending != PendingNumber::None) {
+        bool ok = false;
+        const int value = trimmed.toInt(&ok);
+        if (!ok || value < 1) {
+            message(QStringLiteral("请输入不小于 1 的整数。"));
+            return true;
+        }
+        if (m_pending == PendingNumber::Rows)   m_rows = static_cast<std::size_t>(value);
+        if (m_pending == PendingNumber::Columns) m_columns = static_cast<std::size_t>(value);
+        m_pending = PendingNumber::None;
+        notifyPromptChanged();
+        repaint();
+        return true;
+    }
+
+    // 选项关键字
+    if (matchesOption(trimmed, QStringLiteral("R"))
+        || matchesOption(trimmed, QStringLiteral("ROWS"))) {
+        m_pending = PendingNumber::Rows;
+        notifyPromptChanged();
+        return true;
+    }
+    if (matchesOption(trimmed, QStringLiteral("C"))
+        || matchesOption(trimmed, QStringLiteral("COLUMNS"))) {
+        m_pending = PendingNumber::Columns;
+        notifyPromptChanged();
+        return true;
+    }
+
+    // 坐标输入
+    const std::optional<Point2D> point = parsePointInput(trimmed, m_first);
+    if (!point) return true;
+
+    CanvasEvent synthetic;
+    synthetic.worldPos = *point;
+    synthetic.button = Qt::LeftButton;
+    return mousePress(synthetic);
+}
+
+void DrawTableTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+{
+    if (!m_first || !m_hasCursor) return;
+
+    double width = 0.0;
+    double height = 0.0;
+    spanOf(*m_first, m_cursor.position, width, height);
+    if (width <= kGeomTol || height <= kGeomTol) return;
+
+    Point2D topLeft = *m_first;
+    if (m_cursor.position.y > m_first->y) topLeft.y = m_cursor.position.y;
+    if (m_cursor.position.x < m_first->x) topLeft.x = m_cursor.position.x;
+
+    TableEntity preview(m_rows, m_columns);
+    preview.setInsertionPoint(topLeft);
+    for (std::size_t r = 0; r < m_rows; ++r) {
+        preview.setRowHeight(r, height / static_cast<double>(m_rows));
+    }
+    for (std::size_t c = 0; c < m_columns; ++c) {
+        preview.setColumnWidth(c, width / static_cast<double>(m_columns));
+    }
+    drawPreviewEntity(painter, preview, context);
+}
+
+void DrawTableTool::deactivate()
 {
     ctx().setSnapMarker(std::nullopt);
 }

@@ -29,6 +29,7 @@ QString entityTypeName(EntityType type)
     case EntityType::XLine:    return QStringLiteral("XLINE");
     case EntityType::Ray:      return QStringLiteral("RAY");
     case EntityType::Insert:   return QStringLiteral("INSERT");
+    case EntityType::Table:    return QStringLiteral("ACAD_TABLE");
     }
     return QStringLiteral("UNKNOWN");
 }
@@ -49,6 +50,7 @@ QString entityTypeDisplayName(EntityType type)
     case EntityType::XLine:    return QStringLiteral("构造线");
     case EntityType::Ray:      return QStringLiteral("射线");
     case EntityType::Insert:   return QStringLiteral("块参照");
+    case EntityType::Table:    return QStringLiteral("表格");
     }
     return QStringLiteral("未知图元");
 }

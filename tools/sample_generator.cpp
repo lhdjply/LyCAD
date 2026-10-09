@@ -43,6 +43,7 @@
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
 #include "core/SplineEntity.h"
+#include "core/TableEntity.h"
 #include "core/TextEntity.h"
 #include "core/XLineEntity.h"
 #include "io/CadFile.h"
@@ -304,6 +305,29 @@ void buildSample(Document& document)
         document.addEntity(std::move(ray));
     }
 
+    // 表格：3 行 × 3 列明细表（DXF/DWG 均写出原生 ACAD_TABLE 实体，
+    // 单元格文字随本体逐格写出——见 tests/test_table.cpp）。
+    // 放在图框下方（尺寸标注带的下方），避免压住框内图元。
+    {
+        auto table = std::make_unique<TableEntity>(3, 3);
+        table->setInsertionPoint(Point2D(10.0, -40.0));
+        table->setColumnWidth(0, 20.0);
+        table->setColumnWidth(1, 45.0);
+        table->setColumnWidth(2, 25.0);
+        table->setRowHeight(0, 9.0);           // 表头行略高
+        table->setLayerName(QStringLiteral("标注"));
+        table->setCellText(0, 0, QStringLiteral("序号"));
+        table->setCellText(0, 1, QStringLiteral("代号"));
+        table->setCellText(0, 2, QStringLiteral("数量"));
+        table->setCellText(1, 0, QStringLiteral("1"));
+        table->setCellText(1, 1, QStringLiteral("LyCAD-001"));
+        table->setCellText(1, 2, QStringLiteral("1"));
+        table->setCellText(2, 0, QStringLiteral("2"));
+        table->setCellText(2, 1, QStringLiteral("LyCAD-002"));
+        table->setCellText(2, 2, QStringLiteral("2"));
+        document.addEntity(std::move(table));
+    }
+
     document.endBatchLoad();
 }
 
@@ -377,7 +401,7 @@ int inspect(const QString& path)
         if (!entity) continue;
         out() << QStringLiteral("  - %1").arg(entity->describe()) << Qt::endl;
 
-        // 类型专属字段：文字内容 / 标注测量值，供脚本比对
+        // 类型专属字段：文字内容 / 标注测量值 / 表格行列，供脚本比对
         QString extra;
         if (entity->type() == EntityType::Text) {
             extra = QStringLiteral("|text=%1")
@@ -385,6 +409,12 @@ int inspect(const QString& path)
         } else if (entity->type() == EntityType::Dimension) {
             extra = QStringLiteral("|dim=%1")
                         .arg(static_cast<const DimensionEntity*>(entity)->displayText());
+        } else if (entity->type() == EntityType::Table) {
+            const auto* table = static_cast<const TableEntity*>(entity);
+            extra = QStringLiteral("|rows=%1|cols=%2|cells=%3")
+                        .arg(table->rowCount())
+                        .arg(table->columnCount())
+                        .arg(table->nonEmptyCells().size());
         }
 
         // 数值化输出便于脚本比对

@@ -55,6 +55,7 @@
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
 #include "core/SplineEntity.h"
+#include "core/TableEntity.h"
 #include "core/TextEntity.h"
 #include "core/Types.h"
 #include "core/XLineEntity.h"
@@ -66,6 +67,7 @@
 #include "libdwgrw.h"
 #include "libdxfrw.h"
 
+#include <QDebug>
 #include <QFile>
 #include <QHash>
 #include <QSet>
@@ -75,6 +77,8 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <numeric>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -162,6 +166,18 @@ bool isDimensionBlock(const QString& name)
     if (!name.startsWith(QLatin1Char('*'))) return false;
     if (name.size() < 3) return false;
     return name.at(1) == QLatin1Char('D') || name.at(1) == QLatin1Char('d');
+}
+
+/// 是否为表格的匿名几何块（*T1、*T2……）。
+///
+/// ACAD_TABLE 的可见几何（网格线、单元格文字）就存在这种块里，实体本身只是
+/// 一个指向它的块参照。本软件建了原生 TableEntity，因此这类块的内容在读取期
+/// 被解析成表格的行列结构，而不是当作普通块展开。
+bool isTableBlock(const QString& name)
+{
+    if (!name.startsWith(QLatin1Char('*'))) return false;
+    if (name.size() < 3) return false;
+    return name.at(1) == QLatin1Char('T') || name.at(1) == QLatin1Char('t');
 }
 
 /// 逆时针归一到 (0, 2π]
@@ -276,6 +292,10 @@ public:
     void addSpline(const DRW_Spline* data) override;
     void addKnot(const DRW_Entity&) override {}
     void addInsert(const DRW_Insert& data) override;
+    /// ACAD_TABLE：几何在其引用的 *Tnn 块里，本体的 AcDbTable 段落带完整
+    /// 行列结构（行列数、行列高宽、单元格文字、合并）。优先用本体数据还原，
+    /// 本体数据缺失时再退回几何块反推。
+    void addTable(const DRW_Table& data) override { noteTable(data); }
     void addTrace(const DRW_Trace& data) override;
     void add3dFace(const DRW_3Dface&) override { skip(QStringLiteral("3DFACE")); }
     void addSolid(const DRW_Solid& data) override;
@@ -322,6 +342,9 @@ private:
         QString name;
         Point2D base;
         int     flags = 0;
+        /// 这是表格的匿名几何块（*Tnn）：收尾时按行列结构还原成 TableEntity，
+        /// 而不是注册为普通块定义。
+        bool    isTableGeometry = false;
         std::vector<std::unique_ptr<Entity>> entities;
         std::vector<std::unique_ptr<InsertEntity>> inserts;
         std::vector<AttributeDefinition> attributeDefs;
@@ -331,6 +354,12 @@ private:
     void place(std::unique_ptr<Entity> entity);
     /// 记录一个块引用（先建 InsertEntity，块定义留到 finish 解析）
     void noteInsert(const DRW_Insert& data, const DRW_Entity& source);
+    /// 记录一个 ACAD_TABLE。几何在其引用的 *Tnn 匿名块里，留到 finish 解析。
+    void noteTable(const DRW_Table& data);
+    /// 记录一个指向表格几何块（*Tnn）的普通块参照——本软件写出的表格走这条路。
+    void noteTableRef(const DRW_Insert& data);
+    /// 取一个尚未被认领的表格几何块（DWG/R2000 表格本体无法解析时的配对兜底）。
+    const BlockDef* takeUnclaimedTableGeometry();
     void skip(const QString& type);
     /// 降级保留：实体换了形式但内容没丢（如 MTEXT 按单行文字导入），
     /// 与「跳过」分开计数——否则用户会以为文字被丢掉了。
@@ -382,6 +411,45 @@ private:
     std::vector<std::unique_ptr<InsertEntity>> m_modelInserts;
     /// 刚读到的块参照：紧随其后的 ATTRIB 都挂在它上面（DXF 路径）
     InsertEntity* m_lastInsert = nullptr;
+
+    /// 待解析的表格。两种来源：
+    ///   1) 真·ACAD_TABLE 实体：本体自带完整行列结构（m_native* 有值），
+    ///      几何块仅作显示缓存，还原时以本体为准；
+    ///   2) 指向 *Tnn 几何块的普通块参照（本软件写出的表格）：本体无数据，
+    ///      只能从几何块反推行列结构。
+    struct TableRef {
+        QString blockName;
+        Point2D insertion;
+        double  rotation = 0.0;
+        double  scaleX = 1.0;
+        double  scaleY = 1.0;
+        QString layer;
+
+        // ---- 真·ACAD_TABLE 本体携带的行列结构（几何反推路径下为空）----
+        bool    hasNativeData = false;
+        int     nativeRows = 0;
+        int     nativeCols = 0;
+        std::vector<double> nativeRowHeights;
+        std::vector<double> nativeColWidths;
+        std::vector<std::tuple<int, int, QString, int>> nativeCells;
+        std::vector<TableMergeRange> nativeMerges;
+        QString nativeTableStyle;
+    };
+    std::vector<TableRef> m_tables;
+    /// 已被某个表格认领的几何块名（归一化键）——配对兜底时避免一块被两表抢用。
+    std::set<QString> m_claimedTableGeometry;
+
+    /// 收尾：把 m_tables 里记录的表格引用，按各自的 *Tnn 几何块还原成 TableEntity
+    void finishTables();
+    /// 用 ACAD_TABLE 本体携带的行列结构建表（优先路径）
+    std::unique_ptr<TableEntity> buildTableFromNative(const TableRef& ref) const;
+    /// 从几何块（网格线 + 文字）反推表格的行列结构
+    std::unique_ptr<TableEntity> buildTableFromGeometry(const TableRef& ref,
+                                                        const BlockDef& def) const;
+    /// 本体结构有效但 cells 为空（DWG 写出端编码未完全逆向）时，
+    /// 从配对的 *Tnn 几何块把单元格文字按格归位补回，并反推合并区
+    void mergeTableCellTexts(TableEntity& table, const TableRef& ref,
+                             const BlockDef& def) const;
 
     /// DWG 路径的 ATTRIB 是**独立对象**，不跟在 INSERT 后面，只能靠「同一个属主
     /// （块记录）+ 标签命中该块的属性定义」回填。读取期块定义还没装配好（属性
@@ -629,6 +697,9 @@ void Builder::addBlock(const DRW_Block& data)
     block.name = name;
     block.base = toPoint(data.basePoint);
     block.flags = data.flags;
+    // 表格的匿名几何块（*Tnn）：内容要读（用来还原行列结构），但它不是用户
+    // 意义上的块定义——收尾时会被转成 TableEntity，不进文档的块表。
+    block.isTableGeometry = isTableBlock(name);
     m_currentBlock = &block;
     m_discardBlock = false;
     m_blockNameByHandle[data.handle] = name;
@@ -719,6 +790,14 @@ void Builder::noteInsert(const DRW_Insert& data, const DRW_Entity& source)
     const QString name = toQString(data.name);
     if (name.isEmpty()) return;
 
+    // 指向表格匿名几何块（*Tnn）的块参照。真·ACAD_TABLE 实体走 addTable
+    // （见 processTable），会同时给出几何块与本体行列结构；但老版本 AutoCAD
+    // 或经第三方工具处理过的文件，可能只剩这个块参照——此时退回几何反推。
+    if (isTableBlock(name)) {
+        noteTableRef(data);
+        return;
+    }
+
     // 插入点的坐标体检。块内图元在各自读入时已经查过，这里只需盯住插入点：
     // 它把整块平移到哪里，决定了这块内容会不会落到天文数字上去。
     const Point2D point = toPoint(data.basePoint);
@@ -753,6 +832,74 @@ void Builder::noteInsert(const DRW_Insert& data, const DRW_Entity& source)
 
     if (m_currentBlock) m_currentBlock->inserts.push_back(std::move(insert));
     else                m_modelInserts.push_back(std::move(insert));
+}
+
+void Builder::noteTableRef(const DRW_Insert& data)
+{
+    const QString name = toQString(data.name);
+    if (name.isEmpty()) return;
+
+    const Point2D point = toPoint(data.basePoint);
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)
+        || std::abs(point.x) > kMaxCoordinate || std::abs(point.y) > kMaxCoordinate) {
+        skip(QStringLiteral("ACAD_TABLE(坐标超出范围)"));
+        return;
+    }
+
+    TableRef ref;
+    ref.blockName = name;
+    ref.insertion = point;
+    ref.rotation = data.angle;                    // 两条路径都是弧度
+    ref.scaleX = (data.xscale == 0.0) ? 1.0 : data.xscale;
+    ref.scaleY = (data.yscale == 0.0) ? 1.0 : data.yscale;
+    ref.layer = toQString(data.layer);
+    if (!m_discardBlock) m_tables.push_back(ref);
+}
+
+void Builder::noteTable(const DRW_Table& data)
+{
+    // 注意：不能因为块名称为空就丢弃。DWG（R2000/AC1015）里表格本体是不透明二进制，
+    // 块头句柄解不出来 → name 为空；但表格实体本身有效，后续可由 finishTables 与
+    // 相应的 *Tnn 几何块配对还原。DXF 路径的 name 一定是齐的，不影响。
+    const QString name = toQString(data.name);
+
+    const Point2D point = toPoint(data.basePoint);
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)
+        || std::abs(point.x) > kMaxCoordinate || std::abs(point.y) > kMaxCoordinate) {
+        skip(QStringLiteral("ACAD_TABLE(坐标超出范围)"));
+        return;
+    }
+
+    TableRef ref;
+    ref.blockName = name;
+    ref.insertion = point;
+    ref.rotation = data.angle;                    // 两条路径都是弧度
+    ref.scaleX = (data.xscale == 0.0) ? 1.0 : data.xscale;
+    ref.scaleY = (data.yscale == 0.0) ? 1.0 : data.yscale;
+    ref.layer = toQString(data.layer);
+
+    // 本体自带行列结构：行列数 > 0 才认为有效（有些工具写出的是空壳）。
+    if (data.numRows > 0 && data.numCols > 0) {
+        ref.hasNativeData = true;
+        ref.nativeRows = data.numRows;
+        ref.nativeCols = data.numCols;
+        ref.nativeRowHeights = data.rowHeights;
+        ref.nativeColWidths = data.colWidths;
+        ref.nativeTableStyle = toQString(data.tableStyle);
+        for (const DRW_Table::Cell& cell : data.cells) {
+            ref.nativeCells.emplace_back(cell.row, cell.col, toQString(cell.text), cell.align);
+        }
+        for (const DRW_Table::Merge& merge : data.merges) {
+            TableMergeRange range;
+            range.row = merge.row;
+            range.col = merge.col;
+            range.rowSpan = merge.rowSpan;
+            range.colSpan = merge.colSpan;
+            ref.nativeMerges.push_back(range);
+        }
+    }
+
+    if (!m_discardBlock) m_tables.push_back(ref);
 }
 
 // -----------------------------------------------------------------------------
@@ -1598,6 +1745,553 @@ void Builder::attachPendingAttribs()
 }
 
 // -----------------------------------------------------------------------------
+//  表格还原
+//
+//  两条路径，按可信度排序：
+//    1) 真·ACAD_TABLE 本体自带行列结构（91/92/141/142/1）——直接采用，
+//       这是权威数据，不受几何块里文字摆放方式的影响。
+//    2) 只有指向 *Tnn 几何块的块参照（本软件写出的表格、或被第三方工具
+//       剥掉本体的文件）——从几何反推：横线/竖线的坐标集合即行/列边界，
+//       块内文字按所在格归位。
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+//       块内文字按所在格归位。
+// -----------------------------------------------------------------------------
+//! DWG/R2000 兜底：取一个还没被别的表格认领的表格几何块。
+//!
+//! R2000 的 ACAD_TABLE 本体是一段不透明的二进制数据（libredwg 也标为 unhandled），
+//! 块头句柄解不出来。但文件结构保证：每张表恰有一个 *Tnn 几何块，且该块的
+//! BLKREFS 反应器直指表格句柄。两个集合各取未被认领的一个即可配对。
+const Builder::BlockDef* Builder::takeUnclaimedTableGeometry()
+{
+    for (const auto& [key, def] : m_blocks) {
+        if (!def.isTableGeometry) continue;
+        if (m_claimedTableGeometry.count(key)) continue;
+        m_claimedTableGeometry.insert(key);
+        return &def;
+    }
+    return nullptr;
+}
+
+void Builder::finishTables()
+{
+    if (m_tables.empty()) return;
+
+    // 几何块按归一化名索引，便于 O(1) 查引用。
+    std::map<QString, const BlockDef*> byKey;
+    for (const auto& [key, def] : m_blocks) {
+        if (def.isTableGeometry) byKey[key] = &def;
+    }
+    for (TableRef& ref : m_tables) {
+        std::unique_ptr<TableEntity> table = buildTableFromNative(ref);
+
+        // 本体结构有效但 cells 数组为空：DWG 的 cells 编码尚未完全逆向
+        // （LyCAD 写出端与经 libredwg 解析的真实 AutoCAD 文件都读出 0 计数），
+        // 而完整的单元格文字烘在 *Tnn 匿名几何块里。此时结构仍以本体为准，
+        // 再从几何块把文字按格归位补回来——不算降级，行列尺寸、合并、图层
+        // 全部保持本体值，也不触发「按几何块反推」警告。
+        if (table && ref.nativeCells.empty()) {
+            const BlockDef* paired = nullptr;
+            const auto named = byKey.find(BlockTable::normalizedKey(ref.blockName));
+            if (named != byKey.end() && named->second) {
+                paired = named->second;
+                m_claimedTableGeometry.insert(named->first);
+            } else {
+                // DWG(R2000) 里表格本体的块头句柄解不出来 → blockName 为空，
+                // 退回「各取未被认领的一个」配对（每个表格恰对应一个 *Tnn 块）。
+                paired = takeUnclaimedTableGeometry();
+            }
+            if (paired) mergeTableCellTexts(*table, ref, *paired);
+        }
+
+        // 块名缺失/失配：DWG（R2000/AC1015）里 ACAD_TABLE 的本体是一段不透明的
+        // 二进制块，块头句柄解不出来；此时退回「与几何块配对」。
+        // 依据：每个表格实体恰对应一个 *Tnn 几何块，且该块的 BLKREFS 反应器
+        // 直指表格句柄（DXF 侧可见）。两个集合各取未被认领的那一个即可。
+        if (!table) {
+            const auto it = byKey.find(BlockTable::normalizedKey(ref.blockName));
+            if (it != byKey.end() && it->second) {
+                m_claimedTableGeometry.insert(it->first);
+                table = buildTableFromGeometry(ref, *it->second);
+                if (table) downgrade(QStringLiteral("ACAD_TABLE(按几何块反推行列)"));
+            } else {
+                const BlockDef* paired = takeUnclaimedTableGeometry();
+                if (paired) {
+                    table = buildTableFromGeometry(ref, *paired);
+                    if (table) downgrade(QStringLiteral("ACAD_TABLE(按几何块反推行列)"));
+                }
+            }
+        }
+
+        if (!table) {
+            skip(QStringLiteral("ACAD_TABLE(无法还原)"));
+            continue;
+        }
+
+        if (!ref.layer.isEmpty() && ref.layer != QLatin1String("0")) {
+            // 仅当本体图层可信时覆盖；几何反推路径已在内部回退到块内图层。
+            if (table->layerName().isEmpty() || table->layerName() == QLatin1String("0"))
+                table->setLayerName(ref.layer);
+        }
+        m_doc.addEntity(std::move(table));
+    }
+
+    m_tables.clear();
+}
+
+//! 用 ACAD_TABLE 本体携带的行列结构建表。无本体数据时返回 nullptr。
+std::unique_ptr<TableEntity> Builder::buildTableFromNative(const TableRef& ref) const
+{
+    if (!ref.hasNativeData) return nullptr;
+
+    const std::size_t rows = static_cast<std::size_t>(ref.nativeRows);
+    const std::size_t cols = static_cast<std::size_t>(ref.nativeCols);
+
+    auto table = std::make_unique<TableEntity>(rows, cols);
+    table->setInsertionPoint(ref.insertion);
+    table->setRotation(ref.rotation);
+
+    // 行列尺寸：本体给出的是局部尺寸（未随块参照缩放），需乘上块参照缩放。
+    const double sx = std::abs(ref.scaleX);
+    const double sy = std::abs(ref.scaleY);
+    for (std::size_t r = 0; r < rows && r < ref.nativeRowHeights.size(); ++r) {
+        table->setRowHeight(r, ref.nativeRowHeights[r] * sy);
+    }
+    for (std::size_t c = 0; c < cols && c < ref.nativeColWidths.size(); ++c) {
+        table->setColumnWidth(c, ref.nativeColWidths[c] * sx);
+    }
+
+    // DWG 原生路径给出的对齐方式是 1~9 的九宫格编号
+    //（1=左上 … 5=居中 … 9=右下），越界/缺省归居中。
+    auto mapCellAlign = [](int align) {
+        switch (align) {
+        case 1: return TableCellAlign::TopLeft;
+        case 2: return TableCellAlign::TopCenter;
+        case 3: return TableCellAlign::TopRight;
+        case 4: return TableCellAlign::MiddleLeft;
+        case 6: return TableCellAlign::MiddleRight;
+        case 7: return TableCellAlign::BottomLeft;
+        case 8: return TableCellAlign::BottomCenter;
+        case 9: return TableCellAlign::BottomRight;
+        default: return TableCellAlign::MiddleCenter;
+        }
+    };
+
+    for (const auto& [row, col, text, align] : ref.nativeCells) {
+        if (row < 0 || col < 0) continue;
+        if (static_cast<std::size_t>(row) >= rows || static_cast<std::size_t>(col) >= cols) continue;
+        const auto r = static_cast<std::size_t>(row);
+        const auto c = static_cast<std::size_t>(col);
+        TableCell cell = table->cell(r, c);
+        cell.text = text;
+        cell.align = mapCellAlign(align);
+        table->setCell(r, c, cell);
+    }
+    for (const TableMergeRange& merge : ref.nativeMerges) {
+        table->addMerge(merge);
+    }
+    return table;
+}
+
+std::unique_ptr<TableEntity> Builder::buildTableFromGeometry(const TableRef& ref,
+                                                             const BlockDef& def) const
+{
+    // 1) 收集块内所有直线段（LINE / LWPOLYLINE 段的直线化结果）作为网格线。
+    //    这里只认真正水平/垂直的线段——表格的网格线正是如此；单元格文字
+    //    的包围盒不参与，因为它不是线。
+    std::vector<std::pair<Point2D, Point2D>> segments;
+    segments.reserve(def.entities.size());
+
+    // 文字：记录基线点与内容，稍后按所在单元格归位
+    struct BlockText {
+        QString text;
+        Point2D anchor;
+        double  height = 0.0;
+    };
+    std::vector<BlockText> texts;
+    // 几何块内首个非空图层名——表格本体图层不可信（DWG 兜底）时用它。
+    QString geometryLayer;
+
+    for (const std::unique_ptr<Entity>& entity : def.entities) {
+        if (!entity) continue;
+        if (geometryLayer.isEmpty() && !entity->layerName().isEmpty())
+            geometryLayer = entity->layerName();
+        switch (entity->type()) {
+        case EntityType::Line: {
+            const auto* line = static_cast<const LineEntity*>(entity.get());
+            segments.emplace_back(line->start(), line->end());
+            break;
+        }
+        case EntityType::Polyline: {
+            const auto* poly = static_cast<const PolylineEntity*>(entity.get());
+            const std::vector<Point2D> pts = poly->flatten(kGeomTol);
+            for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+                segments.emplace_back(pts[i], pts[i + 1]);
+            }
+            if (poly->isClosed() && pts.size() >= 3) {
+                segments.emplace_back(pts.back(), pts.front());
+            }
+            break;
+        }
+        case EntityType::Text: {
+            const auto* text = static_cast<const TextEntity*>(entity.get());
+            texts.push_back(BlockText{ text->displayString(), text->position(), text->height() });
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    if (segments.empty()) return nullptr;
+
+    // 2) 水平线 -> 行边界 Y 集合；竖线 -> 列边界 X 集合。坐标相同的线合并。
+    constexpr double kAxisTol = 1e-3;
+    auto nearlyEqual = [](double a, double b) { return std::abs(a - b) <= kAxisTol; };
+
+    std::vector<double> rowYs;      // Y 坐标（自上而下递减）
+    std::vector<double> colXs;      // X 坐标（自左而右递增）
+    auto insertUnique = [&](std::vector<double>& v, double value) {
+        for (double existing : v) {
+            if (nearlyEqual(existing, value)) return;
+        }
+        v.push_back(value);
+    };
+
+    for (const auto& [a, b] : segments) {
+        if (nearlyEqual(a.y, b.y)) {
+            insertUnique(rowYs, a.y);              // 水平线
+        } else if (nearlyEqual(a.x, b.x)) {
+            insertUnique(colXs, a.x);              // 竖线
+        }
+    }
+
+    std::sort(rowYs.begin(), rowYs.end(), std::greater<double>());   // 上大下小
+    std::sort(colXs.begin(), colXs.end());                           // 左小右大
+
+    if (rowYs.size() < 2 || colXs.size() < 2) return nullptr;
+
+    const std::size_t rows = rowYs.size() - 1;
+    const std::size_t cols = colXs.size() - 1;
+
+    // 3) 组装 TableEntity。局部坐标：插入点即左上角（0,0），Y 向下为负。
+    auto table = std::make_unique<TableEntity>();
+
+    // 插入点与旋转的取舍：
+    //   · DXF / 写出的表格引用：ref 里的插入点、旋转是可信的（与块参照字段一致）。
+    //   · DWG(R2000) 兜底配对：表格本体是不可解析的不透明块，ref 里的数值是错位
+    //     解出来的垃圾（可能是 1e80 量级）。此时改由几何自身定位——左上角即插入点，
+    //     旋转取 0（块内几何已按图纸坐标系摆放）。
+    const bool refTrustworthy =
+        std::isfinite(ref.insertion.x) && std::isfinite(ref.insertion.y)
+        && std::abs(ref.insertion.x) <= kMaxCoordinate
+        && std::abs(ref.insertion.y) <= kMaxCoordinate
+        && std::abs(ref.rotation) <= 2.0 * M_PI + 1e-6
+        && std::abs(ref.scaleX) > 1e-9 && std::abs(ref.scaleX) < 1e6
+        && std::abs(ref.scaleY) > 1e-9 && std::abs(ref.scaleY) < 1e6;
+
+    if (refTrustworthy) {
+        table->setInsertionPoint(ref.insertion);
+        table->setRotation(ref.rotation);
+    } else {
+        // 几何块基点 + 网格左上角 → 世界坐标插入点
+        const double sx = 1.0;
+        table->setInsertionPoint(Point2D{ def.base.x + colXs.front() * sx,
+                                          def.base.y + rowYs.front() * sx });
+        table->setRotation(0.0);
+    }
+
+    // 几何块基点可能不是 0（块基点 -> 局部坐标偏移）。块内坐标需减去基点，
+    // 再按插入点的参考系摆放。这里把块基点折算进局部坐标。
+    const double baseX = def.base.x;
+    const double baseY = def.base.y;
+
+    const double topY = rowYs.front();
+    const double leftX = colXs.front();
+
+    table->reset(rows, cols, 1.0, 1.0);
+    const double scaleX = refTrustworthy ? std::abs(ref.scaleX) : 1.0;
+    const double scaleY = refTrustworthy ? std::abs(ref.scaleY) : 1.0;
+    for (std::size_t r = 0; r < rows; ++r) {
+        const double h = std::abs(rowYs[r] - rowYs[r + 1]);
+        table->setRowHeight(r, h > kGeomTol ? h * scaleY : 1.0);
+    }
+    for (std::size_t c = 0; c < cols; ++c) {
+        const double w = std::abs(colXs[c + 1] - colXs[c]);
+        table->setColumnWidth(c, w > kGeomTol ? w * scaleX : 1.0);
+    }
+
+    // 4) 文字归位：按基线点落在哪个单元格（考虑对齐产生的水平偏移，
+    //    这里用中心点而非锚点判断——表格文字通常居中，锚点会在格中）。
+    for (const BlockText& text : texts) {
+        if (text.text.isEmpty()) continue;
+
+        const double lx = text.anchor.x - baseX;
+        const double ly = text.anchor.y - baseY;
+
+        // 找到所属行（ly 落在 [rowYs[r+1], rowYs[r]]）
+        int row = -1;
+        for (std::size_t r = 0; r < rows; ++r) {
+            const double upper = rowYs[r] - baseY;
+            const double lower = rowYs[r + 1] - baseY;
+            if (ly <= upper + kAxisTol && ly >= lower - kAxisTol) {
+                row = static_cast<int>(r);
+                break;
+            }
+        }
+        if (row < 0) {
+            // 基线可能略低于单元格底（VBaseLine），按单元格高度向上回退一行
+            for (std::size_t r = 0; r < rows; ++r) {
+                const double upper = rowYs[r] - baseY;
+                const double lower = rowYs[r + 1] - baseY;
+                if (ly <= upper + text.height + kAxisTol && ly >= lower - kAxisTol) {
+                    row = static_cast<int>(r);
+                    break;
+                }
+            }
+        }
+
+        int col = -1;
+        for (std::size_t c = 0; c < cols; ++c) {
+            const double left = colXs[c] - baseX;
+            const double right = colXs[c + 1] - baseX;
+            if (lx >= left - kAxisTol && lx <= right + kAxisTol) {
+                col = static_cast<int>(c);
+                break;
+            }
+        }
+
+        if (row < 0 || col < 0) continue;
+
+        TableCell existing = table->cell(static_cast<std::size_t>(row),
+                                        static_cast<std::size_t>(col));
+        if (!existing.text.isEmpty()) {
+            existing.text += QLatin1Char('\n') + text.text;   // 多行堆叠
+        } else {
+            existing.text = text.text;
+        }
+        existing.align = TableCellAlign::MiddleCenter;
+        table->setCell(static_cast<std::size_t>(row), static_cast<std::size_t>(col), existing);
+    }
+
+    Q_UNUSED(topY);
+    Q_UNUSED(leftX);
+    // 本体图层不可信（DWG 兜底配对）时，退回几何块内实体的图层。
+    if (!refTrustworthy && !geometryLayer.isEmpty())
+        table->setLayerName(geometryLayer);
+    return table;
+}
+
+//! 本体结构有效但 cells 为空时的补全：*Tnn 匿名几何块里除了网格线，
+//! 还烘着每个非空单元格的 TEXT（写出端与 AutoCAD 原生写法一致）。块基点
+//! 取原点，块内坐标即表格局部坐标，与 rowBoundaries()/columnBoundaries()
+//! 同一参考系——锚点减去块基点（再按块参照缩放折算）后，行按 Y 区间
+//! （第 0 行在最上方）、列按 X 区间归属。只补文字，不动结构：已有内容的
+//! 格用 \n 堆叠，对齐一律置 MiddleCenter（基线锚点反推不出原始对齐）。
+//!
+//! 合并区同样从几何块反推：写出约定「合并区内部的网格线段不画」，因此
+//! 某条内部竖线在行带上找不到覆盖段 → 相邻两格横向连通；内部横线缺失 →
+//! 纵向连通。连通块恰为实心矩形时登记为合并区（addMerge 自拒越界/重叠，
+//! 畸形几何最多被丢弃，不会污染结构）。本体已带 merges 时跳过反推。
+void Builder::mergeTableCellTexts(TableEntity& table, const TableRef& ref,
+                                  const BlockDef& def) const
+{
+    // 块参照缩放异常时按 1 处理（LyCAD 写出的表格比例恒为 1）
+    const double sx = (std::isfinite(ref.scaleX) && std::abs(ref.scaleX) > 1e-9
+                       && std::abs(ref.scaleX) < 1e6) ? std::abs(ref.scaleX) : 1.0;
+    const double sy = (std::isfinite(ref.scaleY) && std::abs(ref.scaleY) > 1e-9
+                       && std::abs(ref.scaleY) < 1e6) ? std::abs(ref.scaleY) : 1.0;
+
+    const std::size_t rows = table.rowCount();
+    const std::size_t cols = table.columnCount();
+    const std::vector<double> rowYs = table.rowBoundaries();     // 上 0，向下为负
+    const std::vector<double> colXs = table.columnBoundaries();  // 左 0，向右为正
+    if (rowYs.size() != rows + 1 || colXs.size() != cols + 1) return;
+
+    const double baseX = def.base.x;
+    const double baseY = def.base.y;
+
+    constexpr double kAxisTol = 1e-3;
+
+    // 块内内容：轴对齐线段（网格线）与文字锚点，均折算到表格局部参考系
+    // （块内坐标 - 块基点，再乘块参照缩放）。
+    struct BlockSeg { double x1, y1, x2, y2; };
+    struct BlockText { QString text; double x, y, height; };
+    std::vector<BlockSeg> segments;
+    std::vector<BlockText> texts;
+
+    auto pushSeg = [&](const Point2D& a, const Point2D& b) {
+        segments.push_back({ (a.x - baseX) * sx, (a.y - baseY) * sy,
+                             (b.x - baseX) * sx, (b.y - baseY) * sy });
+    };
+
+    for (const std::unique_ptr<Entity>& entity : def.entities) {
+        if (!entity) continue;
+        switch (entity->type()) {
+        case EntityType::Line: {
+            const auto* line = static_cast<const LineEntity*>(entity.get());
+            pushSeg(line->start(), line->end());
+            break;
+        }
+        case EntityType::Polyline: {
+            const auto* poly = static_cast<const PolylineEntity*>(entity.get());
+            const std::vector<Point2D> pts = poly->flatten(kGeomTol);
+            for (std::size_t i = 0; i + 1 < pts.size(); ++i)
+                pushSeg(pts[i], pts[i + 1]);
+            if (poly->isClosed() && pts.size() >= 3)
+                pushSeg(pts.back(), pts.front());
+            break;
+        }
+        case EntityType::Text: {
+            const auto* text = static_cast<const TextEntity*>(entity.get());
+            if (!text->displayString().isEmpty()) {
+                texts.push_back({ text->displayString(),
+                                  (text->position().x - baseX) * sx,
+                                  (text->position().y - baseY) * sy,
+                                  text->height() * sy });
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    // ---- 合并区反推（本体没给 merges 才做） --------------------------------
+    if (ref.nativeMerges.empty() && !segments.empty()) {
+        // 竖直边界 c 在行带 [rowYs[r+1], rowYs[r]] 上是否有线段覆盖
+        auto vBoundaryPresent = [&](std::size_t r, std::size_t c) {
+            const double x = colXs[c];
+            const double yTop = rowYs[r];
+            const double yBot = rowYs[r + 1];
+            for (const BlockSeg& s : segments) {
+                if (std::abs(s.x1 - x) > kAxisTol || std::abs(s.x2 - x) > kAxisTol)
+                    continue;
+                const double lo = std::min(s.y1, s.y2);
+                const double hi = std::max(s.y1, s.y2);
+                if (lo <= yBot + kAxisTol && hi >= yTop - kAxisTol) return true;
+            }
+            return false;
+        };
+        // 水平边界 r 在列带 [colXs[c], colXs[c+1]] 上是否有线段覆盖
+        auto hBoundaryPresent = [&](std::size_t r, std::size_t c) {
+            const double y = rowYs[r];
+            const double xL = colXs[c];
+            const double xR = colXs[c + 1];
+            for (const BlockSeg& s : segments) {
+                if (std::abs(s.y1 - y) > kAxisTol || std::abs(s.y2 - y) > kAxisTol)
+                    continue;
+                const double lo = std::min(s.x1, s.x2);
+                const double hi = std::max(s.x1, s.x2);
+                if (lo <= xL + kAxisTol && hi >= xR - kAxisTol) return true;
+            }
+            return false;
+        };
+
+        // 并查集：相邻两格之间的内部边界缺失即连通
+        std::vector<int> parent(rows * cols);
+        std::iota(parent.begin(), parent.end(), 0);
+        auto find = [&parent](int x) {
+            while (parent[x] != x) x = parent[x] = parent[parent[x]];
+            return x;
+        };
+        auto unite = [&find, &parent](int a, int b) { parent[find(a)] = find(b); };
+
+        for (std::size_t r = 0; r < rows; ++r) {
+            for (std::size_t c = 0; c + 1 < cols; ++c) {
+                if (vBoundaryPresent(r, c + 1)) continue;
+                unite(static_cast<int>(r * cols + c), static_cast<int>(r * cols + c + 1));
+            }
+        }
+        for (std::size_t r = 0; r + 1 < rows; ++r) {
+            for (std::size_t c = 0; c < cols; ++c) {
+                if (hBoundaryPresent(r + 1, c)) continue;
+                unite(static_cast<int>(r * cols + c), static_cast<int>((r + 1) * cols + c));
+            }
+        }
+
+        // 连通块恰为实心矩形（格子数 == 外包矩形面积）才登记为合并区
+        struct Comp { int minR, maxR, minC, maxC, count; };
+        std::map<int, Comp> comps;
+        for (std::size_t r = 0; r < rows; ++r) {
+            for (std::size_t c = 0; c < cols; ++c) {
+                const int root = find(static_cast<int>(r * cols + c));
+                const auto it = comps.find(root);
+                if (it == comps.end()) {
+                    comps.emplace(root, Comp{ static_cast<int>(r), static_cast<int>(r),
+                                              static_cast<int>(c), static_cast<int>(c), 1 });
+                } else {
+                    Comp& comp = it->second;
+                    comp.minR = std::min(comp.minR, static_cast<int>(r));
+                    comp.maxR = std::max(comp.maxR, static_cast<int>(r));
+                    comp.minC = std::min(comp.minC, static_cast<int>(c));
+                    comp.maxC = std::max(comp.maxC, static_cast<int>(c));
+                    ++comp.count;
+                }
+            }
+        }
+        for (const auto& [root, comp] : comps) {
+            Q_UNUSED(root);
+            if (comp.count <= 1) continue;
+            const int rowSpan = comp.maxR - comp.minR + 1;
+            const int colSpan = comp.maxC - comp.minC + 1;
+            if (comp.count != rowSpan * colSpan) continue;   // 非矩形：放弃
+            TableMergeRange range;
+            range.row = comp.minR;
+            range.col = comp.minC;
+            range.rowSpan = rowSpan;
+            range.colSpan = colSpan;
+            table.addMerge(range);
+        }
+    }
+
+    // ---- 文字按格归位 -------------------------------------------------------
+    for (const BlockText& text : texts) {
+        const double lx = text.x;
+        const double ly = text.y;
+        const double th = text.height;   // 基线回退用（已在缩放参考系）
+
+        // 行：ly ∈ [rowYs[r+1], rowYs[r]]（Y 向下为负、第 0 行在最上方）
+        int row = -1;
+        for (std::size_t r = 0; r < rows; ++r) {
+            if (ly <= rowYs[r] + kAxisTol && ly >= rowYs[r + 1] - kAxisTol) {
+                row = static_cast<int>(r);
+                break;
+            }
+        }
+        if (row < 0) {
+            // 基线可能贴着格底（VBaseLine），按文字高度向上回退一行
+            for (std::size_t r = 0; r < rows; ++r) {
+                if (ly <= rowYs[r] + th + kAxisTol && ly >= rowYs[r + 1] - kAxisTol) {
+                    row = static_cast<int>(r);
+                    break;
+                }
+            }
+        }
+
+        // 列：lx ∈ [colXs[c], colXs[c+1]]
+        int col = -1;
+        for (std::size_t c = 0; c < cols; ++c) {
+            if (lx >= colXs[c] - kAxisTol && lx <= colXs[c + 1] + kAxisTol) {
+                col = static_cast<int>(c);
+                break;
+            }
+        }
+
+        if (row < 0 || col < 0) continue;
+
+        TableCell existing = table.cell(static_cast<std::size_t>(row),
+                                        static_cast<std::size_t>(col));
+        if (!existing.text.isEmpty())
+            existing.text += QLatin1Char('\n') + text.text;   // 同格多行堆叠
+        else
+            existing.text = text.text;
+        existing.align = TableCellAlign::MiddleCenter;
+        table.setCell(static_cast<std::size_t>(row), static_cast<std::size_t>(col), existing);
+    }
+}
+
+// -----------------------------------------------------------------------------
 //  收尾
 // -----------------------------------------------------------------------------
 void Builder::finish()
@@ -1606,12 +2300,18 @@ void Builder::finish()
     // 因此必须等全部读完再统一解析。
     for (auto& [key, def] : m_blocks) {
         Q_UNUSED(key);
+        // 表格的匿名几何块不是用户意义上的块定义：它的内容用来还原表格，
+        // 不能注册进文档块表，否则每次打开都会多出一个 *Tnn 块。
+        if (def.isTableGeometry) continue;
         const std::shared_ptr<BlockDefinition> block = resolveBlock(def.name);
         if (block) m_doc.blocks().add(block);
     }
 
     attachInserts(std::move(m_modelInserts), nullptr);
     m_modelInserts.clear();
+
+    // 表格必须在块定义装配完之后还原：几何块可能出现在引用它之后。
+    finishTables();
 
     // 块引用都装配好之后，DWG 路径攒下的 ATTRIB 才有定义可对齐
     attachPendingAttribs();
@@ -1942,6 +2642,24 @@ public:
         }
     }
 
+    /// 预扫描：为每个表格分配匿名几何块名（*T1、*T2……）。
+    ///
+    /// 表格以「插入点 + 旋转 + 行列尺寸 + 单元格文字」表达，DXF 侧没有等价
+    /// 的可写实体（libdxfrw 不支持 ACAD_TABLE 写出）。因此走 AutoCAD 自己的
+    /// 老路子：把网格线与单元格文字烘焙进一个匿名块，实体本体写成块参照。
+    /// 这样本软件读回时按块参照还原（见 processTable），AutoCAD 也能正常显示。
+    void prescanTableBlocks()
+    {
+        int index = 0;
+        for (EntityId id : m_doc.drawOrder()) {
+            const Entity* entity = m_doc.entity(id);
+            if (!entity || entity->type() != EntityType::Table) continue;
+            m_tableBlocks.emplace(
+                entity->id(),
+                QStringLiteral("*T%1").arg(++index).toStdString());
+        }
+    }
+
     // ---- 读侧接口（导出不使用） ----------------------------------------------
     void addHeader(const DRW_Header*) override {}
     void addLType(const DRW_LType&) override {}
@@ -2197,6 +2915,10 @@ public:
             Q_UNUSED(id);
             m_rw->writeBlockRecord(blockName);
         }
+        for (const auto& [id, blockName] : m_tableBlocks) {
+            Q_UNUSED(id);
+            m_rw->writeBlockRecord(blockName);
+        }
     }
 
     void writeBlocks() override
@@ -2207,6 +2929,10 @@ public:
         for (const auto& [id, blockName] : m_dimBlocks) {
             Q_UNUSED(id);
             writeDimensionBlock(blockName);
+        }
+        for (const auto& [id, blockName] : m_tableBlocks) {
+            Q_UNUSED(id);
+            writeTableBlock(blockName);
         }
     }
 
@@ -2239,6 +2965,7 @@ private:
         case EntityType::XLine:     writeXLine(static_cast<const XLineEntity&>(entity)); break;
         case EntityType::Ray:       writeRay(static_cast<const RayEntity&>(entity)); break;
         case EntityType::Insert:    writeInsert(static_cast<const InsertEntity&>(entity)); break;
+        case EntityType::Table:     writeTable(static_cast<const TableEntity&>(entity)); break;
         }
     }
 
@@ -2352,7 +3079,171 @@ private:
         m_rw->writeSeqEnd(&record);
     }
 
+    /// 表格（ACAD_TABLE）。
+    ///
+    /// 两条写出策略：
+    ///   · DXF：写出**真正的 ACAD_TABLE 实体**（AcDbBlockReference 子类），
+    ///     本体带完整行列结构与单元格文字，同时引用预先烘焙好的 *Tnn 几何块
+    ///     （旧软件靠它显示）。AutoCAD 打开即为可编辑的表格对象。
+    ///   · DWG：同样写出原生 ACAD_TABLE 类实体（dwgW::writeTable 已按实测位
+    ///     布局实现 AcDbBlockReference + AcDbTable 两段，单元格文字随本体
+    ///     逐格写出，并在 CLASSES 段登记 AcDbTable）。几何（网格线 + 单元格
+    ///     文字）仍完整保留在 *Tnn 匿名块里，由本实体的 block_header(H2) 引用
+    ///     —— 与 AutoCAD 的原生写法一致。
+    ///
+    /// ★ 单元格与合并区两条支路都必须填进 record：DWG 分支若漏填，写出的
+    ///   表格本体全是空格（cell type=0）——显示端靠 *Tnn 块照常显示，但
+    ///   双击进入表格编辑器后内容模型为空，退出即把文字抹掉
+    ///   （实测浩辰 CAD 就是这样丢字的）。
+    void writeTable(const TableEntity& table)
+    {
+        const auto it = m_tableBlocks.find(table.id());
+        if (it == m_tableBlocks.end()) return;   // 未预扫描：写出去就是悬空引用
+
+        DRW_Table record;
+        applyCommonWrite(record, table);
+        record.name = it->second;
+        record.tableStyle = "Standard";
+        applyCoord(record.basePoint, table.insertionPoint());
+        record.xscale = 1.0;
+        record.yscale = 1.0;
+        record.zscale = 1.0;
+        record.angle = table.rotation();      // 弧度（DXF 写出时库再乘 ARAD 转度）
+
+        record.numRows = static_cast<int>(table.rowCount());
+        record.numCols = static_cast<int>(table.columnCount());
+        record.rowHeights = table.rowHeights();
+        record.colWidths = table.columnWidths();
+        for (const auto& [row, col, cell] : table.nonEmptyCells()) {
+            DRW_Table::Cell record2;
+            record2.row = row;
+            record2.col = col;
+            record2.text = cell.text.toStdString();
+            record.cells.push_back(record2);
+        }
+        for (const TableMergeRange& merge : table.merges()) {
+            DRW_Table::Merge m;
+            m.row = merge.row;
+            m.col = merge.col;
+            m.rowSpan = merge.rowSpan;
+            m.colSpan = merge.colSpan;
+            record.merges.push_back(m);
+        }
+        m_rw->writeTable(&record);
+    }
+
 private:
+    /// 表格的匿名几何块：网格线（LINE）+ 单元格文字（TEXT），图层 0、颜色 ByBlock，
+    /// 与标注块同一套约定——随表格实体着色。
+    void writeTableBlock(const std::string& name)
+    {
+        const TableEntity* table = nullptr;
+        for (const auto& [id, blockName] : m_tableBlocks) {
+            if (blockName == name) {
+                table = static_cast<const TableEntity*>(m_doc.entity(id));
+                break;
+            }
+        }
+        if (!table) return;
+
+        DRW_Block block;
+        block.name = name;
+        block.flags = 1;                          // bit 1 = 匿名块
+        applyCoord(block.basePoint, Point2D(0.0, 0.0));
+        m_rw->writeBlock(&block);
+
+        auto beginBlockEntity = [&](DRW_Entity& entity) {
+            entity.layer = "0";
+            entity.color = 0;                     // ByBlock：随表格实体着色
+            entity.lineType = "ByLayer";
+            entity.lWeight = DRW_LW_Conv::dxfInt2lineWidth(-3);
+        };
+
+        // 网格线：块内坐标即表格局部坐标（插入点在实体上，块基点取原点）
+        for (const auto& seg : table->gridLinesLocal()) {
+            DRW_Line line;
+            beginBlockEntity(line);
+            applyCoord(line.basePoint, seg.first);
+            applyCoord(line.secPoint, seg.second);
+            m_rw->writeLine(&line);
+        }
+
+        // 单元格文字：按对齐方式给出基线锚点，与渲染期的定位保持一致
+        const std::vector<double> rows = table->rowBoundaries();
+        const std::vector<double> cols = table->columnBoundaries();
+        for (const auto& [row, col, cell] : table->nonEmptyCells()) {
+            if (cell.text.isEmpty()) continue;
+            if (row < 0 || col < 0) continue;
+            const std::size_t r = static_cast<std::size_t>(row);
+            const std::size_t c = static_cast<std::size_t>(col);
+            if (r + 1 >= rows.size() || c + 1 >= cols.size()) continue;
+
+            const double top = rows[r];
+            const double bottom = rows[r + 1];
+            const double left = cols[c];
+            const double right = cols[c + 1];
+            const double midY = (top + bottom) * 0.5;
+
+            const double boxH = std::abs(top - bottom);
+            const double boxW = std::abs(right - left);
+            // 文字高度：单元格高度的 60%，再按最长行文字宽度收敛，避免溢出格子
+            const QStringList textLines = cell.text.split(QLatin1Char('\n'));
+            double height = boxH * 0.6;
+            const int longest = [&] {
+                int n = 1;
+                for (const QString& l : textLines) n = std::max(n, static_cast<int>(l.size()));
+                return n;
+            }();
+            if (longest > 0 && boxW > 0.0) {
+                // 粗估：平均字宽约 0.6 倍字高
+                height = std::min(height, boxW / (0.6 * static_cast<double>(longest)));
+            }
+            if (height <= kGeomTol) continue;
+
+            // 对齐 -> 水平锚点与基线 Y（块内局部坐标，Y 向下为负）
+            const bool toLeft = cell.align == TableCellAlign::TopLeft
+                || cell.align == TableCellAlign::MiddleLeft
+                || cell.align == TableCellAlign::BottomLeft;
+            const bool toRight = cell.align == TableCellAlign::TopRight
+                || cell.align == TableCellAlign::MiddleRight
+                || cell.align == TableCellAlign::BottomRight;
+            const bool toTop = cell.align == TableCellAlign::TopLeft
+                || cell.align == TableCellAlign::TopCenter
+                || cell.align == TableCellAlign::TopRight;
+            const bool toBottom = cell.align == TableCellAlign::BottomLeft
+                || cell.align == TableCellAlign::BottomCenter
+                || cell.align == TableCellAlign::BottomRight;
+
+            const double anchorX = toLeft ? left + boxW * 0.05 : (toRight ? right - boxW * 0.05 : (left + right) * 0.5);
+            double baselineY = toTop ? top - height
+                                     : (toBottom ? bottom : midY - height * 0.5);
+
+            for (int i = 0; i < textLines.size(); ++i) {
+                if (textLines[i].isEmpty()) continue;
+                DRW_Text text;
+                beginBlockEntity(text);
+                text.text = textLines[i].toStdString();
+                text.height = height;
+                text.angle = 0.0;
+                text.widthscale = 1.0;
+                text.style = "Standard";
+                applyCoord(text.basePoint, Point2D(anchorX, baselineY));
+                applyCoord(text.secPoint, Point2D(anchorX, baselineY));
+                if (toLeft || toRight || (cell.align != TableCellAlign::MiddleCenter
+                                          && cell.align != TableCellAlign::TopCenter
+                                          && cell.align != TableCellAlign::BottomCenter)) {
+                    // 非左对齐（含居中/右对齐）必须给对齐点，否则 TEXT 会忽略 alignH
+                    text.alignH = toRight ? DRW_Text::HRight
+                                          : (toLeft ? DRW_Text::HLeft : DRW_Text::HCenter);
+                    text.alignV = DRW_Text::VBaseLine;
+                    applyCoord(text.secPoint, Point2D(anchorX, baselineY));
+                }
+                m_rw->writeText(&text);
+                baselineY -= height * 1.2;        // 多行向下串行（块内 Y 轴向上为正）
+            }
+        }
+    }
+
     void writeDimensionBlock(const std::string& name)
     {
         const DimensionEntity* dim = nullptr;
@@ -2782,6 +3673,8 @@ private:
     /// 目标版本的 DXF 文本是否按 UTF-8 存放（AC1021 及以后为真）
     bool m_utf8Text = false;
     std::map<EntityId, std::string> m_dimBlocks;
+    /// 表格实体的匿名几何块名（*T1、*T2……）
+    std::map<EntityId, std::string> m_tableBlocks;
     /// 参与写出的块定义（文档引用的 + 块表里的），以及它们在文件里的名字
     std::vector<std::shared_ptr<BlockDefinition>> m_blockOrder;
     std::map<const BlockDefinition*, std::string> m_blockWriteNames;
@@ -2808,6 +3701,7 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
     Exporter exporter(document, version);
     exporter.prescanBlocks();
     exporter.prescanDimensionBlocks();
+    exporter.prescanTableBlocks();
 
     const QByteArray native = QFile::encodeName(path);
     dxfRW writer(native.constData());
@@ -2832,6 +3726,7 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
     ExporterBase<dwgW> exporter(document, DRW::AC1015);
     exporter.prescanBlocks();
     exporter.prescanDimensionBlocks();
+    exporter.prescanTableBlocks();
 
     const QByteArray native = QFile::encodeName(path);
     dwgW writer(native.constData());

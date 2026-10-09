@@ -73,6 +73,7 @@ namespace DRW {
 //        SUN,
 //        SURFACE, //encripted propietry data can be four types
 //        TABLE,
+        ACAD_TABLE,
         TEXT,
 //        TOLERANCE,
         TRACE,
@@ -578,6 +579,76 @@ public: //only for write
          first_attrib / last_attrib / seqend 三个句柄，句柄得提前分配，
          因此写出侧要先知道条数（DXF 侧用不到，靠 66 组码即可）。 */
     int attribCount = 0;
+};
+
+/**
+ * ACAD_TABLE（表格）实体。
+ *
+ * 该实体在 AutoCAD 中是一个 AcDbBlockReference 子类：几何（网格线、单元格
+ * 文字）缓存在它引用的匿名块（*Tnn）里，实体本体另有一段 AcDbTable 属性
+ * （行列数、行列高宽、单元格文字与合并信息）。
+ *
+ * 本类同时承担「写出载体」与「读入结果」两个角色：
+ *   · 写出：dxfRW::writeTable 按 DXF 规范拼出 ACAD_TABLE 组码流；
+ *   · 读入：dxfRW::processTable 逐组码填充本对象后回调 addTable。
+ */
+class DRW_Table : public DRW_Point {
+    SETENTFRIENDS
+public:
+    DRW_Table() {
+        eType = DRW::ACAD_TABLE;
+        xscale = 1;
+        yscale = 1;
+        zscale = 1;
+        angle = 0;
+        numRows = 0;
+        numCols = 0;
+        tableStyle = "Standard";
+    }
+
+    virtual void applyExtrusion() { DRW_Point::applyExtrusion(); }
+
+    /// 单元格：以 (row, col) 定位，text 为该格显示的文字；
+    /// align 为对齐方式（1~9，九宫格：1=左上 … 5=居中 … 9=右下），
+    /// 仅 DWG 原生解析路径会填充（DXF 路径保持缺省 5 = 居中）。
+    struct Cell {
+        int     row = 0;
+        int     col = 0;
+        UTF8STRING text;
+        int     align = 5;
+    };
+    /// 合并区：左上角 (row, col)，跨 rowSpan 行、colSpan 列
+    struct Merge {
+        int row = 0;
+        int col = 0;
+        int rowSpan = 1;
+        int colSpan = 1;
+    };
+
+protected:
+    void parseCode(int code, dxfReader* reader);
+    virtual bool parseDwg(DRW::Version v, dwgBuffer* buf, duint32 bs = 0);
+
+public:
+    // ---- AcDbBlockReference 段落 ------------------------------------------
+    UTF8STRING name;         /*!< 缓存几何块名（*Tnn），code 2 */
+    double xscale;           /*!< code 41 */
+    double yscale;           /*!< code 42 */
+    double zscale;           /*!< code 43 */
+    double angle;            /*!< 旋转角（弧度），code 50 */
+
+    // ---- AcDbTable 段落 ---------------------------------------------------
+    UTF8STRING tableStyle;   /*!< 表样式名，code 342/2 */
+    int    numRows = 0;      /*!< 行数，code 91 */
+    int    numCols = 0;      /*!< 列数，code 92 */
+    std::vector<double> rowHeights;    /*!< 各列行高，code 141（重复）*/
+    std::vector<double> colWidths;     /*!< 各列列宽，code 142（重复）*/
+    std::vector<Cell>   cells;         /*!< 单元格文字，code 11/21 + 1 */
+    std::vector<Merge>  merges;        /*!< 合并区，code 93/94/95/96 */
+
+    // 解析 DWG 时用：块记录句柄（H 2）即 *Tnn 块的入口；表样式句柄（H 342）。
+    dwgHandle blockRecH;
+    dwgHandle tableStyleH;
 };
 
 //! Class to handle lwpolyline entity

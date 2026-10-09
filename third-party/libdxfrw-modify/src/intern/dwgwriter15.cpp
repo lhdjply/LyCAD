@@ -35,8 +35,10 @@
 #include <cstring>
 #include <fstream>
 #include <algorithm>
+#include <map>
 #include <set>
 #include <ctime>
+#include <utility>
 
 #include "../drw_entities.h"
 #include "../drw_header.h"
@@ -100,6 +102,7 @@ constexpr std::uint16_t kClassPlaceholder = 501;   // AcDbPlaceHolder
 constexpr std::uint16_t kClassLayout      = 502;   // AcDbLayout
 constexpr std::uint16_t kClassDictVar     = 503;   // AcDbDictionaryVar
 constexpr std::uint16_t kClassArcDim      = 504;   // AcDbArcDimension（弧长标注）
+constexpr std::uint16_t kClassTable       = 505;   // AcDbTable（表格 ACAD_TABLE）
 
 constexpr std::uint8_t kHcAbsolute = 5;     // 句柄码 5：硬指针（绝对）
 constexpr std::uint8_t kHcSoftPtr  = 4;     // 句柄码 4：软指针（绝对）——实体/控制对象属主
@@ -285,6 +288,12 @@ struct dwgW::Private
     {
         auto it = blocks.find(name);
         return it != blocks.end() ? it->second.record : mspace.record;
+    }
+    /// 表格样式句柄（ACAD_TABLE 的 H342）。本写出器不单独写 TABLESTYLE 对象，
+    /// 一律回退到句柄 0（"无"）——读取端把 0 视作使用默认 Standard 样式。
+    std::uint32_t tableStyleHandle(const std::string& /*name*/) const
+    {
+        return 0;
     }
 
     // ---- 对象登记 --------------------------------------------------------------
@@ -1908,6 +1917,164 @@ bool dwgW::writeArcDimension(DRW_DimArc* ent)
     return true;
 }
 
+// 表格（ACAD_TABLE）——DWG 里的类对象，对象头写的是类号 kClassTable。
+//
+// 字段序 100% 依据对 example.dwg（对象 278 / handle 4F2 / 类号 528）的实测解码
+// （用打过补丁的 libredwg 逐字段读出来，见 build/tblprobe/DWG_TABLE_LAYOUT.md）：
+//
+//   [AcDbBlockReference]
+//     ins_pt        3BD    (10)  插入点
+//     scale_flag    BB     (41)  3 => (1,1,1)；2 => x==y==z；1 => x 默认；0 => 各自
+//     scale         3DD    (41)  随 flag
+//     rotation      BD     (50)  弧度
+//     extrusion     3BD    (210) 通常 (0,0,1)
+//     has_attribs   B      (66)
+//     block_header  H5     (2)   *Tnn 几何块记录
+//     tablestyle    H342   (342) 表样式
+//   [AcDbTable]
+//     flag_for_table_value BS (90)  实测 22
+//     horiz_direction      3BD (11) 实测 (1,0,0)
+//     num_cols             BL  (92)
+//     num_rows             BL  (91)
+//     col_widths[numCols]  BD×n (142)
+//     row_heights[numRows] BD×n (141)
+//     cells[numRows*numCols] 逐格（行优先）：
+//         cell_type        BS      1 = 文字，0 = 空
+//         edge_flags       RC      0
+//         merged           B       0
+//         auto_fit         B       0
+//         merge_width      BL      跨列数（合并区左上角格 >1）
+//         merge_height     BL      跨行数（同上）
+//         rotation         BD      0
+//         value_handle     H(句柄流) 空（文字内联）
+//         text             TV      2000/2004 内联文字（BS 长度 + 代码页字节）
+//         has_style_override B     0
+//     has_style_override   B       0（表级样式替代）
+//     has_border_colors    B       0
+//     has_border_lweights  B       0
+//     has_border_visibility B      0
+//
+// 单元格数组编码已按 opencadcodec 的 write_table / write_table_cell_data
+// 逆向补全：文字内联在数据流（TV），每个单元格在句柄流里各占一个空句柄
+// （顺序：tablestyle 之后、行优先）。表级替代写 4 个 0 bit。这样写出的
+// 表格在 AutoCAD 与本软件读回时都能拿到真实行列结构与单元格文字。
+bool dwgW::writeTable(DRW_Table* ent)
+{
+    const std::uint32_t blockH = d->blockRecordHandle(ent->name);
+    const std::uint32_t styleH = d->tableStyleHandle(ent->tableStyle);
+
+    // 合并区：左上角格写跨距，其余格不写。按 (row, col) 索引。
+    // 另收集被合并覆盖的格：浩辰/AutoCAD 的写法是覆盖格置 merged=1
+    //（左上角格 merged=0、只带跨距），编辑器靠它判断格的归属。
+    std::map<std::pair<int, int>, const DRW_Table::Merge*> byMerge;
+    std::set<std::pair<int, int>> mergedCovered;
+    for (const DRW_Table::Merge& merge : ent->merges) {
+        byMerge.emplace(std::make_pair(merge.row, merge.col), &merge);
+        for (int r = merge.row; r < merge.row + merge.rowSpan; ++r) {
+            for (int c = merge.col; c < merge.col + merge.colSpan; ++c) {
+                if (r == merge.row && c == merge.col) continue;
+                mergedCovered.insert(std::make_pair(r, c));
+            }
+        }
+    }
+
+    // 非空文字按 (row, col) 索引。
+    std::map<std::pair<int, int>, const DRW_Table::Cell*> byCell;
+    for (const DRW_Table::Cell& cell : ent->cells) {
+        if (!cell.text.empty())
+            byCell.emplace(std::make_pair(cell.row, cell.col), &cell);
+    }
+
+    const int numRows = std::max(0, ent->numRows);
+    const int numCols = std::max(0, ent->numCols);
+
+    d->encodeEntity(kClassTable, *ent, [&](Private::ObjBuilder& b) {
+        // ---- AcDbBlockReference 段 ----
+        b.w.write3BD(ent->basePoint.x, ent->basePoint.y, ent->basePoint.z);
+
+        const bool defaultX = ent->xscale == 1.0;
+        const bool defaultY = ent->yscale == 1.0;
+        const bool defaultZ = ent->zscale == 1.0;
+        const bool uniform  = ent->xscale == ent->yscale && ent->yscale == ent->zscale;
+        if (defaultX && defaultY && defaultZ) {
+            b.w.writeBB(3);                        // 三个比例全为默认值 1
+        } else if (uniform) {
+            b.w.writeBB(2);                        // x = y = z
+            b.w.writeRD(ent->xscale);
+        } else if (defaultX) {
+            b.w.writeBB(1);                        // x 默认 1，y/z 用带默认值的编码
+            b.w.writeDD(ent->yscale, 1.0);
+            b.w.writeDD(ent->zscale, 1.0);
+        } else {
+            b.w.writeBB(0);                        // 三个比例各自编码
+            b.w.writeRD(ent->xscale);
+            b.w.writeDD(ent->yscale, ent->xscale);
+            b.w.writeDD(ent->zscale, ent->xscale);
+        }
+
+        b.w.writeBD(ent->angle);                   // 旋转（弧度）
+        b.w.write3BD(0.0, 0.0, 1.0);               // 挤出
+        b.w.writeB(false);                         // has_attribs
+
+        // ---- AcDbTable 段 ----
+        b.w.writeBS(static_cast<dint16>(22));      // flag_for_table_value（实测值）
+        b.w.write3BD(1.0, 0.0, 0.0);               // horiz_direction
+        b.w.writeBL(numCols);
+        b.w.writeBL(numRows);
+        for (int c = 0; c < numCols; ++c) {
+            const double wv = (c < static_cast<int>(ent->colWidths.size()))
+                                  ? ent->colWidths[static_cast<std::size_t>(c)]
+                                  : 63.5;
+            b.w.writeBD(wv);
+        }
+        for (int r = 0; r < numRows; ++r) {
+            const double hv = (r < static_cast<int>(ent->rowHeights.size()))
+                                  ? ent->rowHeights[static_cast<std::size_t>(r)]
+                                  : 9.0;
+            b.w.writeBD(hv);
+        }
+
+        // 单元格：行优先逐格。合并跨距写在左上角格上（越界收拢到表内）。
+        for (int r = 0; r < numRows; ++r) {
+            for (int c = 0; c < numCols; ++c) {
+                int colSpan = 1, rowSpan = 1;
+                const auto mit = byMerge.find(std::make_pair(r, c));
+                if (mit != byMerge.end()) {
+                    colSpan = std::max(1, std::min(mit->second->colSpan, numCols - c));
+                    rowSpan = std::max(1, std::min(mit->second->rowSpan, numRows - r));
+                }
+                const auto cit = byCell.find(std::make_pair(r, c));
+                const bool hasText = cit != byCell.end();
+
+                b.w.writeBS(hasText ? 1 : 0);      // 单元格类型：1 = 文字
+                b.w.writeRC(0);                    // 边框标志
+                b.w.writeB(mergedCovered.count(std::make_pair(r, c)) != 0);   // merged
+                b.w.writeB(false);                 // auto fit
+                b.w.writeBL(colSpan);              // 跨列数
+                b.w.writeBL(rowSpan);              // 跨行数
+                b.w.writeBD(0.0);                  // 旋转
+                if (hasText)
+                    b.w.writeT(cit->second->text, d->codec);   // TV：内联文字
+                b.w.writeB(false);                 // 无单元格样式替代
+            }
+        }
+
+        // 表级替代：4 个 bit 全 0
+        b.w.writeB(false);
+        b.w.writeB(false);
+        b.w.writeB(false);
+        b.w.writeB(false);
+    }, [&](Private::ObjBuilder& b) {
+        // 句柄顺序与读取端一致：
+        //   block_header(H5) → tablestyle(H342) → 每格一个空值句柄（行优先）
+        b.w.writeHandle(kHcAbsolute, blockH);
+        b.w.writeHandle(kHcAbsolute, styleH);
+        for (int i = 0; i < numRows * numCols; ++i)
+            b.w.writeHandle(kHcAbsolute, 0);
+    });
+    return true;
+}
+
 bool dwgW::writeText(DRW_Text* ent)
 {
     d->encodeEntity(kText, *ent, [&](Private::ObjBuilder& b) {
@@ -2385,6 +2552,8 @@ void writeClassesData(dwgBitWriter& w, dwgW::Private& d, std::uint16_t& nextClas
     // 弧长标注（ARC_DIMENSION）在 DWG 里是类对象，没有固定类型号：
     // 实体写出时用的就是**这里的类号**（kClassArcDim），两处必须一致。
     writeOneClass(w, d, nextClassNum++, "AcDbArcDimension", "ARC_DIMENSION");
+    // 表格（ACAD_TABLE）同样是类对象：实体写出时用这里的类号 kClassTable。
+    writeOneClass(w, d, nextClassNum++, "AcDbTable", "ACAD_TABLE");
 }
 
 } // namespace

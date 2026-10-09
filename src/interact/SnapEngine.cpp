@@ -16,6 +16,7 @@
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/SplineEntity.h"
+#include "core/TableEntity.h"
 #include "core/TextEntity.h"
 
 #include <algorithm>
@@ -280,6 +281,22 @@ void SnapEngine::collectEntityCandidates(const Document& document,
             const auto& insert = static_cast<const InsertEntity&>(e);
             for (const std::unique_ptr<Entity>& child : insert.expanded()) {
                 if (child) hit |= self(self, *child);
+            }
+            break;
+        }
+        case EntityType::Table: {
+            // 表格：单元格角点按节点语义捕捉（对齐到表格网格的最常用落点），
+            // 外框四角额外按端点上报。
+            const auto& table = static_cast<const TableEntity&>(e);
+            if (m_settings.node) {
+                for (const Point2D& p : table.snapPoints()) {
+                    hit |= add(p, SnapKind::NodePoint);
+                }
+            }
+            if (m_settings.endpoint) {
+                for (const Point2D& p : table.gripPoints()) {
+                    hit |= add(p, SnapKind::Endpoint);
+                }
             }
             break;
         }

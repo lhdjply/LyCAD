@@ -186,6 +186,50 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+//  表格：插入点 + 尺寸（两个角点或直接输入行高/列宽）
+//
+//  交互范式与 AutoCAD 的 TABLE 一致：先给定表格的**插入点（左上角）**，
+//  再拖动给出**另一个角点**确定总尺寸；行列数在绘制前经选项设定，
+//  行高/列宽按总尺寸均分。这样建出的是一张可直接编辑的原生表格，
+//  而不是一堆散落的线段。
+//
+//  选项（绘制前可随时输入关键字修改，修改后立即重绘预览）：
+//      R  行数     C  列数
+//  绘制过程中：回车 / 空格结束，Esc 取消。
+// -----------------------------------------------------------------------------
+class DrawTableTool : public Tool {
+public:
+    explicit DrawTableTool(ToolContext& context);
+
+    QString name() const override;
+    QString displayName() const override;
+    QString prompt() const override;
+
+    bool mousePress(const CanvasEvent& event) override;
+    bool mouseMove(const CanvasEvent& event) override;
+    bool keyPress(QKeyEvent* event) override;
+    bool textInput(const QString& text) override;
+    void paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context) override;
+    void deactivate() override;
+
+private:
+    /// 按插入点与对角点建表（宽高为负时自动朝对应方向展开）
+    void commit(const Point2D& insertion, const Point2D& opposite);
+    /// 由两个角点算出总宽高
+    static void spanOf(const Point2D& a, const Point2D& b, double& width, double& height);
+
+    std::optional<Point2D> m_first;      ///< 插入点（表格左上角）
+    ResolvedPoint m_cursor;
+    bool m_hasCursor = false;
+
+    std::size_t m_rows = 3;              ///< 行数（选项 R 可改）
+    std::size_t m_columns = 3;           ///< 列数（选项 C 可改）
+    /// 下一个待输入的数值缺口：行数或列数（连续输入 3,4 时按「先行后列」接收）
+    enum class PendingNumber { None, Rows, Columns };
+    PendingNumber m_pending = PendingNumber::None;
+};
+
+// -----------------------------------------------------------------------------
 //  椭圆：轴端点法（默认）与中心点法
 //
 //  默认与 AutoCAD 的 ELLIPSE 一致：先给出一条轴的**两个端点**，再给另一条

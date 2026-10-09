@@ -1254,6 +1254,94 @@ bool dxfRW::writeInsert(DRW_Insert *ent){
     return true;
 }
 
+//! 写出 ACAD_TABLE（表格）。
+/*!
+ *  ACAD_TABLE 是 AcDbBlockReference 的子类：前半段与 INSERT 同构（块名 +
+ *  插入点 + 缩放 + 旋转），后半段是一段 AcDbTable 属性。两端都以 100 组码
+ *  声明子类标记，读方（含 AutoCAD）靠它区分两个段落。
+ *
+ *  AcDbTable 段落按 DXF 参考手册（TABLE 组码表）组织：
+ *      280  表格数据版本号（0 = 2010）
+ *      342  TABLESTYLE 硬指针
+ *      11/21/31  水平方向矢量
+ *      90   表格标志
+ *      91   行数     92  列数
+ *      93/94/95/96  替代标志（本实现恒为 0）
+ *      141  行高（逐行重复）  142  列宽（逐列重复）
+ *      随后**按行优先顺序逐格**写出：171 单元格类型（1=文字）/ 172 标志 /
+ *      173 合并值 / 174 自动调整 / 175 边框宽 / 176 边框高 / 91 替代标志 /
+ *      1 文字。合并信息即编码在每格的 173 里（低 16 位＝跨列数，高位＝跨行数），
+ *      无需额外的合并段落。
+ */
+bool dxfRW::writeTable(DRW_Table *ent){
+    writer->writeString(0, "ACAD_TABLE");
+    writeEntity(ent);
+    if (version > DRW::AC1009) {
+        writer->writeString(100, "AcDbBlockReference");
+        writer->writeUtf8String(2, ent->name);
+    } else
+        writer->writeUtf8Caps(2, ent->name);
+    writer->writeDouble(10, ent->basePoint.x);
+    writer->writeDouble(20, ent->basePoint.y);
+    writer->writeDouble(30, ent->basePoint.z);
+    writer->writeDouble(41, ent->xscale);
+    writer->writeDouble(42, ent->yscale);
+    writer->writeDouble(43, ent->zscale);
+    writer->writeDouble(50, (ent->angle) * ARAD);   // DXF 的 50 组码是度
+
+    if (version <= DRW::AC1009) return true;
+
+    writer->writeString(100, "AcDbTable");
+    writer->writeInt16(280, 0);                     // 表格数据版本号：0 = 2010
+    writer->writeUtf8String(342, ent->tableStyle);  // TABLESTYLE 硬指针（按名字容错）
+    writer->writeDouble(11, 1.0);                   // 水平方向矢量：X 轴
+    writer->writeDouble(21, 0.0);
+    writer->writeDouble(31, 0.0);
+    writer->writeInt32(90, 0);                      // 表格标志
+    writer->writeInt32(91, ent->numRows);
+    writer->writeInt32(92, ent->numCols);
+    writer->writeInt16(93, 0);                      // 替代标志
+    writer->writeInt16(94, 0);                      // 边框颜色替代标志
+    writer->writeInt16(95, 0);                      // 边框线宽替代标志
+    writer->writeInt16(96, 0);                      // 边框可见性替代标志
+    for (double h : ent->rowHeights) writer->writeDouble(141, h);
+    for (double w : ent->colWidths)  writer->writeDouble(142, w);
+
+    // 单元格：按行优先顺序逐格展开。缺省格（无文字、未合并）也要占位，
+    // 否则后续格子的 171/1 会与行列位置错配。
+    std::map<std::pair<int, int>, const DRW_Table::Cell *> byCell;
+    for (const DRW_Table::Cell &cell : ent->cells)
+        byCell[{ cell.row, cell.col }] = &cell;
+
+    // 合并值：低 16 位跨列数，高 16 位跨行数（左上角格写 span，其余写 0）
+    std::map<std::pair<int, int>, const DRW_Table::Merge *> byMerge;
+    for (const DRW_Table::Merge &merge : ent->merges)
+        byMerge[{ merge.row, merge.col }] = &merge;
+
+    for (int r = 0; r < ent->numRows; ++r) {
+        for (int c = 0; c < ent->numCols; ++c) {
+            const auto cellIt = byCell.find({ r, c });
+            const auto mergeIt = byMerge.find({ r, c });
+
+            writer->writeInt16(171, 1);             // 单元格类型：1 = 文字
+            writer->writeInt16(172, 0);             // 单元格标志
+            int merged = 0;
+            if (mergeIt != byMerge.end()) {
+                const DRW_Table::Merge *m = mergeIt->second;
+                merged = (m->rowSpan << 16) | (m->colSpan & 0xFFFF);
+            }
+            writer->writeInt16(173, merged);        // 合并值
+            writer->writeInt16(174, 0);             // 自动调整标志
+            writer->writeInt16(175, 0);             // 边框宽（仅合并格用）
+            writer->writeInt16(176, 0);             // 边框高（仅合并格用）
+            writer->writeInt32(91, 0);              // 单元格替代标志
+            writer->writeUtf8String(1, cellIt != byCell.end() ? cellIt->second->text
+                                                              : UTF8STRING());
+        }
+    }
+    return true;
+}
+
 bool dxfRW::writeText(DRW_Text *ent){
     writer->writeString(0, "TEXT");
     writeEntity(ent);
@@ -2434,6 +2522,8 @@ bool dxfRW::processEntities(bool isblock) {
             processSpline();
         } else if (nextentity == "3DFACE") {
             process3dface();
+        } else if (nextentity == "ACAD_TABLE") {
+            processTable();
         } else if (nextentity == "VIEWPORT") {
             processViewport();
         } else if (nextentity == "IMAGE") {
@@ -2548,6 +2638,132 @@ bool dxfRW::process3dface() {
         }
         default:
             face.parseCode(code, reader);
+            break;
+        }
+    }
+    return true;
+}
+
+//! ACAD_TABLE: 表格实体。
+//! 表格的可见几何（网格线、单元格文字）存放在它引用的匿名块里
+//! （AcDbBlockReference 段落用 2 组码给出块名）。这里按块参照解析，
+//! 交给 addInsert 走既有块装配路径，表格几何即可正常显示。
+//!
+//! 注意：ACAD_TABLE 后半段（AcDbTable）里 2/70/71/44/45 等组码含义与
+//! INSERT 不同（表样式名、行数、列宽等），因此只按「是否处于
+//! AcDbBlockReference 段落」区分，进入 AcDbTable 段落之后一律不取字段。
+//! 读取 ACAD_TABLE（表格）。
+/*!
+ *  两段结构：AcDbBlockReference（块名 2 + 插入点 10/20/30 + 缩放 41/42/43 +
+ *  旋转 50）与 AcDbTable（行列数 91/92、行高 141、列宽 142、逐格 171/172/
+ *  173/174/175/176/91/1）。以 100 组码的子类标记切分两段——AcDbTable 段落里
+ *  同名组码（2、70、71、44、45）语义与 INSERT 完全不同，故进入该段后必须改用
+ *  表格专用解析，绝不能落到 DRW_Insert::parseCode。
+ */
+bool dxfRW::processTable() {
+    DRW_DBG("dxfRW::processTable");
+    int code;
+    DRW_Table table;
+    int section = 0;    // 0=实体前, 1=AcDbBlockReference, 2=AcDbTable
+
+    // AcDbTable 段落里的批量字段靠「重复组码 + 计数器」推进：
+    //   141 行高 -> 每来一个 push 一次；142 列宽同理；
+    //   单元格则是一组定长字段序列，遇到 1 组码（文字）收一格。
+    int cellIndex = 0;
+    int mergeRowSpan = 1;
+    int mergeColSpan = 1;
+    DRW_Table::Cell pendingCell;
+
+    while (reader->readRec(&code)) {
+        DRW_DBG(code); DRW_DBG("\n");
+        if (code == 100) {
+            const std::string marker = reader->getString();
+            if (marker == "AcDbBlockReference")
+                section = 1;
+            else if (marker == "AcDbTable")
+                section = 2;
+            continue;
+        }
+
+        switch (code) {
+        case 0: {
+            nextentity = reader->getString();
+            DRW_DBG(nextentity); DRW_DBG("\n");
+            if (!table.name.empty()) iface->addTable(table);
+            return true;  //found new entity or ENDSEC, terminate
+        }
+        case 2:
+            // 仅在块参照段落里 2 是块名；AcDbTable 段落里的 2 是表样式名。
+            if (section == 1) table.name = reader->getUtf8String();
+            else              table.tableStyle = reader->getUtf8String();
+            break;
+        case 41:
+            if (section <= 1) table.xscale = reader->getDouble();
+            else              (void)reader->getDouble();
+            break;
+        case 42:
+            if (section <= 1) table.yscale = reader->getDouble();
+            else              (void)reader->getDouble();
+            break;
+        case 43:
+            if (section <= 1) table.zscale = reader->getDouble();
+            else              (void)reader->getDouble();
+            break;
+        case 50:
+            if (section <= 1) table.angle = reader->getDouble() / ARAD;
+            else              (void)reader->getDouble();
+            break;
+        case 91:
+            // 表格：91 行数（section 2）；单元格级 91 是替代标志，忽略
+            if (section == 2 && table.numRows == 0) table.numRows = reader->getInt32();
+            else (void)reader->getInt32();
+            break;
+        case 92:
+            if (section == 2) table.numCols = reader->getInt32();
+            else (void)reader->getInt32();
+            break;
+        case 141:
+            table.rowHeights.push_back(reader->getDouble());
+            break;
+        case 142:
+            table.colWidths.push_back(reader->getDouble());
+            break;
+        case 171:
+            // 单元格开始：171 类型 / 172 标志 / 173 合并 / 174 / 175 / 176 / 91 / 1
+            (void)reader->getInt32();
+            pendingCell = DRW_Table::Cell();
+            pendingCell.row = (table.numCols > 0) ? cellIndex / table.numCols : 0;
+            pendingCell.col = (table.numCols > 0) ? cellIndex % table.numCols : 0;
+            break;
+        case 173:
+            mergeRowSpan = 1;
+            mergeColSpan = 1;
+            {
+                const int merged = reader->getInt32();
+                if (merged != 0) {
+                    mergeRowSpan = (merged >> 16) & 0xFFFF;
+                    mergeColSpan = merged & 0xFFFF;
+                    if (mergeRowSpan < 1) mergeRowSpan = 1;
+                    if (mergeColSpan < 1) mergeColSpan = 1;
+                }
+            }
+            break;
+        case 1:
+            pendingCell.text = reader->getUtf8String();
+            if (!pendingCell.text.empty()) table.cells.push_back(pendingCell);
+            if (mergeRowSpan > 1 || mergeColSpan > 1) {
+                DRW_Table::Merge merge;
+                merge.row = pendingCell.row;
+                merge.col = pendingCell.col;
+                merge.rowSpan = mergeRowSpan;
+                merge.colSpan = mergeColSpan;
+                table.merges.push_back(merge);
+            }
+            ++cellIndex;
+            break;
+        default:
+            // 公共实体属性（图层 8、句柄 5、颜色 62、插入点 10/20/30…）
+            table.parseCode(code, reader);
             break;
         }
     }

@@ -199,6 +199,13 @@ public:
      *  让应用层可以计数上报而不是静默丢失。默认空实现。 */
     virtual void addUnknownEntity(const std::string& name) { (void)name; }
 
+    /** ACAD_TABLE（表格）实体。ACAD_TABLE 本质是一个 AcDbBlockReference
+     *  子类：几何挂在它引用的匿名块（*Tnn）里，本体另带一段 AcDbTable 属性
+     *  （行列数、行列高宽、单元格文字）。单独回调（而不是混进 addInsert）
+     *  是为了让应用层能把它建成原生表格，而不会被当成普通块参照展开。
+     *  默认空实现。 */
+    virtual void addTable(const DRW_Table& data) { (void)data; }
+
     virtual void writeHeader(DRW_Header& data) = 0;
     virtual void writeBlocks() = 0;
     virtual void writeBlockRecords() = 0;

@@ -41,7 +41,8 @@ enum class EntityType {
     Ellipse,
     XLine,      ///< 构造线（DXF: XLINE）——过基点双向无限延伸
     Ray,        ///< 射线（DXF: RAY）——自基点沿方向单向无限延伸
-    Insert      ///< 块参照（DXF: INSERT / MINSERT）——对块定义的带变换引用
+    Insert,     ///< 块参照（DXF: INSERT / MINSERT）——对块定义的带变换引用
+    Table       ///< 表格（DXF: ACAD_TABLE）——自身参数化网格，非块引用
 };
 
 /// 英文类型名（DXF 中的实体名，如 "LINE"）

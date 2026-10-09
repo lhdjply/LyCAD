@@ -279,6 +279,7 @@ void MainWindow::createMenus()
         { "圆弧(&A)", "ARC" },
         { "椭圆(&E)", "ELLIPSE" },
         { "矩形(&R)", "RECTANGLE" },
+        { "表格(&B)", "TABLE" },
         { "点(&O)", "POINT" },
         { "构造线(&X)", "XLINE" },
         { "射线(&Y)", "RAY" },
@@ -526,6 +527,9 @@ void MainWindow::createRibbon()
                                QStringLiteral("POINT"), QStringLiteral("点 (POINT / PO)"));
         panel->addSmallCommand(QStringLiteral("hatch"), QStringLiteral("填充"),
                                QStringLiteral("HATCH"), QStringLiteral("图案填充 (HATCH / H)"));
+        panel->addSmallCommand(QStringLiteral("table"), QStringLiteral("表格"),
+                               QStringLiteral("TABLE"),
+                               QStringLiteral("插入表格 (TABLE / TB；行数列数用 R / C 设置)"));
     }
 
     // ---- 修改 ----
