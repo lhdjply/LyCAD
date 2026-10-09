@@ -14,6 +14,7 @@
 // =============================================================================
 #pragma once
 
+#include "core/Block.h"
 #include "core/Entity.h"
 #include "core/Layer.h"
 #include "core/Selection.h"
@@ -39,6 +40,7 @@ class TransformEntitiesCommand;
 class EntityPropertyCommand;
 class ReplaceEntityCommand;
 class LayerTableCommand;
+class ExplodeEntitiesCommand;
 
 class Document : public QObject {
     Q_OBJECT
@@ -103,10 +105,35 @@ public:
     /// 修改垂直对齐（DXF 73）
     bool setEntitiesTextVAlign(const std::vector<EntityId>& ids, TextEntity::VAlign vAlign);
 
+    // ---- 块参照属性（只作用于选择集里的块参照，其它类型忽略） -------------------
+    //
+    // 与文字属性同一口径：选择集里一个块参照都没有时返回 false 且不产生撤销记录。
+    /// 修改插入比例（块参照的 X/Y 比例；Z 保持不变）
+    bool setEntitiesInsertScale(const std::vector<EntityId>& ids, double scaleX, double scaleY);
+    /// 修改插入旋转（弧度）
+    bool setEntitiesInsertRotation(const std::vector<EntityId>& ids, double radians);
+
     /// 以新几何整体替换某图元的几何（夹点拖拽结束后调用）
     bool replaceEntity(EntityId id,
                        std::unique_ptr<Entity> replacement,
                        const QString& actionLabel = QString());
+
+    /// 分解块参照（INSERT）：把每个块参照换成它展开后的独立图元，单条撤销记录。
+    /// 括号内的选择集里没有块参照时返回 false 且**不产生撤销记录**
+    /// ——与 setEntitiesTextXxx 的口径一致，界面据此提示而不是留下空白操作。
+    /// 返回被替换掉的块参照个数（out参数）。
+    bool explodeEntities(const std::vector<EntityId>& ids, int* explodedCount = nullptr);
+
+    // ---- 块定义表 --------------------------------------------------------------
+    /// 块表：块参照按名解析定义。图元自身也持有定义的 shared_ptr，
+    /// 因此从表里删除一条定义不会让既有块参照变成悬空引用。
+    BlockTable& blocks() noexcept { return m_blocks; }
+    const BlockTable& blocks() const noexcept { return m_blocks; }
+
+    /// 文档实际引用到的全部块定义（含块参照私有的匿名副本），按名字去重、保序。
+    /// 写出端必须用这个而不是 blocks().all()：块参照在非相似变换下会把几何
+    /// 烘焙进一份**不在表里**的私有定义，只遍历表会把这些内容整块丢掉。
+    std::vector<std::shared_ptr<BlockDefinition>> referencedBlocks() const;
 
     // ---- 图层 ----------------------------------------------------------------
     LayerManager& layers() noexcept { return m_layers; }
@@ -183,6 +210,8 @@ signals:
     /// 文档被整体替换（新建/打开文件）
     void documentReset();
     void layersChanged();
+    /// 块定义表发生变化（新建/删除块定义、批量导入完成）
+    void blocksChanged();
     void selectionChanged();
     void filePathChanged(const QString& path);
     void modificationChanged(bool modified);
@@ -195,8 +224,10 @@ private:
     friend class TransformEntitiesCommand;
     friend class EntityPropertyCommand;
     friend class TextPropertyCommand;
+    friend class InsertPropertyCommand;
     friend class ReplaceEntityCommand;
     friend class LayerTableCommand;
+    friend class ExplodeEntitiesCommand;
 
     /// 图元集合变化后统一发出的收尾信号
     void afterEntitiesMutated();
@@ -207,6 +238,7 @@ private:
 
     LayerManager m_layers;
     TextStyleTable m_textStyles;
+    BlockTable m_blocks;
     Selection* m_selection = nullptr;
     QUndoStack* m_undoStack = nullptr;
 

@@ -28,6 +28,7 @@ QString entityTypeName(EntityType type)
     case EntityType::Ellipse:  return QStringLiteral("ELLIPSE");
     case EntityType::XLine:    return QStringLiteral("XLINE");
     case EntityType::Ray:      return QStringLiteral("RAY");
+    case EntityType::Insert:   return QStringLiteral("INSERT");
     }
     return QStringLiteral("UNKNOWN");
 }
@@ -47,6 +48,7 @@ QString entityTypeDisplayName(EntityType type)
     case EntityType::Ellipse:  return QStringLiteral("椭圆");
     case EntityType::XLine:    return QStringLiteral("构造线");
     case EntityType::Ray:      return QStringLiteral("射线");
+    case EntityType::Insert:   return QStringLiteral("块参照");
     }
     return QStringLiteral("未知图元");
 }
@@ -102,8 +104,10 @@ int fromMillimeters(double mm)
 QColor Entity::resolvedColor(const LayerManager& layers, bool themeIsDark) const
 {
     int aci = m_colorIndex;
-    if (aci < 0) {
-        // 随层：取图层颜色
+    if (aci <= 0) {
+        // 随层（<0）与随块（0）都落到图层颜色上：块内的随块图元在展开阶段
+        // 已被 InsertEntity::collectInto 换成块参照自身的颜色，走到这里说明
+        // 这条图元不在任何块里（或块参照本身也随层），按图层解析即是正解。
         if (const Layer* lyr = layers.find(m_layerName)) {
             aci = lyr->colorIndex();
         } else {

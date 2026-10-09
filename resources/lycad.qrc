@@ -14,6 +14,7 @@
         <file alias="dim-radius.svg">icons/dim-radius.svg</file>
         <file alias="ellipse.svg">icons/ellipse.svg</file>
         <file alias="erase.svg">icons/erase.svg</file>
+        <file alias="explode.svg">icons/explode.svg</file>
         <file alias="grid.svg">icons/grid.svg</file>
         <file alias="hatch.svg">icons/hatch.svg</file>
         <file alias="help.svg">icons/help.svg</file>

@@ -6,6 +6,7 @@
 #include "core/Document.h"
 #include "core/Entity.h"
 #include "core/Format.h"
+#include "core/InsertEntity.h"
 #include "core/TextEntity.h"
 #include "ui/PropertyChoices.h"
 
@@ -124,6 +125,53 @@ PropertyPanel::PropertyPanel(QWidget* parent)
     m_textGroup->setToolTip(QStringLiteral(
         "只作用于选择集里的文字图元。多选时字段留空表示「多种取值」，仍可单独修改该字段"));
 
+    // ---- 块参照 ----
+    m_blockName = new QLabel(this);
+    m_blockName->setObjectName(QStringLiteral("propertyPanel.blockName"));
+    m_blockName->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_blockName->setToolTip(QStringLiteral("引用的块定义名"));
+
+    m_blockScaleX = new QDoubleSpinBox(this);
+    m_blockScaleY = new QDoubleSpinBox(this);
+    for (QDoubleSpinBox* box : { m_blockScaleX, m_blockScaleY }) {
+        box->setDecimals(4);
+        box->setRange(-1000000.0, 1000000.0);
+        box->setSingleStep(0.1);
+        box->setKeyboardTracking(false);
+    }
+    m_blockScaleX->setObjectName(QStringLiteral("propertyPanel.blockScaleX"));
+    m_blockScaleY->setObjectName(QStringLiteral("propertyPanel.blockScaleY"));
+    m_blockScaleX->setToolTip(QStringLiteral("插入比例的 X 分量（负值表示镜像）"));
+    m_blockScaleY->setToolTip(QStringLiteral("插入比例的 Y 分量（负值表示镜像）"));
+
+    m_blockRotation = new QDoubleSpinBox(this);
+    m_blockRotation->setDecimals(3);
+    m_blockRotation->setRange(-360.0, 360.0);
+    m_blockRotation->setSingleStep(1.0);
+    m_blockRotation->setWrapping(true);
+    m_blockRotation->setKeyboardTracking(false);
+    m_blockRotation->setObjectName(QStringLiteral("propertyPanel.blockRotation"));
+    m_blockRotation->setToolTip(QStringLiteral("插入旋转角（度）"));
+
+    m_blockInfo = new QLabel(this);
+    m_blockInfo->setObjectName(QStringLiteral("propertyPanel.blockInfo"));
+    m_blockInfo->setWordWrap(true);
+    m_blockInfo->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    auto* blockForm = new QFormLayout();
+    blockForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    blockForm->addRow(QStringLiteral("块名"), m_blockName);
+    blockForm->addRow(QStringLiteral("比例 X"), m_blockScaleX);
+    blockForm->addRow(QStringLiteral("比例 Y"), m_blockScaleY);
+    blockForm->addRow(QStringLiteral("旋转"), m_blockRotation);
+    blockForm->addRow(QString(), m_blockInfo);
+
+    m_blockGroup = new QGroupBox(QStringLiteral("块参照"), this);
+    m_blockGroup->setLayout(blockForm);
+    m_blockGroup->setObjectName(QStringLiteral("propertyPanel.blockGroup"));
+    m_blockGroup->setToolTip(QStringLiteral(
+        "只作用于选择集里的块参照。比例与旋转可改；块内容请用 分解(EXPLODE) 打散后编辑"));
+
     m_geometryText = new QPlainTextEdit(this);
     m_geometryText->setReadOnly(true);
     m_geometryText->setMinimumHeight(160);
@@ -139,6 +187,7 @@ PropertyPanel::PropertyPanel(QWidget* parent)
     layout->addWidget(m_summaryLabel);
     layout->addWidget(formGroup);
     layout->addWidget(m_textGroup);
+    layout->addWidget(m_blockGroup);
     layout->addWidget(geometryGroup, 1);
 
     connect(m_layerCombo, &QComboBox::currentTextChanged, this, [this](const QString& name) {
@@ -179,6 +228,23 @@ PropertyPanel::PropertyPanel(QWidget* parent)
             static_cast<TextEntity::VAlign>(m_textVAlign->itemData(index).toInt()));
     });
 
+    // 比例两个框一起发：它们是同一次「改比例」的两个分量，分开改会让块在
+    // 中途短暂处于错误的非等比状态，也会多出一条撤销记录
+    const auto emitScale = [this] {
+        if (m_updating) return;
+        if (m_blockScaleX->text().isEmpty() || m_blockScaleY->text().isEmpty()) return;
+        emit blockScaleChangeRequested(m_blockScaleX->value(), m_blockScaleY->value());
+    };
+    connect(m_blockScaleX, &QDoubleSpinBox::valueChanged, this,
+            [emitScale](double) { emitScale(); });
+    connect(m_blockScaleY, &QDoubleSpinBox::valueChanged, this,
+            [emitScale](double) { emitScale(); });
+    connect(m_blockRotation, &QDoubleSpinBox::valueChanged, this, [this](double degrees) {
+        if (m_updating) return;
+        // 面板上行的是度，文档里存的是弧度
+        emit blockRotationChangeRequested(degToRad(degrees));
+    });
+
     refresh(nullptr);
 }
 
@@ -200,6 +266,10 @@ void PropertyPanel::setEnabledState(bool enabled)
     m_textRotation->setEnabled(enabled);
     m_textHAlign->setEnabled(enabled);
     m_textVAlign->setEnabled(enabled);
+
+    m_blockScaleX->setEnabled(enabled);
+    m_blockScaleY->setEnabled(enabled);
+    m_blockRotation->setEnabled(enabled);
 }
 
 void PropertyPanel::refresh(const Document* document)
@@ -210,6 +280,7 @@ void PropertyPanel::refresh(const Document* document)
         m_summaryLabel->setText(QStringLiteral("未选择对象"));
         m_geometryText->setPlainText(QStringLiteral("在画布中选择对象以查看其属性。"));
         m_textGroup->setVisible(false);
+        m_blockGroup->setVisible(false);
         setEnabledState(false);
         m_updating = false;
         return;
@@ -371,6 +442,68 @@ void PropertyPanel::refresh(const Document* document)
                                           ? m_textVAlign->findData(
                                                 static_cast<int>(first->vAlign()))
                                           : -1);
+    }
+
+    // ---- 块参照属性（只统计选择集里的块参照）--------------------------------
+    std::vector<const InsertEntity*> inserts;
+    for (EntityId id : ids) {
+        if (const auto* insert = dynamic_cast<const InsertEntity*>(document->entity(id))) {
+            inserts.push_back(insert);
+        }
+    }
+
+    // 选择集里没有块参照就整组隐藏
+    m_blockGroup->setVisible(!inserts.empty());
+
+    if (!inserts.empty()) {
+        const InsertEntity* first = inserts.front();
+        bool sameScale = true;
+        bool sameRotation = true;
+        const long long firstScaleX = displayKey(first->scaleX(), 10000.0);
+        const long long firstScaleY = displayKey(first->scaleY(), 10000.0);
+        const long long firstRotation = displayKey(radToDeg(first->rotation()), 1000.0);
+
+        for (const InsertEntity* insert : inserts) {
+            sameScale = sameScale
+                        && displayKey(insert->scaleX(), 10000.0) == firstScaleX
+                        && displayKey(insert->scaleY(), 10000.0) == firstScaleY;
+            sameRotation = sameRotation
+                           && displayKey(radToDeg(insert->rotation()), 1000.0) == firstRotation;
+        }
+
+        m_blockName->setText(inserts.size() == 1
+                                 ? (first->blockName().isEmpty()
+                                        ? QStringLiteral("(未命名)")
+                                        : first->blockName())
+                                 : QStringLiteral("%1 个块参照").arg(inserts.size()));
+
+        if (sameScale) {
+            m_blockScaleX->setValue(first->scaleX());
+            m_blockScaleY->setValue(first->scaleY());
+        } else {
+            setMixed(m_blockScaleX);
+            setMixed(m_blockScaleY);
+        }
+
+        if (sameRotation) m_blockRotation->setValue(radToDeg(first->rotation()));
+        else setMixed(m_blockRotation);
+
+        if (inserts.size() == 1) {
+            QString info = QStringLiteral("块内图元 %1 个，展开后 %2 个")
+                               .arg(first->hasBlock() ? first->block()->entityCount() : 0)
+                               .arg(first->expandedCount());
+            if (first->isArray()) {
+                info += QStringLiteral("\n阵列 %1 行 × %2 列")
+                            .arg(first->rowCount())
+                            .arg(first->columnCount());
+            }
+            if (!first->attributes().empty()) {
+                info += QStringLiteral("\n属性 %1 个").arg(first->attributes().size());
+            }
+            m_blockInfo->setText(info);
+        } else {
+            m_blockInfo->setText(QString());
+        }
     }
 
     Q_UNUSED(previousLayer);

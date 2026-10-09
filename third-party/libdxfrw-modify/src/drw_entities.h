@@ -31,8 +31,8 @@ namespace DRW {
 //        E3DSOLID, //encripted propietry data
 //        ACAD_PROXY_ENTITY,
         ARC,
-//        ATTDEF,
-//        ATTRIB,
+        ATTDEF,
+        ATTRIB,
         BLOCK,// and ENDBLK
 //        BODY, //encripted propietry data
         CIRCLE,
@@ -569,6 +569,14 @@ public:
 public: //only for read dwg
     dwgHandle blockRecH;
     dwgHandle seqendH; //RLZ: on implement attrib remove this handle from obj list (see pline/vertex code)
+public: //only for write
+    /*!< 其后是否跟着 ATTRIB 实体（DXF 写出 66 组码；DWG 写出 has_attribs 位）。
+         只由写出侧使用：读取侧从 66 组码或 DWG 的 hasAttrib 位得知。 */
+    bool hasAttribs = false;
+    /*!< 随后将写出的 ATTRIB 条数。DWG 的 INSERT 必须在写出时就填好
+         first_attrib / last_attrib / seqend 三个句柄，句柄得提前分配，
+         因此写出侧要先知道条数（DXF 侧用不到，靠 66 组码即可）。 */
+    int attribCount = 0;
 };
 
 //! Class to handle lwpolyline entity
@@ -683,6 +691,14 @@ public:
 protected:
     void parseCode(int code, dxfReader *reader);
     virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs=0);
+    /// TEXT 一族（TEXT / ATTRIB / ATTDEF）在 DWG 里共有的数据段。
+    ///
+    /// 只读「公共实体数据 + 文字字段」，**不含句柄流**：两种属性实体在句柄流
+    /// 之前还要多读自己的几个字段（标签/标志），所以这段必须单独拆出来复用，
+    /// 不能在子类里直接调 parseDwg——那会把句柄流也一并读掉，之后读到的
+    /// 「标签」其实是句柄字节。
+    /// @param sBuf 字符串缓冲（2007+ 与字段流分开；2000~2004 与 buf 同一份）
+    bool parseDwgTextData(DRW::Version version, dwgBuffer *buf, dwgBuffer *sBuf, duint32 bs);
 
 public:
     double height;             /*!< height text, code 40 */
@@ -695,6 +711,57 @@ public:
     enum HAlign alignH;        /*!< horizontal align, code 72 */
     enum VAlign alignV;        /*!< vertical align, code 73 */
     dwgHandle styleH;          /*!< handle for text style */
+};
+
+// ============================================================================
+//  ATTDEF / ATTRIB —— 属性块的两半
+//
+//  上游 libdxfrw 0.6.3 把这两种实体整块注释掉了，于是属性块读进来只剩几何、
+//  属性文字全部丢失，写出去也没有 ATTRIB。这里补上最小可用的解析：
+//  两者都以 TEXT 的全部字段为基础，再各加几个自己的组码。
+//
+//    ATTDEF（块定义里）：2 标签 / 3 提示 / 70 标志 / 1 默认值
+//    ATTRIB（块参照上）：2 标签 / 70 标志 / 1 实际值
+//
+//  注意 ATTRIB 的 10/20 组码是**世界坐标**（不是相对块插入点的坐标），
+//  这一条决定了移动块参照时必须同时移动属性——适配层据此处理。
+// ============================================================================
+
+//! Class to handle attribute definition entries (ATTDEF)
+class DRW_Attdef : public DRW_Text {
+    SETENTFRIENDS
+public:
+    DRW_Attdef() {
+        eType = DRW::ATTDEF;
+        flags = 0;
+    }
+
+protected:
+    void parseCode(int code, dxfReader *reader);
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs=0);
+
+public:
+    UTF8STRING tag;        /*!< attribute tag, code 2 */
+    UTF8STRING prompt;     /*!< prompt string, code 3 */
+    int flags;             /*!< attribute flags, code 70 */
+};
+
+//! Class to handle attribute entries (ATTRIB)
+class DRW_Attrib : public DRW_Text {
+    SETENTFRIENDS
+public:
+    DRW_Attrib() {
+        eType = DRW::ATTRIB;
+        flags = 0;
+    }
+
+protected:
+    void parseCode(int code, dxfReader *reader);
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs=0);
+
+public:
+    UTF8STRING tag;        /*!< attribute tag, code 2 */
+    int flags;             /*!< attribute flags, code 70 */
 };
 
 //! Class to handle insert entries

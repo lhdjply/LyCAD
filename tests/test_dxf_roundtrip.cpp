@@ -18,6 +18,7 @@
 #include "core/Document.h"
 #include "core/Format.h"
 #include "core/HatchEntity.h"
+#include "core/InsertEntity.h"
 #include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/PointEntity.h"
@@ -364,6 +365,20 @@ QStringList TestDxfRoundTrip::entitySignatures(const Document& document)
                                     + formatDxfDouble(dim.dimLinePoint().y),
                                 formatDxfDouble(radToDeg(dim.rotation()), 6))
                            .arg(dim.textOverride());
+            break;
+        }
+        case EntityType::Insert: {
+            // 块参照：签名只看插入参数与引用的块名。块内容不在这里逐点比对——
+            // 它由块定义承载，另有一组测试专门盯着定义本身的往返。
+            const auto& insert = static_cast<const InsertEntity&>(*entity);
+            geometry = QStringLiteral("B=%1;P=%2,%3;S=%4,%5;R=%6;N=%7")
+                           .arg(insert.blockName(),
+                                formatDxfDouble(insert.insertionPoint().x),
+                                formatDxfDouble(insert.insertionPoint().y),
+                                formatDxfDouble(insert.scaleX()),
+                                formatDxfDouble(insert.scaleY()),
+                                formatDxfDouble(insert.rotation()))
+                           .arg(insert.expandedCount());
             break;
         }
         }

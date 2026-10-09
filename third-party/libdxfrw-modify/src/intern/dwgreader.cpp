@@ -1043,6 +1043,32 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
             e.style = findTableName(DRW::STYLE, e.styleH.ref);
             intfa.addText(e);
             break; }
+        // ATTRIB / ATTDEF：属性实体。它们的专属字段在两个方向上都只能靠与同一张
+        // 图的 DXF 对照来定标，版本间还有差异，因此**解析失败只丢掉这一条属性**：
+        // 读取端只要有一条实体返回 false 就会把整张图判为「已损坏」，
+        // 拿属性去换整张图打不开是不划算的（每个对象各自一个缓冲，互不影响）。
+        case 2: {   // ATTRIB：块参照上的属性值（独立对象，不跟在 INSERT 之后）
+            DRW_Attrib e;
+            ENTRY_PARSE(e)
+            if (ret) {
+                e.style = findTableName(DRW::STYLE, e.styleH.ref);
+                intfa.addAttrib(e);
+            } else {
+                DRW_DBG("Warning: ATTRIB parse failed, handle: "); DRW_DBG(obj.handle); DRW_DBG("\n");
+                ret = true;
+            }
+            break; }
+        case 3: {   // ATTDEF：块定义里的属性定义
+            DRW_Attdef e;
+            ENTRY_PARSE(e)
+            if (ret) {
+                e.style = findTableName(DRW::STYLE, e.styleH.ref);
+                intfa.addAttdef(e);
+            } else {
+                DRW_DBG("Warning: ATTDEF parse failed, handle: "); DRW_DBG(obj.handle); DRW_DBG("\n");
+                ret = true;
+            }
+            break; }
         case 44: {
             DRW_MText e;
             ENTRY_PARSE(e)

@@ -49,6 +49,11 @@ signals:
     /// 垂直对齐（DXF 73）
     void textVAlignChangeRequested(TextEntity::VAlign vAlign);
 
+    /// 块参照插入比例（X / Y；Z 保持不变）
+    void blockScaleChangeRequested(double scaleX, double scaleY);
+    /// 块参照插入旋转（弧度）。面板上显示的是度，换算在面板内完成。
+    void blockRotationChangeRequested(double radians);
+
 private:
     void setEnabledState(bool enabled);
     /// 把数值输入框清空并显示「多种取值」占位（多选且取值不一致时使用）
@@ -65,6 +70,13 @@ private:
     QDoubleSpinBox* m_textRotation = nullptr;      ///< 显示单位是度
     QComboBox*      m_textHAlign = nullptr;
     QComboBox*      m_textVAlign = nullptr;
+
+    QGroupBox*      m_blockGroup = nullptr;
+    QLabel*         m_blockName = nullptr;
+    QDoubleSpinBox* m_blockScaleX = nullptr;
+    QDoubleSpinBox* m_blockScaleY = nullptr;
+    QDoubleSpinBox* m_blockRotation = nullptr;     ///< 显示单位是度
+    QLabel*         m_blockInfo = nullptr;
 
     QPlainTextEdit* m_geometryText = nullptr;
 

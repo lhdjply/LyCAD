@@ -109,10 +109,11 @@ glob 带 `CONFIGURE_DEPENDS`——裸的 glob 只在配置阶段展开一次，�
 |---|---|
 | `Types` | `Point2D` / `Vector2D` / `Box2D` / `Transform2D`（2×3 仿射变换）与线段求交等几何算法 |
 | `Entity` | 图元抽象基类：标识、图层归属、颜色/线宽的随层解析、包围盒、拾取距离、夹点 |
-| `PointEntity` `LineEntity` `CircleEntity` `ArcEntity` `PolylineEntity` `TextEntity` `HatchEntity` `DimensionEntity` | 八类图元 |
+| `PointEntity` `LineEntity` `CircleEntity` `ArcEntity` `PolylineEntity` `TextEntity` `HatchEntity` `DimensionEntity` `SplineEntity` `EllipseEntity` `InfiniteLineEntity` `InsertEntity` | 十三类图元（含构造线/射线与块参照） |
+| `Block` | 块定义（`BlockDefinition`）与块表（`BlockTable`），含属性定义 ATTDEF |
 | `Layer` / `Linetype` / `AciPalette` | 图层表、标准线型、AutoCAD 颜色索引 |
 | `Selection` | 选择集 |
-| `Document` | 图元容器 + 图层表 + 选择集 + 撤销栈 |
+| `Document` | 图元容器 + 图层表 + 块表 + 文字样式表 + 选择集 + 撤销栈 |
 | `Commands` | `QUndoCommand` 实现 |
 
 设计要点：
@@ -128,6 +129,17 @@ glob 带 `CONFIGURE_DEPENDS`——裸的 glob 只在配置阶段展开一次，�
 - **标注的显示几何不落盘**。`DimensionEntity` 只存定义点，尺寸线/界线/箭头/文字位置
   由 `geometry()` 一处公式实时推导，渲染、DXF 匿名块生成、拾取三处共用同一份结果，
   从结构上杜绝「存下来的图形与定义点不一致」。
+- **块参照是「引用」而不是「复制」**。`InsertEntity` 持有块定义的 `shared_ptr`
+  （定义在 `BlockTable` 里按名索引，大小写不敏感），几何由
+  `T(插入点)·R(旋转)·S(比例)·T(-块基点)` 实时推导，展开结果带缓存供渲染/拾取/捕捉共用。
+  导入时**不再炸开** `INSERT`：同一个定义被引用二十次就是二十个引用，文件往返后
+  `BLOCKS` 段与 `INSERT` 都还在原处，需要平面化时由 分解(EXPLODE) 显式触发。
+  变换的可分解性是这里唯一的坑：块参照的线性部分恒为 `R(θ)·S(sx,sy)`（两列正交），
+  左乘任何**相似变换**（平移/旋转/等比缩放/镜像）后两列仍正交，因而总能重新分解回
+  `(插入点, 比例, 旋转)` 三个参数；只有非等比拉伸（以及 MINSERT 的阵列偏移）会引入
+  错切，此时把结果**烘焙**进该块参照私有的一份匿名块定义副本——几何精确，代价是
+  这一处不再是引用。`Document::referencedBlocks()` 因此不能只遍历块表：私有副本
+  不在表里，只查表会在保存时把这块内容整块丢掉。
 
 **io —— 文件解析**
 
@@ -150,9 +162,18 @@ glob 带 `CONFIGURE_DEPENDS`——裸的 glob 只在配置阶段展开一次，�
   适配层内含两处**用实测定标出来的**处理，删改前请先读注释：
   文字旋转在 DXF 与 DWG 两条路径下单位不同（度 / 弧度）；以及它会把
   `\U+XXXX` 转义的前导反斜杠解成 `¥`，导致中文退化成可见转义文本。
-  读取时把 `INSERT` **按插入点/比例/旋转角展开为独立图元**（本软件不建块定义），
-  遵循「块内 0 层图元继承 INSERT 图层」的标准语义，支持嵌套块（含环引用保护）。
-  标注的匿名几何块（`*Dnn`）仅作显示用途，读入后忽略——几何由定义点重推导。
+  读取时把 `INSERT` **建成块参照**：块定义进 `BlockTable`，块参照指过去，两者都不展开。
+  「块内 0 层图元继承 INSERT 图层」与「随块（ByBlock）颜色/线型/线宽取块参照的值」
+  这两条标准语义在 `InsertEntity::collectInto` 里统一实现，嵌套块在同一次递归中解析
+  （深度上限 16 挡自引用）。属性块也已支持：`ATTDEF` 进块定义的属性表，`INSERT`
+  后面的 `ATTRIB` 挂到该块参照上，块参照上缺哪条属性就按定义补默认值。
+  DWG 路径也一样：`ATTDEF`/`ATTRIB` 在那里是**独立对象**（不跟在 INSERT 后面），
+  属性值靠「同一个属主块记录 + 标签命中该块的属性定义」回填——这条字段序全靠
+  与同一张图的 DXF 逐字段对照定标，`test_block_insert` 里的 DWG/DXF 对照测试就是
+  那把尺子（插入参数、属性值、属性位置、字高、旋转都要求逐位一致）。
+  标注的匿名几何块（`*Dnn`）仅作显示用途，读入后**整块丢弃**——几何由定义点重推导。
+  这里必须区分「丢弃」与「不属于任何块」：跳过 `*Dnn` 时若只是把当前块指针置空，
+  块内的尺寸线/箭头/标注文字会掉进模型空间，一张四个标注的样图会凭空多出二十个图元。
   样条（SPLINE，de Boor 求值按弦高离散化）与椭圆（含椭圆弧）已建模。
   **无界直线**也已建模：构造线（XLINE）与射线（RAY）由公共基类
   `InfiniteLineEntity` 表达——「基点 + 单位方向向量」与 DXF 的 10/11 组码一一对应。
@@ -244,7 +265,7 @@ glob 带 `CONFIGURE_DEPENDS`——裸的 glob 只在配置阶段展开一次，�
 - `CoordinateInput`：支持 `100,50` / `@50,0` / `50<45` 三种坐标形式，以及带括号的四则运算。
 - 已实现命令：`LINE` `PLINE` `CIRCLE` `ARC` `ELLIPSE` `RECTANGLE` `POINT` `TEXT` `HATCH`
   `DIMALIGNED` `DIMLINEAR` `DIMRADIUS` `DIMDIAMETER`
-  `MOVE` `COPY` `ROTATE` `SCALE` `MIRROR` `ERASE` `SELECT`。
+  `MOVE` `COPY` `ROTATE` `SCALE` `MIRROR` `EXPLODE` `ERASE` `SELECT`。
 
 **ui —— 界面装配**
 
@@ -367,6 +388,7 @@ Letter 等、横向纵向、**出图比例**：适应图纸 / 1:1 / 自定义 1:
 | `test_dxf_roundtrip` | **六档可写版本（2000/2004/2007/2010/2013/2018）的写出→读回逐图元比对**（类型/图层/颜色/可见性/几何，含文字/填充/标注）、**文件头版本号 + 文本编码**（2007 起必须是 UTF-8，更早必须按代码页——「声明 2007 却写 GBK」在自读自写的往返里是隐形的）、二进制 DXF 解析、未支持实体的计数上报、DWG 版本签名识别 |
 | `test_dwg_codec` | DWG 版本签名表、内容探测、编解码器层的原生读写（写出的是二进制 DWG 而非 DXF 副本、写-读往返）、二进制内容预检（挡住伪装成 DWG 的文本）、损坏文件必须如实报错且不留半成品 |
 | `test_libdxfrw` | 内置 libdxfrw-modify 适配层：全部已建模图元的读取、**圆弧角度的单位换算**、**文字旋转在 DXF 路径下按度读出后转弧度**（这是两条读取路径唯一的差异点）、多段线凸度符号、标注定义点、**天文数字坐标必须被挡在模型之外并如实上报**、**填充边界带凸度时每个顶点都要写 42 组码**（否则别的 CAD 画成一片乱纹）、**填充图案定义随文件往返且间距口径一致**、**读取他人生成的 R12 文件时 `\U+XXXX` 中文转义必须还原**（R12 已只读不写，这段逻辑再没有别的生成途径，只能用手写的 R12 文件盯住）、**MTEXT 的旋转取自 11 组码的 X 轴方向向量**（MTEXT 几乎不用 50 组码表达旋转）、**MTEXT 降级时段落对齐码（\pxqc; 等）与「插入点 + 参考矩形宽度」都要换算进对齐点**（否则整块文字错位）、**内联字体码要还原成文字样式**（否则导出后英文字体变样）、**同一张图纸的 DWG 与 DXF 必须读出同一份文字几何**（DWG 实样，需 `LYCAD_DWG_SAMPLE`，见 4.4），以及两条「导出后能用」的回归测试：**`*ACTIVE` 视口必须覆盖全图**（否则打开是空白）、**文字样式的字体与样式名必须随文件往返**（否则汉字变成 `?` 或换字体），以及三条**原生 DWG 写-读往返**：**直线/多段线坐标逐位保真**（盯住 DD 压缩 double 的分支对偶，见第 5 节）、**构造线/射线按「基点 + 单位方向」往返**（R2000 的 RAY/XLINE 只有两个 3BD 字段，多写一个字节都会让句柄流错位） |
+| `test_block_insert` | 块参照：块表大小写不敏感查找与唯一命名、插入变换（插入点/比例/旋转，含负比例镜像）、**块内 0 层继承块参照图层**、**随块颜色取块参照的颜色**、嵌套块递归展开、ATTDEF 自动生成 ATTRIB 并参与渲染、**非相似变换下的烘焙必须逐位保持几何**（否则块会被拉歪）、分解命令一次撤销即可还原且没有可分解对象时不产生空撤销记录、**DXF 六档版本往返后仍是块参照而不是被炸开的图元**（含块表、块内容、ATTDEF 与属性值）、DWG 往返保留块参照、**属性必须还是块参照上的 ATTRIB 而不是散落的独立文字**（实体数、属性表、属性定义三处都盯住）、几何保持、**引用了未定义块的 INSERT 必须计数上报且不留悬空引用**、**循环块引用（A 插 B、B 插 A）必须被断开并上报**（连上会让两者互相持有 shared_ptr，谁都不会被释放）、**同一张图的 DWG 与 DXF 必须读出同一份块参照与属性**（DWG 实样，需 `LYCAD_BLOCK_DWG_SAMPLE`，见 4.4）；真实图纸样本经 `LYCAD_BLOCK_SAMPLE` 指定，加 `LYCAD_BLOCK_SNAPSHOT=<png>` 可把样本渲染成图片供人工核对 |
 | `test_libdxfrw_codec` | libdxfrw-modify 的文本解码器：**其行为只取决于当前文件的版本，不受同进程中此前读过的文件影响**；以及**四张双字节码表逐码位核对**（GBK/韩文/繁体/日文，守住「引导字节表错位导致整段码位解错或解成 `?`」的回归测试，见第 8 节） |
 
 ```
@@ -571,6 +593,43 @@ LYCAD_DWG_SAMPLE=/path/a.dwg LYCAD_DXF_SAMPLE=/path/b.dxf \
 不设 `LYCAD_DXF_SAMPLE` 时，取与 DWG 同名的 `.dxf` 作为对照；两个环境变量都没
 设置时该测试自行跳过，不影响常规 `ctest`。
 
+块参照同样可以拿真实图纸盯住——尤其要确认「导入后还是块参照」而不是被炸开：
+
+```bash
+LYCAD_BLOCK_SAMPLE=/path/属性块.dxf ./build/tests/test_block_insert realSampleIfProvided
+```
+
+同一张图的 DWG 与 DXF 还要读出**同一份块参照与属性**。DWG 的属性对象是独立对象，
+字段序只能靠对照来定标，这条测试就是那把尺子（只给 DWG 时会自动找同名的 `.dxf`）：
+
+```bash
+LYCAD_BLOCK_DWG_SAMPLE=/path/a.dwg LYCAD_BLOCK_DXF_SAMPLE=/path/a.dxf \
+    ./build/tests/test_block_insert dwgAndDxfAgreeOnBlocks
+```
+
+给新增的 DWG 实体定标时，`LYCAD_DWG_DEBUG=1` 会打开 libdxfrw 的逐字段调试输出
+（DWG 的字段序无法从接口看出，只能靠它把「读到的值」和同一张图的 DXF 摆在一起看）。
+
+**写出的 DWG 还要用另一套实现来验**：自己读自己写得对，不代表别的 CAD 也认。
+[GNU LibreDWG](https://www.gnu.org/software/libredwg/) 是独立实现的 DWG 读写库，
+把写出的文件交给它的 `dwg2dxf` 转一遍，再比对 INSERT / ATTRIB / SEQEND 与句柄归属，
+能发现「自读自写正常、别的实现当成游离实体」这类问题——块属性的属主写错（应指向
+INSERT 而非块记录）就是靠它发现的，症状是 `stale ATTRIB subentity` 警告加上属性
+被导出两遍：
+
+```bash
+dwg2dxf -o /tmp/check.dxf /tmp/lycad_written.dwg   # 独立实现的解读结果
+```
+
+加上 `LYCAD_BLOCK_SNAPSHOT=<png>` 还能把样本离屏渲染成一张图片，人工看一眼
+块参照到底画成了什么样（这条路径与命令行、出图共用同一个 `EntityRenderer`，
+因此图片里能看到的东西就是用户能看到的东西）：
+
+```bash
+LYCAD_BLOCK_SAMPLE=/path/属性块.dxf LYCAD_BLOCK_SNAPSHOT=/tmp/blk.png \
+    ./build/tests/test_block_insert
+```
+
 ### 4.5 复现验证
 
 ```bash
@@ -686,7 +745,7 @@ DWG 是二进制格式，而有些文件会把 DXF 内容套上 DWG 签名——
 |---|---|
 | 圆/圆弧在非等比缩放下被近似 | 椭圆已是**独立的图元类型**（ELLIPSE 的读写、绘制、捕捉、属性面板都支持），但圆的变换仍按等效均匀缩放处理，不会自动转成椭圆。等比缩放与镜像下为精确结果。 |
 | 出图固定比例超出纸面即分页 | 适应图纸恒为一页；固定比例（1:1 / 自定义）下图纸超出可打印区时按先行后列自动分页，预览与打印页数一致。不做「缩到一页」与拼页顺序之外的打印样式（页边裁切线、页码标注等）。 |
-| 块引用导入即展开 | 当前不建模块定义体系，`INSERT` 在导入时按变换展开为独立图元。图形内容零丢失，代价是文件往返后块被打散（导入结果中会明确告知）。 |
+| 块参照的几何不可直接编辑 | 支持块定义 + `INSERT` 的完整往返、显示、拾取、捕捉、属性面板与 分解(EXPLODE)。但**没有块编辑器**（不能双击进块改内容），也没有 `BLOCK`/`INSERT`/`WBLOCK` 命令（不能新建块或再插入），`MINSERT` 的阵列在变换后会被烘焙展开。要改块内容先 `EXPLODE` 打散；非等比拉伸落到块参照上时几何同样被烘焙进一份匿名块定义副本，该处不再是引用（几何精确）。 |
 | 未实现逆向编辑 | 不支持 OFFSET / TRIM / EXTEND / FILLET / CHAMFER / STRETCH。刻意保留为未实现状态而非半成品。 |
 | 未建模的实体类型 | 多行文字（MTEXT）、角度标注、公差与引线标注。导入时按类型计数跳过并明确告知，不静默丢弃。 |
 | 文字为 TEXT 模型（内容可含换行） | 对应 DXF `TEXT`：支持镜像生成标志（71 bit2/bit4，PCB 背面丝印即此表达）与宽度因子（41，含负值=镜像）。内容里的换行会被保留：画布按多行绘制、双击弹出的编辑框按多行打开（Enter 确认 / Alt+Enter 换行）、导出到 R2000 及以上时写回为 MTEXT。**MTEXT 实体本身仍未建模**：导入时降级为多行文字并计数上报，其内联格式码只还原字体与段落对齐两项，其余（行距、栏宽、制表位等）不保留。文字样式（`STYLE` 表）已随文件往返：图元带样式名（7），字体（3/4 组码与记录 TrueType 字体的 ACAD 扩展数据）存在文档的文字样式表里按名解析，导出原样写回；只有界面上的样式管理（新建/改名/删除）尚未提供。 |
@@ -695,7 +754,7 @@ DWG 是二进制格式，而有些文件会把 DXF 内容套上 DWG 签名——
 | EDA 图层配色为启发式 | 文件自带颜色时严格按文件显示；仅当 EDA 导出的 DXF 缺失图层颜色时，才按图层名关键词套用行业惯例配色（顶/底丝印分色：顶黄/底绿，与常见 EDA 2D 视图一致），可在图层面板修改，导出时随图层表写出。 |
 | 线型为内置标准集 | 支持 CONTINUOUS / DASHED / DASHDOT / DASHDOTDOT / DOT / HIDDEN / CENTER / PHANTOM / BORDER；文件中引用的自定义线型会回退为 CONTINUOUS。 |
 | 单图纸空间 | 无布局/视口体系，仅在模型空间工作；图纸空间里的实体也会被一并导入到模型空间。 |
-| 不支持对象编组与属性块 | — |
+| 不支持对象编组 | 未建模；文件里的 `GROUP` 对象在读取时按对象跳过。 |
 | 功能区宽度靠滚动而非折叠 | 面板排开的总宽度大于窗口，窗口偏窄时出现横向滚动条。AutoCAD 的做法是把放不下的面板折叠成一个按钮，本项目未实现该机制——滚动不会隐藏任何功能，只是需要多一次拖动。 |
 | 图标为自绘，非 AutoCAD 原图标 | 形态按 AutoCAD 的表达习惯绘制（夹点、箭头、虚线辅助线），但不复制其美术资源。 |
 
@@ -758,6 +817,12 @@ DWG 是二进制格式，而有些文件会把 DXF 内容套上 DWG 签名——
 | `drw_entities.h` / `libdxfrw.cpp` | DIMENSION 支持 42 组码（实测值） | 上游不写该组码，不具备标注重绘能力的旧软件无法显示测量值 |
 | `drw_header.cpp` | `$HANDSEED` 放宽到 0xFFFFFF | 规范要求句柄种子大于文件中全部句柄；上游写死 0x20000，余量太小 |
 | `libdxfrw.h` / `libdxfrw.cpp` | 实体写出处补 `330` 组码（属主 BLOCK_RECORD 软指针） | 上游不写该组码，实体成"孤儿"——实测 AutoCAD 打开后整个图形空白；模型空间实体指向 0x1F，块内实体指向各自的块记录 |
+| `drw_entities.*` / `drw_interface.h` / `libdxfrw.cpp` | 新增 `DRW_Attdef` / `DRW_Attrib` 与 `addAttdef` / `addAttrib` 回调，DXF 侧补齐 `ATTDEF`/`ATTRIB` 的解析与写出（`writeAttdef` / `writeAttrib` / `writeSeqEnd`，`INSERT` 的 66 组码） | 上游把这两种实体整块注释掉了：属性块读进来只剩几何，属性文字全丢；写出去也没有 `ATTRIB`，别的 CAD 打开看不到属性值 |
+| `intern/dwgreader.cpp` | DWG 对象类型 2/3（ATTRIB/ATTDEF）接入派发；两者解析失败**不**把整张图判为损坏 | 上游把它们丢进"待处理对象"表后不再处理；而读取端只要有一条实体返回 false 就会让整张图打不开，拿属性换整张图不划算 |
+| `intern/dwgwriter15.cpp` / `libdwgrw.h` | 新增 `dwgW::writeInsert`（对象类型 7/8）：插入点、比例、旋转、挤出、has_attribs 位、BLOCK RECORD 硬指针，以及属性存在时的 first_attrib / last_attrib / seqend 三个句柄 | 上游 DWG 写出器没有 INSERT，块参照保存为 DWG 后会整块消失；三个属性句柄不写，属性就成了没人认领的游离实体 |
+| `intern/dwgwriter15.cpp` / `libdwgrw.h` | 新增 `dwgW::writeAttrib` / `writeAttdef` / `writeSeqEnd`（对象类型 2/3/6），与 TEXT 共用 `writeTextBody` | 上游没有属性对象的编码器，属性块保存为 DWG 后属性文字会散成模型空间里的独立 TEXT——块参照与它的属性就此脱钩 |
+| `intern/dwgwriter15.cpp` | 属性对象的属主写成**块参照自己**（不是块记录），且不挂进块的 prev/next 实体链 | 实测 AutoCAD 2000 的图纸正是如此；照块内实体写会让别的实现把属性当成游离实体——libredwg 的 `dwg2dxf` 会打出 `stale ATTRIB subentity` 并把同一条属性导出两遍（见 4.4 的交叉校验） |
+| `intern/dwgwriter15.cpp` | `writeText` 的挤出/厚度顺序改为**挤出在前** | 读取端是 `getExtrusion()` 再 `getThickness()`，上游写出侧写反了。两者都以「1 位 = 取默认值」编码，默认时看不出来（所以一直没暴露），厚度或挤出一旦非默认就会张冠李戴 |
 | `libdxfrw.cpp` | 写出文字样式时补写表记录的扩展数据（`writeExtData`） | 上游只给图元写扩展数据，表记录一律不写；而 AutoCAD 把中文图纸常用的 TrueType 字体族名**只**记在样式的 ACAD 扩展数据里（此时 3 组码为空），往返后字体丢失，汉字退化为 "?" |
 | `intern/dwgreader21.cpp` | 2007+ 区段页的 RS 块数改用 `duint32`（上游写成 `duint8`） | 一页最多 257 块（65535 字节 / 255），写在 `duint8` 里 257 会截断成 1：整页只剩第一块被纠错，其余仍是 RS 编码，解压出来是乱码，表段解析失败 —— 整个文件被判「已损坏」而打不开。实测一个 2007 版 DWG（对象区 47MB）正是如此 |
 | `libdxfrw.cpp`（`writeHatch`） | 写出填充的图案定义线（53/43/44/45/46/79/49），并把它们收进 `DRW_Hatch::deflist`（读取侧也照此保留） | 上游只写 78 组码的**条数**、内容一个字不写（那段代码是注释掉的），文件里的非实体填充于是成了「有图案名、无定义」：实测 AutoCAD 会把它画成一大片乱纹盖住整张图，点一下重生成才恢复。另外偏移必须换算到图案线坐标系、基点归零，直接照抄源数据同样出问题 |

@@ -133,6 +133,9 @@ public:
     bool writeRay(DRW_Ray* ent);
     bool writeXline(DRW_Xline* ent);
     bool writeCircle(DRW_Circle* ent);
+    /// 块参照：块内与模型空间通用。写出时引用 BLOCK_RECORD 句柄，
+    /// 由预扫描阶段登记的块记录解析得到。
+    bool writeInsert(DRW_Insert* ent);
     bool writeArc(DRW_Arc* ent);
     bool writeEllipse(DRW_Ellipse* ent);
     bool writeSolid(DRW_Solid* ent);
@@ -144,6 +147,12 @@ public:
     bool writeHatch(DRW_Hatch* ent);
     bool writeDimension(DRW_Dimension* ent);
     bool writeText(DRW_Text* ent);
+    /// 块属性：ATTRIB（块参照上的值）与 ATTDEF（块定义里的定义）。
+    /// 两者与 TEXT 共用同一段文字数据，尾部再多「标签 + 字段长度 + 标志(+提示)」。
+    bool writeAttrib(DRW_Attrib* ent);
+    bool writeAttdef(DRW_Attdef* ent);
+    /// 属性列表的结束标记。句柄在写 INSERT 时就已一并占下。
+    bool writeSeqEnd(DRW_Entity* ent);
     bool writeMText(DRW_MText* ent);
 
 private:

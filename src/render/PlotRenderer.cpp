@@ -220,6 +220,10 @@ void renderToRect(QPainter& painter, const Document& document, const QRectF& tar
     // 直接传毫米会让 0.5 mm 的粗线在 1:50 的图上错成 25 mm 的墨块，或反过来细成
     // 一根看不见的丝——取决于比例是放大还是缩小。
     const double worldPerMillimeter = view.worldPerDevice() * devicePerMillimeter;
+    // 块参照按子图元各自的图层重新解析样式；线宽换算系数要和块外的完全一致，
+    // 否则同一张图里块内的粗线画得跟块外不一样粗。
+    context.layers = &layers;
+    context.lineweightWorldScale = worldPerMillimeter;
 
     for (EntityId id : document.drawOrder()) {
         const Entity* entity = document.entity(id);

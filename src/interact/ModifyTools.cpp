@@ -570,6 +570,96 @@ void MirrorTool::paintTargetPreview(QPainter& painter, const EntityRenderer::Dra
 }
 
 // =============================================================================
+//  分解块参照
+// =============================================================================
+ExplodeTool::ExplodeTool(ToolContext& context)
+    : Tool(context)
+{
+}
+
+QString ExplodeTool::name() const { return QStringLiteral("EXPLODE"); }
+QString ExplodeTool::displayName() const { return QStringLiteral("分解"); }
+
+QString ExplodeTool::prompt() const
+{
+    if (!ctx().document) return QString();
+    const std::size_t count = ctx().document->selection().size();
+    return QStringLiteral("分解块参照：选择对象 <回车确认>（已选 %1 个）:").arg(count);
+}
+
+void ExplodeTool::explodeSelection()
+{
+    if (!ctx().document) return;
+
+    int count = 0;
+    if (!ctx().document->explodeEntities(ctx().document->selection().ids(), &count)) {
+        message(QStringLiteral("选择集中没有可分解的块参照。"));
+        return;
+    }
+    message(QStringLiteral("已分解 %1 个块参照。").arg(count));
+}
+
+void ExplodeTool::activate()
+{
+    // 与 ERASE 一致：已有选择集时立即执行，符合 CAD 的「先选后改」习惯
+    if (ctx().document && !ctx().document->selection().isEmpty()) {
+        explodeSelection();
+        finish();
+        return;
+    }
+    notifyPromptChanged();
+}
+
+bool ExplodeTool::mousePress(const CanvasEvent& event)
+{
+    if (event.button != Qt::LeftButton || !ctx().document) return false;
+
+    CadCanvas* canvas = ctx().canvas;
+    const EntityId picked = canvas ? canvas->pickEntity(event.worldPos, ctx().pickToleranceWorld())
+                                   : kInvalidEntityId;
+    if (picked == kInvalidEntityId) return true;
+
+    if (event.hasModifier(Qt::ShiftModifier)) {
+        ctx().document->selection().toggle(picked);
+    } else {
+        ctx().document->selection().add(picked);
+    }
+    notifyPromptChanged();
+    repaint();
+    return true;
+}
+
+bool ExplodeTool::keyPress(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape) {
+        finish();
+        return true;
+    }
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+        if (ctx().document && !ctx().document->selection().isEmpty()) {
+            explodeSelection();
+        } else {
+            message(QStringLiteral("未选择任何对象，命令取消。"));
+        }
+        finish();
+        return true;
+    }
+    return false;
+}
+
+bool ExplodeTool::textInput(const QString& text)
+{
+    Q_UNUSED(text);
+    message(QStringLiteral("请用鼠标选择要分解的块参照，按回车确认。"));
+    return true;
+}
+
+void ExplodeTool::deactivate()
+{
+    ctx().setSnapMarker(std::nullopt);
+}
+
+// =============================================================================
 //  删除
 // =============================================================================
 EraseTool::EraseTool(ToolContext& context)

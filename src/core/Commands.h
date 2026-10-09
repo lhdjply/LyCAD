@@ -11,6 +11,7 @@
 
 #include "core/Document.h"
 #include "core/Entity.h"
+#include "core/InsertEntity.h"
 #include "core/Layer.h"
 #include "core/TextEntity.h"
 
@@ -174,6 +175,39 @@ private:
     std::vector<EntityId> m_ids;                ///< 命中的文字图元
     std::vector<TextPropertyValues> m_before;   ///< 与 m_ids 一一对应的前置快照
     TextPropertyValues m_new;
+};
+
+// -----------------------------------------------------------------------------
+//  修改块参照属性（比例 / 旋转）
+//
+//  比例与旋转是块参照独有的几何参数，取值是浮点——与文字属性同理，单独一条命令。
+//  字段同样采用「未赋值即不动」的约定，多选时某一列取值不一致不影响改其它列。
+// -----------------------------------------------------------------------------
+struct InsertPropertyValues {
+    std::optional<double> scaleX;
+    std::optional<double> scaleY;
+    std::optional<double> rotation;     ///< 弧度（与 InsertEntity 同一口径）
+};
+
+class InsertPropertyCommand : public QUndoCommand {
+public:
+    /// ids 里不是块参照的图元会被剔除；一个块参照都没有时命令不做任何事
+    InsertPropertyCommand(Document* document,
+                          std::vector<EntityId> ids,
+                          InsertPropertyValues values,
+                          const QString& text);
+
+    void undo() override;
+    void redo() override;
+
+private:
+    /// 按「已赋值才写」的规则把 values 落到块参照上（redo 与 undo 共用）
+    static void assign(InsertEntity& insert, const InsertPropertyValues& values);
+
+    Document* m_document;
+    std::vector<EntityId> m_ids;
+    std::vector<InsertPropertyValues> m_before;   ///< 与 m_ids 一一对应的前置快照
+    InsertPropertyValues m_new;
 };
 
 // -----------------------------------------------------------------------------

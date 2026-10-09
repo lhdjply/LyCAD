@@ -50,8 +50,13 @@ namespace {
 // ---- R2000 固定对象类型（与 libredwg dwg.h / 读取端分支一致） ---------------
 enum : std::uint16_t {
     kText          = 0x01,
+    kAttrib        = 0x02,  // 块参照上的属性值（独立对象，跟在 INSERT 之后）
+    kAttdef        = 0x03,  // 块定义里的属性定义
     kBlock         = 0x04,
     kEndblk        = 0x05,
+    kSeqEnd        = 0x06,  // 属性列表的结束标记
+    kInsert        = 0x07,  // 块参照
+    kMinsert       = 0x08,  // 块参照 + 阵列（列/行重复）
     kArc           = 0x11,
     kCircle        = 0x12,
     kLine          = 0x13,
@@ -160,6 +165,13 @@ struct dwgW::Private
             return w.takeData();
         }
     };
+
+    /// INSERT 的属性句柄：写出 INSERT 时按条数一次性占下来，
+    /// 之后写每条 ATTRIB / SEQEND 时依次取用。
+    std::vector<std::uint32_t> attribHandles;
+    std::uint32_t seqendHandle = 0;
+    /// 当前正在写属性的那个 INSERT 的句柄：ATTRIB / SEQEND 的属主就是它
+    std::uint32_t currentInsertHandle = 0;
 
     struct Blk {
         std::string name;
@@ -385,6 +397,65 @@ struct dwgW::Private
         writeExtrusion(b, ext);
     }
 
+    /// TEXT / ATTRIB / ATTDEF 共有的文字数据段（R2000+ 位流，顺序依 libredwg
+    /// dwg.spec 的 TEXT/ATTRIB/ATTDEF **非 DXF 分支**）。
+    ///
+    /// 只写文字字段，**不含**属性专属尾部（标签/标志）与句柄流——两种属性实体
+    /// 在这之后还要写自己的字段，所以必须拆出来复用，不能整体调 writeText。
+    ///
+    /// 注意挤出与厚度的顺序：读取端是 `getExtrusion()` 再 `getThickness()`，
+    /// 这里就必须是挤出在前。两者都以「1 位 = 取默认值」编码，默认时写反看不出来
+    ///（早先 writeText 就写反了，因为常见文字两者都取默认，一直没暴露）；
+    /// 厚度或挤出非默认时写反，读回来就会张冠李戴。
+    void writeTextBody(ObjBuilder& b, const DRW_Text& ent)
+    {
+        const bool hasAlignment = ent.alignH != DRW_Text::HLeft
+                               || ent.alignV != DRW_Text::VBaseLine;
+        std::uint8_t df = 0x01          // 省略高程（z=0）
+                        | 0x04;         // 省略倾角（0）
+        if (!hasAlignment) df |= 0x02;  // 省略对齐点（取插入点）
+        if (ent.textgen == 0) df |= 0x20;
+        if (!hasAlignment) df |= 0x40 | 0x80;
+
+        b.w.writeRC(df);
+        if (!(df & 0x01)) b.w.writeRD(ent.basePoint.z);
+        b.w.write2RD(ent.basePoint.x, ent.basePoint.y);
+        if (!(df & 0x02)) {
+            b.w.writeDD(ent.secPoint.x, ent.basePoint.x);
+            b.w.writeDD(ent.secPoint.y, ent.basePoint.y);
+        }
+        writeExtrusion(b, ent.extPoint);
+        writeThickness(b, ent.thickness);
+        // 倾角与旋转角：DRW_Text 的 angle/oblique 与 DXF 50/51 组码同单位（度），
+        // 而 DWG 位流里一律存弧度——不换算的话，90° 的文字会被真实 CAD 解释为
+        // 90 弧度（≈116.6° 取模），旋转整体错乱。
+        if (!(df & 0x04)) b.w.writeRD(ent.oblique * kDegToRad);
+        if (!(df & 0x08)) b.w.writeRD(ent.angle * kDegToRad);
+        b.w.writeRD(ent.height);
+        if (!(df & 0x10)) b.w.writeRD(ent.widthscale);
+        b.w.writeT(ent.text, codec);
+        if (!(df & 0x20)) b.w.writeBS(static_cast<dint16>(ent.textgen));
+        if (!(df & 0x40)) b.w.writeBS(static_cast<dint16>(ent.alignH));
+        if (!(df & 0x80)) b.w.writeBS(static_cast<dint16>(ent.alignV));
+    }
+
+    /// 取出为 ATTRIB 预分配的句柄（没预分配就现分配，见 dwgW::writeInsert）
+    std::uint32_t takeAttribHandle()
+    {
+        if (attribHandles.empty()) return allocHandle();
+        const std::uint32_t handle = attribHandles.front();
+        attribHandles.erase(attribHandles.begin());
+        return handle;
+    }
+
+    std::uint32_t takeSeqendHandle()
+    {
+        if (seqendHandle == 0) return allocHandle();
+        const std::uint32_t handle = seqendHandle;
+        seqendHandle = 0;
+        return handle;
+    }
+
     /// 实体句柄流。顺序依 libdxfrw `parseDwgEntHandle`（R2000 路径）与样例实测：
     ///   [owner 仅 entmode==0] → [numReactors × reactors] → [XDicObj] →
     ///   if(!nolinks){ prev_entity → next_entity } → [layer] → if(ltFlags==3)[linetype]
@@ -411,13 +482,26 @@ struct dwgW::Private
     /// 实体写出主流程：公共数据 → 类型数据 → 句柄流 → 排队。
     /// fill 写类型数据；extraHandles 在公共句柄流之后追加句柄（标注实体用）。
     struct NoOp { void operator()(ObjBuilder&) const {} };
+    /// 普通实体的句柄由内部按顺序分配；属性实体（ATTRIB/SEQEND）要用
+    /// **预分配**的句柄 —— INSERT 在写出时就得填好 first_attrib / last_attrib /
+    /// seqend 三个句柄，那时这些对象还没编码。
+    ///
+    /// ownerOverride 非 0 时改用它作属主：DWG 里 ATTRIB 与 SEQEND 的属主是**块参照
+    /// 自己**（不是块记录）——实测 AutoCAD 2000 写的图纸正是如此（ATTRIB/SEQEND 的
+    /// 330 都指向 INSERT 的句柄）。照「块内实体」那样写成块记录，别的实现会把属性
+    /// 当成游离实体（libredwg 的 dwg2dxf 直接打出 "stale ATTRIB subentity"，
+    /// 并把同一条属性导出两遍）。
+    ///
+    /// linkToBlock 为假时**不**把该对象挂进当前块的实体链：属性是块参照的子实体，
+    /// 靠 INSERT 的三个句柄索引，不参与块的 prev/next 链（AutoCAD 的写法亦然）。
     template<typename Fill, typename ExtraHandles = NoOp>
     std::uint32_t encodeEntity(std::uint16_t otype, const DRW_Entity& e, Fill fill,
-                               ExtraHandles extraHandles = NoOp{})
+                               ExtraHandles extraHandles = NoOp{}, std::uint32_t handle = 0,
+                               std::uint32_t ownerOverride = 0, bool linkToBlock = true)
     {
-        const std::uint32_t handle = allocHandle();
+        if (handle == 0) handle = allocHandle();
         Blk& blk = current ? *current : mspace;
-        const std::uint32_t owner = blk.record;
+        const std::uint32_t owner = ownerOverride != 0 ? ownerOverride : blk.record;
         const int entmode = entmodeFor(owner);
         ObjBuilder b;
         writeEntityCommon(b, otype, e, handle, entmode);
@@ -425,9 +509,11 @@ struct dwgW::Private
         writeEntityHandles(b, owner, e.layer, entmode);
         extraHandles(b);
         pushObject(handle, otype, b.finish(), b.prevBit, b.nextBit);
-        if (blk.first == 0) blk.first = handle;
-        blk.last = handle;
-        blk.ents.push_back(handle);
+        if (linkToBlock) {
+            if (blk.first == 0) blk.first = handle;
+            blk.last = handle;
+            blk.ents.push_back(handle);
+        }
         return handle;
     }
 
@@ -1417,6 +1503,137 @@ bool dwgW::writeXline(DRW_Xline* ent)
     return true;
 }
 
+// 块参照（INSERT 0x07 / MINSERT 0x08）。
+//
+// 字段序严格对应读取端 DRW_Insert::parseDwg 的 R2000 分支：
+//   插入点 3BD → 比例（2 位标志 + 若干 RD/DD）→ 旋转 BD → 挤出 3BD
+//   → hasAttrib 位 →（MINSERT 时）列数 BS / 行数 BS / 列距 BD / 行距 BD
+// 句柄流在公共实体句柄之后追加 **BLOCK RECORD 硬指针**（读取端用它反查块名）。
+//
+// hasAttrib 恒写 false：本写出器不生成 ATTRIB 对象。置位却给不出 ATTRIB/SEQEND
+// 句柄会让读取端按「后面还有两个句柄」继续读，整个对象的句柄流随之错位。
+bool dwgW::writeInsert(DRW_Insert* ent)
+{
+    const bool isMinsert = ent->colcount > 1 || ent->rowcount > 1;
+    const std::uint32_t blockH = d->blockRecordHandle(ent->name);
+
+    // 句柄号的分配顺序必须与**对象在文件里的先后顺序**一致：
+    //   INSERT → ATTRIB… → SEQEND
+    // libredwg（以及 AutoCAD 的读取逻辑）用「对象在对象表中的下一个」来串属性，
+    // 表按句柄排序；若 ATTRIB 的句柄小于 INSERT 的，属性会被当成游离实体
+    //（libredwg 的 dwg2dxf 会打出 "stale ATTRIB subentity"）。因此这里先给
+    // INSERT 自己占号，再按条数占下各 ATTRIB 与 SEQEND 的号。
+    const bool hasAttribs = ent->hasAttribs && ent->attribCount > 0;
+    const std::uint32_t insertHandle = d->allocHandle();
+    d->currentInsertHandle = insertHandle;
+
+    d->attribHandles.clear();
+    d->seqendHandle = 0;
+    if (hasAttribs) {
+        d->attribHandles.reserve(static_cast<std::size_t>(ent->attribCount));
+        for (int i = 0; i < ent->attribCount; ++i) d->attribHandles.push_back(d->allocHandle());
+        d->seqendHandle = d->allocHandle();
+    }
+
+    d->encodeEntity(isMinsert ? kMinsert : kInsert, *ent, [&](Private::ObjBuilder& b) {
+        b.w.write3BD(ent->basePoint.x, ent->basePoint.y, ent->basePoint.z);
+
+        const bool defaultX = ent->xscale == 1.0;
+        const bool defaultY = ent->yscale == 1.0;
+        const bool defaultZ = ent->zscale == 1.0;
+        const bool uniform  = ent->xscale == ent->yscale && ent->yscale == ent->zscale;
+        if (defaultX && defaultY && defaultZ) {
+            b.w.writeBB(3);                        // 三个比例全为默认值 1
+        } else if (uniform) {
+            b.w.writeBB(2);                        // x = y = z
+            b.w.writeRD(ent->xscale);
+        } else if (defaultX) {
+            b.w.writeBB(1);                        // x 默认 1，y/z 用带默认值的编码
+            b.w.writeDD(ent->yscale, 1.0);
+            b.w.writeDD(ent->zscale, 1.0);
+        } else {
+            b.w.writeBB(0);                        // 三个比例各自编码
+            b.w.writeRD(ent->xscale);
+            b.w.writeDD(ent->yscale, ent->xscale);
+            b.w.writeDD(ent->zscale, ent->xscale);
+        }
+
+        b.w.writeBD(ent->angle);
+        // 挤出方向：R2000 的 INSERT 这里是普通 3BD，没有公共实体数据那种
+        // 「默认标志位」——读取端正是按 getExtrusion(false) 读的。
+        b.w.write3BD(0.0, 0.0, 1.0);
+        b.w.writeB(hasAttribs);                    // has_attribs（对应 DXF 66）
+
+        if (isMinsert) {
+            b.w.writeBS(static_cast<dint16>(ent->colcount));
+            b.w.writeBS(static_cast<dint16>(ent->rowcount));
+            b.w.writeBD(ent->colspace);
+            b.w.writeBD(ent->rowspace);
+        }
+    }, [&](Private::ObjBuilder& b) {
+        b.w.writeHandle(kHcAbsolute, blockH);      // H 5 BLOCK RECORD
+        if (hasAttribs) {
+            // 顺序与句柄码依 libredwg dwg.spec 的 INSERT（R2000 分支）：
+            //   first_attrib 软指针(4) → last_attrib 软指针(4) → seqend 硬属主(3)
+            // 缺这三个（或多写），读取端的句柄流会整体错位。
+            b.w.writeHandle(kHcSoftPtr, d->attribHandles.front());
+            b.w.writeHandle(kHcSoftPtr, d->attribHandles.back());
+            b.w.writeHandle(kHcOwner, d->seqendHandle);
+        }
+    }, insertHandle);
+    return true;
+}
+
+// ATTRIB / ATTDEF / SEQEND
+//
+// 字段序取自 libredwg 的 dwg.spec（**非 DXF 分支**，即真实位流那一侧）：
+//
+//   [common entity data]
+//   dataflags RC → 高程 RD → 插入点 2RD → 对齐点 2DD → 挤出 BE → 厚度 BT
+//   → 倾角 RD → 旋转 RD → 字高 RD → 宽度因子 RD → 文字 T
+//   → 生成标志 BS → 水平对齐 BS → 垂直对齐 BS
+//   → 【属性专属】标签 T → 字段长度 BS → 标志 RC →（ATTDEF 再跟一个）提示 T
+//   [common entity handle data] → 文字样式句柄 H5
+//
+// 两处最容易写错：标志是 **RC（1 字节）不是 BS**，且它前面还有一个字段长度；
+// 对齐点写在挤出/厚度**之前**（与 TEXT 的字段序不同）。
+bool dwgW::writeAttrib(DRW_Attrib* ent)
+{
+    d->encodeEntity(kAttrib, *ent, [&](Private::ObjBuilder& b) {
+        d->writeTextBody(b, *ent);
+        b.w.writeT(ent->tag, d->codec);              // 2 组码：标签
+        b.w.writeBS(0);                              // 73：字段长度，不建模
+        b.w.writeRC(static_cast<std::uint8_t>(ent->flags & 0xFF));
+    }, [&](Private::ObjBuilder& b) {
+        b.w.writeHandle(kHcAbsolute, d->styleHandle(ent->style));
+    }, d->takeAttribHandle(), d->currentInsertHandle, false);
+    return true;
+}
+
+bool dwgW::writeAttdef(DRW_Attdef* ent)
+{
+    d->encodeEntity(kAttdef, *ent, [&](Private::ObjBuilder& b) {
+        d->writeTextBody(b, *ent);
+        b.w.writeT(ent->tag, d->codec);
+        b.w.writeBS(0);                              // 73：字段长度，不建模
+        b.w.writeRC(static_cast<std::uint8_t>(ent->flags & 0xFF));
+        b.w.writeT(ent->prompt, d->codec);           // 3 组码：提示
+    }, [&](Private::ObjBuilder& b) {
+        b.w.writeHandle(kHcAbsolute, d->styleHandle(ent->style));
+    });
+    return true;
+}
+
+// SEQEND：没有类型数据，只有公共实体数据 + 公共句柄流。
+// 它没有自己的句柄可分配——句柄早在写 INSERT 时就已经占下了。
+bool dwgW::writeSeqEnd(DRW_Entity* ent)
+{
+    const std::uint32_t handle = d->takeSeqendHandle();
+    d->encodeEntity(kSeqEnd, *ent, [](Private::ObjBuilder&) {}, Private::NoOp{}, handle,
+                    d->currentInsertHandle, false);
+    return true;
+}
+
 bool dwgW::writeCircle(DRW_Circle* ent)
 {
     d->encodeEntity(kCircle, *ent, [&](Private::ObjBuilder& b) {
@@ -1620,35 +1837,7 @@ bool dwgW::writeHatch(DRW_Hatch* ent)
 bool dwgW::writeText(DRW_Text* ent)
 {
     d->encodeEntity(kText, *ent, [&](Private::ObjBuilder& b) {
-        // DataFlags：按需省略字段。bit0 高程省略、bit2 倾角省略；
-        // 对齐点/旋转/宽度因子/生成标志/对齐方式按记录内容写。
-        const bool hasAlignment = ent->alignH != DRW_Text::HLeft
-                               || ent->alignV != DRW_Text::VBaseLine;
-        std::uint8_t df = 0x01          // 省略高程（z=0）
-                        | 0x04;         // 省略倾角（0）
-        if (!hasAlignment) df |= 0x02;  // 省略对齐点（取插入点）
-        if (ent->textgen == 0) df |= 0x20;
-        if (!hasAlignment) df |= 0x40 | 0x80;
-        b.w.writeRC(df);
-        if (!(df & 0x01)) b.w.writeRD(ent->basePoint.z);
-        b.w.write2RD(ent->basePoint.x, ent->basePoint.y);
-        if (!(df & 0x02)) {
-            b.w.writeDD(ent->secPoint.x, ent->basePoint.x);
-            b.w.writeDD(ent->secPoint.y, ent->basePoint.y);
-        }
-        d->writeThicknessExtrusion(b, ent->thickness, ent->extPoint);
-        // 倾角与旋转角：DRW_Text::angle/oblique 与 DXF 50/51 组码同单位（度），
-        // 而 DWG 位流里一律存弧度——不换算的话，90° 的文字会被真实 CAD 解释为
-        // 90 弧度（≈116.6°取模），旋转整体错乱。标注几何块内的文字（适配器按
-        // 度填 angle）受影响最直接：DXF 打开正常、DWG 打开旋转不对。
-        if (!(df & 0x04)) b.w.writeRD(ent->oblique * kDegToRad);
-        if (!(df & 0x08)) b.w.writeRD(ent->angle * kDegToRad);
-        b.w.writeRD(ent->height);
-        if (!(df & 0x10)) b.w.writeRD(ent->widthscale);
-        b.w.writeT(ent->text, d->codec);
-        if (!(df & 0x20)) b.w.writeBS(static_cast<dint16>(ent->textgen));
-        if (!(df & 0x40)) b.w.writeBS(static_cast<dint16>(ent->alignH));
-        if (!(df & 0x80)) b.w.writeBS(static_cast<dint16>(ent->alignV));
+        d->writeTextBody(b, *ent);
     }, [&](Private::ObjBuilder& b) {
         b.w.writeHandle(kHcAbsolute, d->styleHandle(ent->style));
     });

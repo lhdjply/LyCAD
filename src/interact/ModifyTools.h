@@ -187,6 +187,31 @@ private:
 };
 
 // -----------------------------------------------------------------------------
+//  分解块参照（EXPLODE）
+//
+//  一次性的批量命令：把选择集里的块参照替换成它展开后的独立图元。没有块参照时
+//  不给任何提示就静默返回是不行的——用户点了按钮却什么都没发生，会以为功能坏了。
+// -----------------------------------------------------------------------------
+class ExplodeTool : public Tool {
+public:
+    explicit ExplodeTool(ToolContext& context);
+
+    QString name() const override;
+    QString displayName() const override;
+    QString prompt() const override;
+
+    bool mousePress(const CanvasEvent& event) override;
+    bool keyPress(QKeyEvent* event) override;
+    bool textInput(const QString& text) override;
+    void activate() override;
+    void deactivate() override;
+
+private:
+    /// 分解当前选择集里的块参照；无块参照时给出提示
+    void explodeSelection();
+};
+
+// -----------------------------------------------------------------------------
 //  删除
 // -----------------------------------------------------------------------------
 class EraseTool : public Tool {

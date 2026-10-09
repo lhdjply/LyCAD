@@ -104,6 +104,10 @@ public:
 
     /** Called for every insert. */
     virtual void addInsert(const DRW_Insert& data) = 0;
+    /// 属性定义（ATTDEF）：只出现在块定义里
+    virtual void addAttdef(const DRW_Attdef& data) = 0;
+    /// 属性值（ATTRIB）：紧跟在块参照之后
+    virtual void addAttrib(const DRW_Attrib& data) = 0;
     
     /** Called for every trace start */
     virtual void addTrace(const DRW_Trace& data) = 0;

@@ -40,12 +40,14 @@
 
 #include "core/AciPalette.h"
 #include "core/ArcEntity.h"
+#include "core/Block.h"
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
 #include "core/Document.h"
 #include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
 #include "core/InfiniteLineEntity.h"
+#include "core/InsertEntity.h"
 #include "core/Layer.h"
 #include "core/Linetype.h"
 #include "core/LineEntity.h"
@@ -74,13 +76,11 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace lycad {
 namespace {
-
-/// 块引用递归展开的深度上限（防止自引用块造成无限递归）
-constexpr int kMaxBlockDepth = 16;
 
 /// 图元坐标的合理上限（世界单位）。真实图纸——哪怕以毫米计的超大总图——都远小于
 /// 它；而二进制格式里读错一个字节造出的天文数字（实测 1e36、1e101）会被挡住。
@@ -152,6 +152,18 @@ bool isSpaceBlock(const QString& name)
         || name.startsWith(QLatin1String("*Paper_Space"));
 }
 
+/// 是否为标注的匿名几何块（*D1、*D2……）。
+///
+/// 这类块只是「让不具备标注重绘能力的旧软件也能显示」的缓存几何；本软件按
+/// DIMENSION 的定义点实时重推导标注几何（见 DimensionEntity::geometry），
+/// 读进来既无用，写出时还会和自己重新生成的匿名块撞名。
+bool isDimensionBlock(const QString& name)
+{
+    if (!name.startsWith(QLatin1Char('*'))) return false;
+    if (name.size() < 3) return false;
+    return name.at(1) == QLatin1Char('D') || name.at(1) == QLatin1Char('d');
+}
+
 /// 逆时针归一到 (0, 2π]
 inline double sweepCcw(double start, double end) noexcept
 {
@@ -221,8 +233,8 @@ public:
     /// 降级保留的实体类型 -> 个数
     const QHash<QString, int>& downgradedTypes() const noexcept { return m_downgraded; }
 
-    /// 由块引用展开出的图元数
-    int expandedCount() const noexcept { return m_expanded; }
+    /// 读入的块定义个数（供导入提示显示）
+    std::size_t blockCount() const noexcept { return m_resolvedBlocks.size(); }
 
     /// 文件头里的 $ACADVER（如 "AC1015"），未携带时为空
     QString acadVersion() const { return m_acadVersion; }
@@ -246,6 +258,10 @@ public:
     void addBlock(const DRW_Block& data) override;
     void setBlock(const int handle) override;
     void endBlock() override;
+    /// 属性定义（ATTDEF）：只出现在块定义里，进块定义的属性表而不是图元表
+    void addAttdef(const DRW_Attdef& data) override;
+    /// 属性值（ATTRIB）：紧跟在 INSERT 之后，挂到刚读到的那个块参照上
+    void addAttrib(const DRW_Attrib& data) override;
 
     // ---- 图元 ----------------------------------------------------------------
     void addPoint(const DRW_Point& data) override;
@@ -296,29 +312,24 @@ public:
     void writeAppId() override {}
 
 private:
-    /// 一次待展开的块引用
-    struct PendingInsert {
-        QString blockName;
-        Point2D point;
-        double  scaleX = 1.0;
-        double  scaleY = 1.0;
-        double  rotation = 0.0;          ///< 弧度
-        QString layer;
-        int     colCount = 1;
-        int     rowCount = 1;
-        double  colSpace = 0.0;
-        double  rowSpace = 0.0;
-    };
-
+    /// 一个块定义在读取期暂存的形态。
+    ///
+    /// 块引用（INSERT）此刻还不能变成 InsertEntity——它要指向的块定义可能出现在
+    /// 文件更靠后的位置（DWG 的对象流完全不保证顺序）。因此定义先攒起来，
+    /// 等全部读完（finish）再统一解析成 BlockDefinition + InsertEntity。
     struct BlockDef {
         QString name;
         Point2D base;
+        int     flags = 0;
         std::vector<std::unique_ptr<Entity>> entities;
-        std::vector<PendingInsert> inserts;
+        std::vector<std::unique_ptr<InsertEntity>> inserts;
+        std::vector<AttributeDefinition> attributeDefs;
     };
 
     /// 把图元放到正确的位置：块内 or 模型空间
     void place(std::unique_ptr<Entity> entity);
+    /// 记录一个块引用（先建 InsertEntity，块定义留到 finish 解析）
+    void noteInsert(const DRW_Insert& data, const DRW_Entity& source);
     void skip(const QString& type);
     /// 降级保留：实体换了形式但内容没丢（如 MTEXT 按单行文字导入），
     /// 与「跳过」分开计数——否则用户会以为文字被丢掉了。
@@ -342,25 +353,52 @@ private:
     std::unique_ptr<TextEntity> makeText(const DRW_Text& data, double rotationRadians);
     void applyHatchBoundary(const DRW_Hatch& data);
 
-    void expand(const PendingInsert& insert, const Transform2D& outer,
-                int depth, const QString& inheritedLayer);
-    void expandAll();
+    /// 读取收尾：把暂存的块定义装配进文档、解析块引用、汇总警告。
+    /// 把若干暂存的块引用接到文档（或某个块定义）上；解析不到定义的按缺失计数。
+    void attachInserts(std::vector<std::unique_ptr<InsertEntity>>&& inserts,
+                       const std::shared_ptr<BlockDefinition>& owner);
+    std::shared_ptr<BlockDefinition> resolveBlock(const QString& name);
+    /// 把 DWG 路径攒下的 ATTRIB 按「属主 + 标签」回填到对应块参照上
+    void attachPendingAttribs();
 
     Document& m_doc;
     Source    m_source;
 
-    std::map<QString, BlockDef> m_blocks;
-    BlockDef* m_currentBlock = nullptr;
+    std::map<QString, BlockDef> m_blocks;         ///< 归一化名 -> 定义
+    std::map<QString, std::shared_ptr<BlockDefinition>> m_resolvedBlocks;
+    /// 正在装配的块定义链（归一化名）。用于**掐断循环块引用**：A 里插 B、
+    /// B 里又插 A 时，InsertEntity 会持有对方的 shared_ptr，而对方又拥有这个
+    /// 块参照——引用计数永远降不到 0，整块定义连同它的图元一起泄漏。
+    /// 现实中的 CAD 会拒绝建立循环引用，但手改过或损坏的文件里存在这种结构。
+    std::vector<QString> m_resolveChain;
     std::map<duint32, QString> m_blockNameByHandle;
+    BlockDef* m_currentBlock = nullptr;           ///< 正在读取的块（模型空间为 null）
+    /// 正在读取一个**被忽略**的块（*Dnn 标注几何块）。它的图元要就地丢弃，
+    /// 不能因为「没有 currentBlock」而掉进模型空间——那会让标注的显示几何
+    /// 在图纸里多出一整套（实测某个 4 个标注的样图凭空多出 20 个图元）。
+    bool m_discardBlock = false;
 
-    std::vector<PendingInsert> m_modelInserts;
+    std::vector<std::unique_ptr<InsertEntity>> m_modelInserts;
+    /// 刚读到的块参照：紧随其后的 ATTRIB 都挂在它上面（DXF 路径）
+    InsertEntity* m_lastInsert = nullptr;
+
+    /// DWG 路径的 ATTRIB 是**独立对象**，不跟在 INSERT 后面，只能靠「同一个属主
+    /// （块记录）+ 标签命中该块的属性定义」回填。读取期块定义还没装配好（属性
+    /// 定义在 finish 才解析），所以先把它们攒起来，收尾时按标签逐条配对。
+    struct PendingAttrib {
+        Attribute attribute;
+        duint32   owner = 0;          ///< 所属块记录句柄
+    };
+    std::vector<PendingAttrib> m_pendingAttribs;
+    /// 属主句柄 -> 该空间里的块参照（按读取顺序）
+    std::map<duint32, std::vector<InsertEntity*>> m_insertsByOwner;
 
     QHash<QString, int> m_skipped;
     QHash<QString, int> m_downgraded;
     QString m_acadVersion;
     int m_missingBlocks = 0;
-    int m_depthExceeded = 0;
-    int m_expanded = 0;
+    int m_cyclicBlocks = 0;
+    int m_orphanAttribs = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -385,9 +423,12 @@ void Builder::applyCommon(Entity& entity, const DRW_Entity& source)
                                                    rgb & 0xFF)));
     } else if (source.color > 0 && source.color < aci::kByLayer) {
         entity.setColorIndex(source.color);
+    } else if (source.color == aci::kByBlock) {
+        // 0 = 随块：块内图元取块参照的颜色。必须如实保留，
+        // 否则块定义一旦被不同颜色的块参照引用，整块颜色就都错了。
+        entity.setColorByBlock();
     } else {
-        // 256 = 随层；0 = 随块，本软件无此概念，按随层处理
-        entity.setColorByLayer();
+        entity.setColorByLayer();     // 256 = 随层
     }
 
     // ---- 线型 ----------------------------------------------------------------
@@ -409,6 +450,9 @@ void Builder::applyCommon(Entity& entity, const DRW_Entity& source)
 
 void Builder::place(std::unique_ptr<Entity> entity)
 {
+    // 只有紧跟在 INSERT 之后的 ATTRIB 属于那个块参照。这里清掉「刚读到的块参照」，
+    // 于是中间夹了任何别的实体时，后面的 ATTRIB 不会被错挂到上一个块参照上。
+    m_lastInsert = nullptr;
     if (!entity) return;
 
     // 坐标体检：二进制格式里读错一个字节就能造出 1e100 这种坐标，混进来会把
@@ -438,6 +482,7 @@ void Builder::place(std::unique_ptr<Entity> entity)
         return;
     }
 
+    if (m_discardBlock) return;      // 被忽略的块（*Dnn）：内容一概不留
     if (m_currentBlock) {
         m_currentBlock->entities.push_back(std::move(entity));
     } else {
@@ -550,24 +595,41 @@ void Builder::addTextStyle(const DRW_Textstyle& data)
 
 // -----------------------------------------------------------------------------
 //  块
+//
+//  块定义**不展开**：定义原样收集进 BlockDef，块引用建成 InsertEntity 并指向
+//  对应定义（引用语义）。这样文件往返后 BLOCKS 段与 INSERT 都还在原处，
+//  分解（EXPLODE）由用户在需要时显式触发。
 // -----------------------------------------------------------------------------
 void Builder::addBlock(const DRW_Block& data)
 {
     const QString name = toQString(data.name);
     if (name.isEmpty()) return;
 
-    // 模型空间 / 图纸空间是容器，不收集；其余块（含 *U、*D1 等匿名块）正常收集。
-    // 尺寸标注的几何块、EDA 工具导出的匿名块都属于后者，丢掉它们会让图元消失。
+    // 模型空间 / 图纸空间是容器，不是块定义；它们的内容由读取器直接按实体流回调。
+    // 其余块（含 *U、*D1 等匿名块）都是真正的定义。
     if (isSpaceBlock(name)) {
         m_currentBlock = nullptr;
+        m_discardBlock = false;
         m_blockNameByHandle[data.handle] = name;
         return;
     }
 
-    BlockDef& block = m_blocks[name];
+    // 尺寸标注的匿名几何块（*Dnn）仅作显示用途——本软件按定义点重推导标注几何，
+    // 收下它们只会在写出时与重新生成的匿名块重名，其内容因此整块丢弃。
+    if (isDimensionBlock(name)) {
+        m_currentBlock = nullptr;
+        m_discardBlock = true;
+        m_blockNameByHandle[data.handle] = name;
+        return;
+    }
+
+    const QString key = BlockTable::normalizedKey(name);
+    BlockDef& block = m_blocks[key];
     block.name = name;
     block.base = toPoint(data.basePoint);
+    block.flags = data.flags;
     m_currentBlock = &block;
+    m_discardBlock = false;
     m_blockNameByHandle[data.handle] = name;
 }
 
@@ -575,38 +637,121 @@ void Builder::setBlock(const int handle)
 {
     // DWG 路径用句柄切换当前块；句柄未知或为 0 表示回到模型空间。
     const auto it = m_blockNameByHandle.find(handle);
-    if (it == m_blockNameByHandle.end() || isSpaceBlock(it->second)) {
+    if (it == m_blockNameByHandle.end() || isSpaceBlock(it->second)
+        || isDimensionBlock(it->second)) {
         m_currentBlock = nullptr;
+        m_discardBlock = (it != m_blockNameByHandle.end()) && isDimensionBlock(it->second);
         return;
     }
 
-    const auto block = m_blocks.find(it->second);
+    const auto block = m_blocks.find(BlockTable::normalizedKey(it->second));
     m_currentBlock = (block == m_blocks.end()) ? nullptr : &block->second;
+    m_discardBlock = false;
 }
 
 void Builder::endBlock()
 {
     m_currentBlock = nullptr;
+    m_discardBlock = false;
+}
+
+void Builder::addAttdef(const DRW_Attdef& data)
+{
+    // ATTDEF 只在块定义里有意义：它是块参照上待填的文字占位符，本身不作为
+    // 几何绘制。混进图元列表会让每次插入都多画一遍占位文字。
+    if (m_discardBlock) return;      // 被忽略的块：内容一概不留
+    if (!m_currentBlock) {
+        skip(QStringLiteral("ATTDEF(块定义之外)"));
+        return;
+    }
+
+    AttributeDefinition definition;
+    definition.tag = toQString(data.tag).trimmed();
+    definition.prompt = toQString(data.prompt);
+    definition.defaultValue = toQString(data.text);
+    definition.position = toPoint(data.basePoint);
+    definition.height = data.height;
+    definition.rotation = textRotationRadians(data, m_source);
+    definition.style = toQString(data.style);
+    definition.flags = data.flags;
+    if (definition.tag.isEmpty()) return;
+
+    m_currentBlock->attributeDefs.push_back(definition);
+}
+
+void Builder::addAttrib(const DRW_Attrib& data)
+{
+    Attribute attribute;
+    attribute.tag = toQString(data.tag).trimmed();
+    attribute.value = toQString(data.text);
+    attribute.position = toPoint(data.basePoint);
+    attribute.height = data.height;
+    attribute.rotation = textRotationRadians(data, m_source);
+    attribute.style = toQString(data.style);
+    attribute.flags = data.flags;
+    attribute.layer = toQString(data.layer);
+    if (attribute.tag.isEmpty()) return;
+
+    // DXF：ATTRIB 紧跟在它的 INSERT 之后（libdxfrw 的 processInsert 会把随后的
+    // ATTRIB 读完再返回），直接挂到刚读到的那个块参照上。
+    if (m_lastInsert) {
+        m_lastInsert->attributes().push_back(attribute);
+        return;
+    }
+
+    // DWG：ATTRIB 是独立对象，与 INSERT 之间没有顺序关系，只能收尾时按属主配对。
+    if (m_source == Source::Dwg) {
+        m_pendingAttribs.push_back(PendingAttrib{ attribute, data.parentHandle });
+        return;
+    }
+
+    skip(QStringLiteral("ATTRIB(前无块参照)"));
 }
 
 void Builder::addInsert(const DRW_Insert& data)
 {
-    PendingInsert insert;
-    insert.blockName = toQString(data.name);
-    insert.point     = toPoint(data.basePoint);
-    insert.scaleX    = (data.xscale == 0.0) ? 1.0 : data.xscale;
-    insert.scaleY    = (data.yscale == 0.0) ? 1.0 : data.yscale;
-    insert.rotation  = data.angle;            // 两条路径都是弧度
-    insert.layer     = toQString(data.layer);
-    insert.colCount  = std::max(1, data.colcount);
-    insert.rowCount  = std::max(1, data.rowcount);
-    insert.colSpace  = data.colspace;
-    insert.rowSpace  = data.rowspace;
+    noteInsert(data, data);
+}
 
-    if (insert.blockName.isEmpty()) return;
+void Builder::noteInsert(const DRW_Insert& data, const DRW_Entity& source)
+{
+    const QString name = toQString(data.name);
+    if (name.isEmpty()) return;
 
-    if (m_currentBlock) m_currentBlock->inserts.push_back(insert);
-    else                m_modelInserts.push_back(insert);
+    // 插入点的坐标体检。块内图元在各自读入时已经查过，这里只需盯住插入点：
+    // 它把整块平移到哪里，决定了这块内容会不会落到天文数字上去。
+    const Point2D point = toPoint(data.basePoint);
+    if (!std::isfinite(point.x) || !std::isfinite(point.y)
+        || std::abs(point.x) > kMaxCoordinate || std::abs(point.y) > kMaxCoordinate) {
+        skip(QStringLiteral("INSERT(坐标超出范围)"));
+        return;
+    }
+
+    auto insert = std::make_unique<InsertEntity>();
+    insert->setBlockName(name);
+    insert->setInsertionPoint(point);
+    insert->setScale((data.xscale == 0.0) ? 1.0 : data.xscale,
+                     (data.yscale == 0.0) ? 1.0 : data.yscale,
+                     (data.zscale == 0.0) ? 1.0 : data.zscale);
+    insert->setRotation(data.angle);            // 两条路径都是弧度
+    insert->setColumnCount(data.colcount);
+    insert->setRowCount(data.rowcount);
+    insert->setColumnSpacing(data.colspace);
+    insert->setRowSpacing(data.rowspace);
+    applyCommon(*insert, source);
+
+    if (m_discardBlock) {            // 被忽略的块：内容一概不留
+        m_lastInsert = nullptr;
+        return;
+    }
+
+    m_lastInsert = insert.get();
+    if (m_source == Source::Dwg) {
+        m_insertsByOwner[source.parentHandle].push_back(insert.get());
+    }
+
+    if (m_currentBlock) m_currentBlock->inserts.push_back(std::move(insert));
+    else                m_modelInserts.push_back(std::move(insert));
 }
 
 // -----------------------------------------------------------------------------
@@ -1274,66 +1419,115 @@ void Builder::addDimDiametric(const DRW_DimDiametric* data)
 }
 
 // -----------------------------------------------------------------------------
-//  块引用展开
+//  块定义装配
+//
+//  读取期只把定义暂存在 BlockDef 里，块引用是「没有定义的 InsertEntity」。
+//  这里一次性把它们接上：块引用可以出现在定义之前（DWG 的对象流完全不保证
+//  顺序），也可以嵌套，所以必须等全部读完再解析。
 // -----------------------------------------------------------------------------
-void Builder::expand(const PendingInsert& insert, const Transform2D& outer,
-                     int depth, const QString& inheritedLayer)
+std::shared_ptr<BlockDefinition> Builder::resolveBlock(const QString& name)
 {
-    if (depth > kMaxBlockDepth) {
-        ++m_depthExceeded;
-        return;
+    const QString key = BlockTable::normalizedKey(name);
+    const auto it = m_blocks.find(key);
+    if (it == m_blocks.end()) return nullptr;
+
+    // 同一个定义只装配一次：块内的 InsertEntity 必须共享同一份定义对象，
+    // 否则「改一处定义、所有引用同步」的语义就没了。
+    const auto cached = m_resolvedBlocks.find(key);
+    if (cached != m_resolvedBlocks.end()) return cached->second;
+
+    BlockDef& def = it->second;
+    auto block = std::make_shared<BlockDefinition>(def.name);
+    block->setBasePoint(def.base);
+    block->setFlags(def.flags);
+    for (const AttributeDefinition& attributeDef : def.attributeDefs) {
+        block->addAttributeDefinition(attributeDef);
     }
-
-    const auto it = m_blocks.find(insert.blockName);
-    if (it == m_blocks.end()) {
-        ++m_missingBlocks;
-        return;
+    for (std::unique_ptr<Entity>& entity : def.entities) {
+        block->addEntity(std::move(entity));
     }
+    def.entities.clear();
 
-    // 块内位于 "0" 层的图元继承 INSERT 所在图层（DXF 标准语义）
-    const QString insertLayer =
-        ((insert.layer.isEmpty() || insert.layer == QLatin1String("0")) && !inheritedLayer.isEmpty())
-            ? inheritedLayer
-            : insert.layer;
+    // 先登记再递归：自引用块（A 里插 A）会在这里再次查到自己，
+    // 拿到的是同一个定义对象，因而不会无限递归地新建定义。
+    m_resolvedBlocks.emplace(key, block);
 
-    const BlockDef& block = it->second;
+    std::vector<std::unique_ptr<InsertEntity>> nested = std::move(def.inserts);
+    def.inserts.clear();
 
-    for (int row = 0; row < insert.rowCount; ++row) {
-        for (int col = 0; col < insert.colCount; ++col) {
-            const Point2D offset(col * insert.colSpace, row * insert.rowSpace);
+    // 装配期间把「当前正在装配的定义」记进链上：链上已有的名字再被引用就是
+    // 循环，必须断开（见 m_resolveChain 的说明）。
+    m_resolveChain.push_back(key);
+    attachInserts(std::move(nested), block);
+    m_resolveChain.pop_back();
+    return block;
+}
 
-            // 块内坐标 -> 世界坐标：平移到块基点、缩放、旋转，最后平移到插入点
-            const Transform2D local =
-                Transform2D::translation(insert.point.x + offset.x,
-                                         insert.point.y + offset.y)
-                * Transform2D::rotation(insert.rotation)
-                * Transform2D::scaling(insert.scaleX, insert.scaleY)
-                * Transform2D::translation(-block.base.x, -block.base.y);
-            const Transform2D combined = outer * local;
+void Builder::attachInserts(std::vector<std::unique_ptr<InsertEntity>>&& inserts,
+                            const std::shared_ptr<BlockDefinition>& owner)
+{
+    for (std::unique_ptr<InsertEntity>& insert : inserts) {
+        if (!insert) continue;
 
-            for (const std::unique_ptr<Entity>& source : block.entities) {
-                auto copy = source->clone();
-                if (copy->layerName() == QLatin1String("0") && !insertLayer.isEmpty()) {
-                    copy->setLayerName(insertLayer);
-                }
-                copy->transform(combined);
-                m_doc.addEntity(std::move(copy));
-                ++m_expanded;
-            }
-
-            for (const PendingInsert& nested : block.inserts) {
-                expand(nested, combined, depth + 1, insertLayer);
-            }
+        // 循环引用：目标块正在装配链上。断开而不是连上——连上会让两者互相
+        // 持有 shared_ptr，谁都不会被释放。
+        const QString target = BlockTable::normalizedKey(insert->blockName());
+        if (!target.isEmpty()
+            && std::find(m_resolveChain.begin(), m_resolveChain.end(), target)
+                   != m_resolveChain.end()) {
+            ++m_cyclicBlocks;
+            continue;
         }
+
+        std::shared_ptr<BlockDefinition> block = resolveBlock(insert->blockName());
+        if (!block) {
+            // 引用的块未定义：写回去会变成悬空引用（AutoCAD 打开时报警），
+            // 因此不保留这个块参照，只在导入警告里如实计数。
+            ++m_missingBlocks;
+            continue;
+        }
+
+        insert->setBlock(block);       // 顺带按属性定义补齐缺失的 ATTRIB
+        if (owner) owner->addEntity(std::move(insert));
+        else       m_doc.addEntity(std::move(insert));
     }
 }
 
-void Builder::expandAll()
+void Builder::attachPendingAttribs()
 {
-    for (const PendingInsert& insert : m_modelInserts) {
-        expand(insert, Transform2D::identity(), 0, QString());
+    // 同一个属主下、同一个标签的第 k 条 ATTRIB，配给第 k 个「块定义里有这个
+    // 标签」的块参照。单块参照（最常见）时就是全部给它；多个同块参照时按
+    // 读取顺序依次铺开，不会出现「所有属性都堆到第一个块参照上」。
+    std::map<duint32, std::map<QString, std::size_t>> assigned;
+
+    for (const PendingAttrib& pending : m_pendingAttribs) {
+        const auto ownerIt = m_insertsByOwner.find(pending.owner);
+        if (ownerIt == m_insertsByOwner.end()) {
+            ++m_orphanAttribs;
+            continue;
+        }
+
+        const QString tag = pending.attribute.tag;
+        std::size_t& index = assigned[pending.owner][BlockTable::normalizedKey(tag)];
+
+        bool placed = false;
+        std::size_t seen = 0;
+        for (InsertEntity* insert : ownerIt->second) {
+            if (!insert || !insert->hasBlock()) continue;
+            if (!insert->block()->findAttributeDefinition(tag)) continue;
+            if (seen++ < index) continue;
+
+            insert->setAttribute(pending.attribute);
+            ++index;
+            placed = true;
+            break;
+        }
+
+        if (!placed) ++m_orphanAttribs;
     }
-    m_modelInserts.clear();
+
+    m_pendingAttribs.clear();
+    m_insertsByOwner.clear();
 }
 
 // -----------------------------------------------------------------------------
@@ -1341,14 +1535,28 @@ void Builder::expandAll()
 // -----------------------------------------------------------------------------
 void Builder::finish()
 {
-    // 必须等全部读完再展开：块定义可能在引用之后才出现（DWG 的对象流不保证顺序）
-    expandAll();
+    // 块定义与块引用可能相互穿插（DWG 的对象流完全不保证顺序），
+    // 因此必须等全部读完再统一解析。
+    for (auto& [key, def] : m_blocks) {
+        Q_UNUSED(key);
+        const std::shared_ptr<BlockDefinition> block = resolveBlock(def.name);
+        if (block) m_doc.blocks().add(block);
+    }
 
+    attachInserts(std::move(m_modelInserts), nullptr);
+    m_modelInserts.clear();
+
+    // 块引用都装配好之后，DWG 路径攒下的 ATTRIB 才有定义可对齐
+    attachPendingAttribs();
+
+    if (m_orphanAttribs > 0) {
+        m_skipped[QStringLiteral("ATTRIB(找不到所属块参照)")] = m_orphanAttribs;
+    }
     if (m_missingBlocks > 0) {
         m_skipped[QStringLiteral("INSERT(引用的块未定义)")] = m_missingBlocks;
     }
-    if (m_depthExceeded > 0) {
-        m_skipped[QStringLiteral("INSERT(嵌套过深，已截断)")] = m_depthExceeded;
+    if (m_cyclicBlocks > 0) {
+        m_skipped[QStringLiteral("INSERT(循环引用，已断开)")] = m_cyclicBlocks;
     }
 }
 
@@ -1445,15 +1653,15 @@ void applyEdaLayerColorHeuristic(Document& document, IoResult* result)
 
 } // namespace
 
-IoResult buildResult(Document& document, Builder& builder, int expanded,
+IoResult buildResult(Document& document, Builder& builder,
                      const QString& versionNote)
 {
     IoResult result = IoResult::success(document.entityCount());
 
     if (!versionNote.isEmpty()) result.addWarning(versionNote);
-    if (expanded > 0) {
-        result.addWarning(QStringLiteral("块引用已展开为独立图元（本软件不建模块定义，"
-                                         "共 %1 个图元）").arg(expanded));
+    if (builder.blockCount() > 0) {
+        result.addWarning(QStringLiteral("保留块定义 %1 个（块参照不再展开，可用 分解(EXPLODE) 打散）")
+                              .arg(builder.blockCount()));
     }
 
     // 降级保留的（换了形式但内容在）与真正跳过的分开报，避免误导
@@ -1480,6 +1688,9 @@ IoResult readDwgWithLibDxfRw(const QString& path, Document& document)
     document.beginBatchLoad();
 
     dwgR reader(native.constData());
+    // 开发者开关：DWG 的字段序无法从接口看出，只能与同一张图的 DXF 逐字段对照
+    // 来定标（新增实体类型时就是这么做的）。置 LYCAD_DWG_DEBUG=1 打开逐字段输出。
+    if (qEnvironmentVariableIsSet("LYCAD_DWG_DEBUG")) reader.setDebug(DRW::DEBUG);
     Builder builder(document, Builder::Source::Dwg);
     const bool ok = reader.read(&builder, false);
     builder.finish();
@@ -1497,7 +1708,7 @@ IoResult readDwgWithLibDxfRw(const QString& path, Document& document)
 
     // 版本信息不在这里报：调用方（DwgCodec）会给出带可读名称的版本说明，
     // 两处都报会让同一条信息在界面上出现两次。
-    IoResult result = buildResult(document, builder, builder.expandedCount(), QString());
+    IoResult result = buildResult(document, builder, QString());
     document.markClean();
 
     // 图层可能被批量改写，统一通知一次
@@ -1523,8 +1734,7 @@ IoResult readDxfWithLibDxfRw(const QString& path, Document& document)
         return IoResult::failure(QStringLiteral("DXF 解析失败（libdxfrw）。"));
     }
 
-    IoResult result = buildResult(document, builder, builder.expandedCount(),
-                                  QStringLiteral("由 libdxfrw 读取"));
+    IoResult result = buildResult(document, builder, QStringLiteral("由 libdxfrw 读取"));
     if (!builder.acadVersion().isEmpty()) {
         result.addWarning(QStringLiteral("源文件版本 %1").arg(builder.acadVersion()));
     }
@@ -1620,6 +1830,38 @@ public:
 
     void setDxfRw(RW* rw) { m_rw = rw; }
 
+    /// 预扫描：把文档实际引用到的块定义收集起来，并给每个定一个**文件内唯一**的名字。
+    ///
+    /// 必须遍历 referencedBlocks 而不是 blocks().all()：块参照在非相似变换下会把
+    /// 几何烘焙进一份不在块表里的私有定义，只遍历表会把那些内容整块丢掉。
+    /// 名字唯一化也不能改块定义本身（文档是 const 的，改了还会影响其它引用），
+    /// 因此在写出侧维护一张「定义 -> 文件名」的映射。
+    void prescanBlocks()
+    {
+        QSet<QString> used;
+        const std::vector<std::shared_ptr<BlockDefinition>> blocks = m_doc.referencedBlocks();
+        for (const std::shared_ptr<BlockDefinition>& block : blocks) {
+            if (!block) continue;
+
+            QString name = block->name().trimmed();
+            if (name.isEmpty()) name = QStringLiteral("*U%1").arg(m_blockOrder.size() + 1);
+
+            if (used.contains(BlockTable::normalizedKey(name))) {
+                for (int i = 2;; ++i) {
+                    const QString candidate = name + QString::number(i);
+                    if (!used.contains(BlockTable::normalizedKey(candidate))) {
+                        name = candidate;
+                        break;
+                    }
+                }
+            }
+
+            used.insert(BlockTable::normalizedKey(name));
+            m_blockWriteNames.emplace(block.get(), name.toStdString());
+            m_blockOrder.push_back(block);
+        }
+    }
+
     /// 预扫描：为每个尺寸标注分配匿名块名（*D1、*D2……）
     void prescanDimensionBlocks()
     {
@@ -1656,6 +1898,8 @@ public:
     void addSpline(const DRW_Spline*) override {}
     void addKnot(const DRW_Entity&) override {}
     void addInsert(const DRW_Insert&) override {}
+    void addAttdef(const DRW_Attdef&) override {}
+    void addAttrib(const DRW_Attrib&) override {}
     void addTrace(const DRW_Trace&) override {}
     void add3dFace(const DRW_3Dface&) override {}
     void addSolid(const DRW_Solid&) override {}
@@ -1874,9 +2118,13 @@ public:
         m_rw->writeVport(&viewport);
     }
 
-    /// R2000 及以上的 BLOCK_RECORD 表：每个匿名块都要在此登记，写出块体时才能对上句柄
+    /// R2000 及以上的 BLOCK_RECORD 表：每个块都要在此登记，写出块体时才能对上句柄。
+    /// 顺序必须与 writeBlocks 完全一致（库按写入次序分配句柄，块体写出时按名字查表）。
     void writeBlockRecords() override
     {
+        for (const std::shared_ptr<BlockDefinition>& block : m_blockOrder) {
+            m_rw->writeBlockRecord(blockNameOf(block));
+        }
         for (const auto& [id, blockName] : m_dimBlocks) {
             Q_UNUSED(id);
             m_rw->writeBlockRecord(blockName);
@@ -1885,6 +2133,9 @@ public:
 
     void writeBlocks() override
     {
+        for (const std::shared_ptr<BlockDefinition>& block : m_blockOrder) {
+            writeBlockDefinition(block);
+        }
         for (const auto& [id, blockName] : m_dimBlocks) {
             Q_UNUSED(id);
             writeDimensionBlock(blockName);
@@ -1896,22 +2147,141 @@ public:
         for (EntityId id : m_doc.drawOrder()) {
             const Entity* entity = m_doc.entity(id);
             if (!entity) continue;
-            switch (entity->type()) {
-            case EntityType::Line:      writeLine(*static_cast<const LineEntity*>(entity)); break;
-            case EntityType::Circle:    writeCircle(*static_cast<const CircleEntity*>(entity)); break;
-            case EntityType::Arc:       writeArc(*static_cast<const ArcEntity*>(entity)); break;
-            case EntityType::Polyline:  writePolyline(*static_cast<const PolylineEntity*>(entity)); break;
-            case EntityType::Point:     writePoint(*static_cast<const PointEntity*>(entity)); break;
-            case EntityType::Text:      writeText(*static_cast<const TextEntity*>(entity)); break;
-            case EntityType::Hatch:     writeHatch(*static_cast<const HatchEntity*>(entity)); break;
-            case EntityType::Dimension: writeDimension(*static_cast<const DimensionEntity*>(entity)); break;
-            case EntityType::Spline:    writeSplineCurve(*static_cast<const SplineEntity*>(entity)); break;
-            case EntityType::Ellipse:   writeEllipseCurve(*static_cast<const EllipseEntity*>(entity)); break;
-            case EntityType::XLine:     writeXLine(*static_cast<const XLineEntity*>(entity)); break;
-            case EntityType::Ray:       writeRay(*static_cast<const RayEntity*>(entity)); break;
-            default: break;
+            writeEntity(*entity);
+        }
+    }
+
+private:
+    /// 单个图元写出——模型空间与块内**共用同一条分发**。
+    /// 分开写两份 switch 意味着「块内的标注/多段线写法与模型空间不同」这种
+    /// 缺陷不会有任何编译错误提示，只会体现在文件里。
+    void writeEntity(const Entity& entity)
+    {
+        switch (entity.type()) {
+        case EntityType::Line:      writeLine(static_cast<const LineEntity&>(entity)); break;
+        case EntityType::Circle:    writeCircle(static_cast<const CircleEntity&>(entity)); break;
+        case EntityType::Arc:       writeArc(static_cast<const ArcEntity&>(entity)); break;
+        case EntityType::Polyline:  writePolyline(static_cast<const PolylineEntity&>(entity)); break;
+        case EntityType::Point:     writePoint(static_cast<const PointEntity&>(entity)); break;
+        case EntityType::Text:      writeText(static_cast<const TextEntity&>(entity)); break;
+        case EntityType::Hatch:     writeHatch(static_cast<const HatchEntity&>(entity)); break;
+        case EntityType::Dimension: writeDimension(static_cast<const DimensionEntity&>(entity)); break;
+        case EntityType::Spline:    writeSplineCurve(static_cast<const SplineEntity&>(entity)); break;
+        case EntityType::Ellipse:   writeEllipseCurve(static_cast<const EllipseEntity&>(entity)); break;
+        case EntityType::XLine:     writeXLine(static_cast<const XLineEntity&>(entity)); break;
+        case EntityType::Ray:       writeRay(static_cast<const RayEntity&>(entity)); break;
+        case EntityType::Insert:    writeInsert(static_cast<const InsertEntity&>(entity)); break;
+        }
+    }
+
+    void writeBlockDefinition(const std::shared_ptr<BlockDefinition>& block)
+    {
+        if (!block) return;
+
+        DRW_Block record;
+        record.name = blockNameOf(block);
+        record.flags = block->flags();
+        applyCoord(record.basePoint, block->basePoint());
+        m_rw->writeBlock(&record);
+
+        // 属性定义（ATTDEF）不是几何，但它是块定义的一部分：不写回去，块参照
+        // 就再也不知道自己该有哪些属性，往返一次属性块就退化成普通块。
+        {
+            for (const AttributeDefinition& definition : block->attributeDefinitions()) {
+                DRW_Attdef record;
+                record.layer = "0";
+                record.color = 0;                 // ByBlock：随块参照着色
+                record.lineType = "ByLayer";
+                record.lWeight = DRW_LW_Conv::dxfInt2lineWidth(-3);
+                record.visible = !definition.isInvisible();
+                applyCoord(record.basePoint, definition.position);
+                applyCoord(record.secPoint, definition.position);
+                record.text = definition.defaultValue.toStdString();
+                record.prompt = definition.prompt.toStdString();
+                record.tag = definition.tag.toStdString();
+                record.flags = definition.flags;
+                record.height = definition.height;
+                record.angle = definition.rotation * kRadToDeg;   // DRW_Text 的 50 组码按度
+                record.style = (definition.style.isEmpty() ? QStringLiteral("Standard")
+                                                           : definition.style)
+                                   .toStdString();
+                m_rw->writeAttdef(&record);
             }
         }
+
+        // 块内图元按原图层/颜色写出——**不做**图层继承换算：继承是块参照在
+        // 展开时的事（InsertEntity::collectInto），文件里要保留 0 层的原始归属。
+        for (const std::unique_ptr<Entity>& entity : block->entities()) {
+            if (entity) writeEntity(*entity);
+        }
+    }
+
+    /// 块定义 -> 写出用的名字。名字在预扫描时定好并做过唯一化，
+    /// 这里不能临时用 block->name()：两份匿名副本可能恰好同名。
+    const std::string& blockNameOf(const std::shared_ptr<BlockDefinition>& block) const
+    {
+        static const std::string kEmpty;
+        if (!block) return kEmpty;
+        const auto it = m_blockWriteNames.find(block.get());
+        return it == m_blockWriteNames.end() ? kEmpty : it->second;
+    }
+
+    /// 块参照（INSERT）。带属性时还要写出 66=1、随后若干 ATTRIB 与 SEQEND，
+    /// 否则 AutoCAD 会把属性文字整段丢掉。
+    void writeInsert(const InsertEntity& insert)
+    {
+        const std::string name = blockNameOf(insert.block());
+        if (name.empty()) return;      // 块未定义：写出去就是悬空引用
+
+        const bool hasAttributes = !insert.attributes().empty();
+
+        DRW_Insert record;
+        applyCommonWrite(record, insert);
+        record.name = name;
+        record.hasAttribs = hasAttributes;
+        // DWG 的 INSERT 必须在写出时就填好 first_attrib / last_attrib / seqend 三个
+        // 句柄，句柄得按条数提前分配——所以条数要在写 INSERT 之前交出去。
+        record.attribCount = static_cast<int>(insert.attributes().size());
+        applyCoord(record.basePoint, insert.insertionPoint());
+        record.xscale = insert.scaleX();
+        record.yscale = insert.scaleY();
+        record.zscale = insert.scaleZ();
+        // DRW_Insert::angle 的约定与其它实体不同：**弧度**。
+        // 读侧 parseCode 收 50 组码后除以 ARAD 得弧度，写侧 dxfRW::writeInsert
+        // 再乘 ARAD 还原成度——转换在库里做完了，这里若再乘一次 kRadToDeg，
+        // 往返一次旋转就变成「度当弧度用」（实测 311.34° 变成 198.69°）。
+        record.angle = insert.rotation();
+        record.colcount = insert.columnCount();
+        record.rowcount = insert.rowCount();
+        record.colspace = insert.columnSpacing();
+        record.rowspace = insert.rowSpacing();
+        m_rw->writeInsert(&record);
+
+        if (!hasAttributes) return;
+
+        // 属性条数必须与 attribCount 严格一致（DWG 的句柄是照这个数预分配的，
+        // 少写一条就会留下一个悬空句柄），因此空值也照写。
+        for (const Attribute& attribute : insert.attributes()) {
+            DRW_Attrib attrib;
+            attrib.layer = (attribute.layer.isEmpty() ? insert.layerName() : attribute.layer)
+                               .toStdString();
+            attrib.color = insert.isColorByLayer() ? 256 : insert.colorIndex();
+            attrib.lineType = "ByLayer";
+            attrib.lWeight = DRW_LW_Conv::dxfInt2lineWidth(-3);
+            attrib.visible = !attribute.isInvisible();
+            applyCoord(attrib.basePoint, attribute.position);
+            applyCoord(attrib.secPoint, attribute.position);
+            attrib.text = attribute.value.toStdString();
+            attrib.height = attribute.height;
+            attrib.angle = attribute.rotation * kRadToDeg;
+            attrib.style = (attribute.style.isEmpty() ? QStringLiteral("Standard")
+                                                      : attribute.style)
+                               .toStdString();
+            attrib.tag = attribute.tag.toStdString();
+            attrib.flags = attribute.flags;
+            m_rw->writeAttrib(&attrib);
+        }
+        m_rw->writeSeqEnd(&record);
     }
 
 private:
@@ -2293,12 +2663,18 @@ private:
         return m_extents;
     }
 
+    /// 写出目标是否为 DWG（dwgW）。属性对象只在 DXF 写出端存在。
+    static constexpr bool kIsDwgWriter = std::is_same_v<RW, dwgW>;
+
     const Document& m_doc;
     RW* m_rw = nullptr;
     DRW::Version m_version = DRW::AC1015;
     /// 目标版本的 DXF 文本是否按 UTF-8 存放（AC1021 及以后为真）
     bool m_utf8Text = false;
     std::map<EntityId, std::string> m_dimBlocks;
+    /// 参与写出的块定义（文档引用的 + 块表里的），以及它们在文件里的名字
+    std::vector<std::shared_ptr<BlockDefinition>> m_blockOrder;
+    std::map<const BlockDefinition*, std::string> m_blockWriteNames;
     Box2D m_extents;
     bool m_extentsReady = false;
 };
@@ -2320,6 +2696,7 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
     if (version == DRW::UNKNOWNV) version = DRW::AC1015;
 
     Exporter exporter(document, version);
+    exporter.prescanBlocks();
     exporter.prescanDimensionBlocks();
 
     const QByteArray native = QFile::encodeName(path);
@@ -2343,6 +2720,7 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
     Q_UNUSED(options.version);              // DWG 写出固定 AC1015，不随选项变化
 
     ExporterBase<dwgW> exporter(document, DRW::AC1015);
+    exporter.prescanBlocks();
     exporter.prescanDimensionBlocks();
 
     const QByteArray native = QFile::encodeName(path);

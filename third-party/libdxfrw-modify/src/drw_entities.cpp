@@ -1326,12 +1326,124 @@ void DRW_Text::parseCode(int code, dxfReader *reader){
     }
 }
 
+// ============================================================================
+//  ATTDEF / ATTRIB
+//
+//  DXF 组码：ATTRIB 的 73 是「字段长度」而 74 才是垂直对齐——与 TEXT 的
+//  73=垂直对齐**不同义**。因此这两个码必须在子类里截住，不能透传给
+//  DRW_Text::parseCode，否则垂直对齐会被字段长度覆盖。
+// ============================================================================
+void DRW_Attdef::parseCode(int code, dxfReader *reader){
+    switch (code) {
+    case 2:
+        tag = reader->getUtf8String();
+        break;
+    case 3:
+        prompt = reader->getUtf8String();
+        break;
+    case 70:
+        flags = reader->getInt32();
+        break;
+    case 73:                    /* 字段长度：本库不建模，读出即丢 */
+        (void)reader->getInt32();
+        break;
+    case 74:
+        alignV = (VAlign)reader->getInt32();
+        break;
+    default:
+        DRW_Text::parseCode(code, reader);
+        break;
+    }
+}
+
+bool DRW_Attdef::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
+    dwgBuffer sBuff = *buf;
+    dwgBuffer *sBuf = buf;
+    if (version > DRW::AC1018) {//2007+
+        sBuf = &sBuff; //separate buffer for strings
+    }
+    if (!parseDwgTextData(version, buf, sBuf, bs)) return false;
+
+    // 属性专属尾部。顺序依 libredwg dwg.spec 的 ATTDEF（R2000 分支，非 DXF 侧）：
+    //   标签 T → 字段长度 BS → 标志 RC → 提示 T
+    // 这里有个陷阱：**标志是 RC（1 字节），不是 BS**，而且它前面还有一个字段长度。
+    // 少了这两步，句柄流会整体错位、buf->isGood() 为假。实测一张 AutoCAD 2000
+    // 图纸：标签 ETIKEDO、标志 0、提示 invitilo、默认值 valoro、插入点
+    // (-289.217687, -218.054561)、字高 100 —— 与同一张图的 DXF 逐个对上。
+    tag = sBuf->getVariableText(version, false);
+    (void)buf->getBitShort();                        /* field_length（73），不建模 */
+    flags = buf->getRawChar8();                      /* RC，见上 */
+    if (version > DRW::AC1014) {//2000+
+        prompt = sBuf->getVariableText(version, false);
+    }
+    DRW_DBG("ATTDEF tag: "); DRW_DBG(tag.c_str());
+    DRW_DBG(", flags: "); DRW_DBG(flags);
+    DRW_DBG(", prompt: "); DRW_DBG(prompt.c_str()); DRW_DBG("\n");
+
+    if (!DRW_Entity::parseDwgEntHandle(version, buf)) return false;
+    styleH = buf->getHandle(); /* H 7 STYLE (hard pointer) */
+    return buf->isGood();
+}
+
+void DRW_Attrib::parseCode(int code, dxfReader *reader){
+    switch (code) {
+    case 2:
+        tag = reader->getUtf8String();
+        break;
+    case 70:
+        flags = reader->getInt32();
+        break;
+    case 73:                    /* 字段长度：本库不建模，读出即丢 */
+        (void)reader->getInt32();
+        break;
+    case 74:
+        alignV = (VAlign)reader->getInt32();
+        break;
+    default:
+        DRW_Text::parseCode(code, reader);
+        break;
+    }
+}
+
+bool DRW_Attrib::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
+    dwgBuffer sBuff = *buf;
+    dwgBuffer *sBuf = buf;
+    if (version > DRW::AC1018) {//2007+
+        sBuf = &sBuff; //separate buffer for strings
+    }
+    if (!parseDwgTextData(version, buf, sBuf, bs)) return false;
+
+    // 尾部与 ATTDEF 同构，只少最后那个提示串：
+    //   标签 T → 字段长度 BS → 标志 RC
+    tag = sBuf->getVariableText(version, false);
+    (void)buf->getBitShort();                        /* field_length（73），不建模 */
+    flags = buf->getRawChar8();                      /* RC */
+    DRW_DBG("ATTRIB tag: "); DRW_DBG(tag.c_str());
+    DRW_DBG(", flags: "); DRW_DBG(flags); DRW_DBG("\n");
+
+    if (!DRW_Entity::parseDwgEntHandle(version, buf)) return false;
+    styleH = buf->getHandle(); /* H 7 STYLE (hard pointer) */
+    return buf->isGood();
+}
+
 bool DRW_Text::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     dwgBuffer sBuff = *buf;
     dwgBuffer *sBuf = buf;
     if (version > DRW::AC1018) {//2007+
         sBuf = &sBuff; //separate buffer for strings
     }
+    if (!parseDwgTextData(version, buf, sBuf, bs)) return false;
+
+    /* Common Entity Handle Data */
+    if (!DRW_Entity::parseDwgEntHandle(version, buf)) return false;
+
+    styleH = buf->getHandle(); /* H 7 STYLE (hard pointer) */
+    DRW_DBG("text style Handle: "); DRW_DBGHL(styleH.code, styleH.size, styleH.ref); DRW_DBG("\n");
+
+    return buf->isGood();
+}
+
+bool DRW_Text::parseDwgTextData(DRW::Version version, dwgBuffer *buf, dwgBuffer *sBuf, duint32 bs){
     bool ret = DRW_Entity::parseDwg(version, buf, sBuf, bs);
     if (!ret)
         return ret;
@@ -1403,14 +1515,6 @@ bool DRW_Text::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         DRW_DBG(", alignV: "); DRW_DBG(alignV);
     }
     DRW_DBG("\n");
-
-    /* Common Entity Handle Data */
-    ret = DRW_Entity::parseDwgEntHandle(version, buf);
-    if (!ret)
-        return ret;
-
-    styleH = buf->getHandle(); /* H 7 STYLE (hard pointer) */
-    DRW_DBG("text style Handle: "); DRW_DBGHL(styleH.code, styleH.size, styleH.ref); DRW_DBG("\n");
 
     /* CRC X --- */
     return buf->isGood();

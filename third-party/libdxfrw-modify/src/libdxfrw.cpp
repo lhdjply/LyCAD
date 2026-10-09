@@ -1232,6 +1232,10 @@ bool dxfRW::writeInsert(DRW_Insert *ent){
     writeEntity(ent);
     if (version > DRW::AC1009) {
         writer->writeString(100, "AcDbBlockReference");
+        // 66=1 声明「其后跟着属性」：少了它，读方会把随后写出的 ATTRIB
+        // 当成模型空间里的独立文字实体，块参照上的属性值全部错位。
+        if (ent->hasAttribs)
+            writer->writeInt16(66, 1);
         writer->writeUtf8String(2, ent->name);
     } else
         writer->writeUtf8Caps(2, ent->name);
@@ -1286,6 +1290,103 @@ bool dxfRW::writeText(DRW_Text *ent){
     if (ent->alignV != DRW_Text::VBaseLine) {
         writer->writeInt16(73, ent->alignV);
     }
+    return true;
+}
+
+// ATTRIB：TEXT 的字段 + 属性专属字段。注意 73 是字段长度、74 才是垂直对齐，
+// 与 TEXT 的 73=垂直对齐不同义——照抄 writeText 会把对齐写错。
+bool dxfRW::writeAttrib(DRW_Attrib *ent){
+    writer->writeString(0, "ATTRIB");
+    writeEntity(ent);
+    if (version > DRW::AC1009) {
+        writer->writeString(100, "AcDbText");
+    }
+    writer->writeDouble(10, ent->basePoint.x);
+    writer->writeDouble(20, ent->basePoint.y);
+    writer->writeDouble(30, ent->basePoint.z);
+    writer->writeDouble(40, ent->height);
+    writer->writeUtf8String(1, ent->text);
+    writer->writeDouble(50, ent->angle);
+    writer->writeDouble(41, ent->widthscale);
+    writer->writeDouble(51, ent->oblique);
+    if (version > DRW::AC1009)
+        writer->writeUtf8String(7, ent->style);
+    else
+        writer->writeUtf8Caps(7, ent->style);
+    writer->writeInt16(71, ent->textgen);
+    if (ent->alignH != DRW_Text::HLeft) {
+        writer->writeInt16(72, ent->alignH);
+    }
+    if (ent->alignH != DRW_Text::HLeft || ent->alignV != DRW_Text::VBaseLine) {
+        writer->writeDouble(11, ent->secPoint.x);
+        writer->writeDouble(21, ent->secPoint.y);
+        writer->writeDouble(31, ent->secPoint.z);
+    }
+    writer->writeDouble(210, ent->extPoint.x);
+    writer->writeDouble(220, ent->extPoint.y);
+    writer->writeDouble(230, ent->extPoint.z);
+    if (version > DRW::AC1009) {
+        writer->writeString(100, "AcDbAttribute");
+        writer->writeInt16(280, 0);          // 版本号，恒为 0
+    }
+    writer->writeUtf8String(2, ent->tag);
+    writer->writeInt16(70, ent->flags);
+    if (ent->alignV != DRW_Text::VBaseLine) {
+        writer->writeInt16(74, ent->alignV);
+    }
+    return true;
+}
+
+// ATTDEF：ATTDEF 的字段与 ATTRIB 同构（TEXT 部分 + 属性专属部分），
+// 区别只在属性部分用 3=提示 + 1=默认值，且子类名为 AcDbAttributeDefinition。
+bool dxfRW::writeAttdef(DRW_Attdef *ent){
+    writer->writeString(0, "ATTDEF");
+    writeEntity(ent);
+    if (version > DRW::AC1009) {
+        writer->writeString(100, "AcDbText");
+    }
+    writer->writeDouble(10, ent->basePoint.x);
+    writer->writeDouble(20, ent->basePoint.y);
+    writer->writeDouble(30, ent->basePoint.z);
+    writer->writeDouble(40, ent->height);
+    writer->writeUtf8String(1, ent->text);
+    writer->writeDouble(50, ent->angle);
+    writer->writeDouble(41, ent->widthscale);
+    writer->writeDouble(51, ent->oblique);
+    if (version > DRW::AC1009)
+        writer->writeUtf8String(7, ent->style);
+    else
+        writer->writeUtf8Caps(7, ent->style);
+    writer->writeInt16(71, ent->textgen);
+    if (ent->alignH != DRW_Text::HLeft) {
+        writer->writeInt16(72, ent->alignH);
+    }
+    if (ent->alignH != DRW_Text::HLeft || ent->alignV != DRW_Text::VBaseLine) {
+        writer->writeDouble(11, ent->secPoint.x);
+        writer->writeDouble(21, ent->secPoint.y);
+        writer->writeDouble(31, ent->secPoint.z);
+    }
+    writer->writeDouble(210, ent->extPoint.x);
+    writer->writeDouble(220, ent->extPoint.y);
+    writer->writeDouble(230, ent->extPoint.z);
+    if (version > DRW::AC1009) {
+        writer->writeString(100, "AcDbAttributeDefinition");
+        writer->writeInt16(280, 0);          // 版本号，恒为 0
+    }
+    writer->writeUtf8String(3, ent->prompt);
+    writer->writeUtf8String(2, ent->tag);
+    writer->writeInt16(70, ent->flags);
+    if (ent->alignV != DRW_Text::VBaseLine) {
+        writer->writeInt16(74, ent->alignV);
+    }
+    return true;
+}
+
+// SEQEND：属性列表的结束标记。借用块参照实体的公共属性（图层/属主），
+// 使它与所属 INSERT 挂在同一个块记录上。
+bool dxfRW::writeSeqEnd(DRW_Entity *ent){
+    writer->writeString(0, "SEQEND");
+    writeEntity(ent);
     return true;
 }
 
@@ -2268,6 +2369,8 @@ bool dxfRW::processEntities(bool isblock) {
             processSolid();
         } else if (nextentity == "INSERT") {
             processInsert();
+        } else if (nextentity == "ATTDEF") {
+            processAttdef();
         } else if (nextentity == "LWPOLYLINE") {
             processLWPolyline();
         } else if (nextentity == "POLYLINE") {
@@ -2561,11 +2664,68 @@ bool dxfRW::processInsert() {
             nextentity = reader->getString();
             DRW_DBG(nextentity); DRW_DBG("\n");
             iface->addInsert(insert);
+            // 66=1 时其后跟着若干 ATTRIB，以 SEQEND 收尾。这里就地读完：
+            // 把它们留在实体流里的话，属性会以「独立文字实体」的身份被再次
+            // 上报——既挂不到块参照上，图纸里还会多出一批游离的文字。
+            while (nextentity == "ATTRIB") {
+                processAttrib();
+            }
+            if (nextentity == "SEQEND") {
+                processSeqEnd();
+            }
             return true;  //found new entity or ENDSEC, terminate
         }
         default:
             insert.parseCode(code, reader);
             break;
+        }
+    }
+    return true;
+}
+
+bool dxfRW::processAttdef() {
+    DRW_DBG("dxfRW::processAttdef");
+    int code;
+    DRW_Attdef attdef;
+    while (reader->readRec(&code)) {
+        DRW_DBG(code); DRW_DBG("\n");
+        if (code == 0) {
+            nextentity = reader->getString();
+            DRW_DBG(nextentity); DRW_DBG("\n");
+            iface->addAttdef(attdef);
+            return true;  //found new entity or ENDSEC, terminate
+        }
+        attdef.parseCode(code, reader);
+    }
+    return true;
+}
+
+bool dxfRW::processAttrib() {
+    DRW_DBG("dxfRW::processAttrib");
+    int code;
+    DRW_Attrib attrib;
+    while (reader->readRec(&code)) {
+        DRW_DBG(code); DRW_DBG("\n");
+        if (code == 0) {
+            nextentity = reader->getString();
+            DRW_DBG(nextentity); DRW_DBG("\n");
+            iface->addAttrib(attrib);
+            return true;  //found new entity / SEQEND / ENDSEC, terminate
+        }
+        attrib.parseCode(code, reader);
+    }
+    return true;
+}
+
+bool dxfRW::processSeqEnd() {
+    DRW_DBG("dxfRW::processSeqEnd");
+    int code;
+    while (reader->readRec(&code)) {
+        DRW_DBG(code); DRW_DBG("\n");
+        if (code == 0) {
+            nextentity = reader->getString();
+            DRW_DBG(nextentity); DRW_DBG("\n");
+            return true;  //found new entity or ENDSEC, terminate
         }
     }
     return true;

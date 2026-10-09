@@ -12,6 +12,7 @@
 // =============================================================================
 #pragma once
 
+#include "core/AciPalette.h"
 #include "core/Types.h"
 
 #include <QColor>
@@ -39,7 +40,8 @@ enum class EntityType {
     Spline,
     Ellipse,
     XLine,      ///< 构造线（DXF: XLINE）——过基点双向无限延伸
-    Ray         ///< 射线（DXF: RAY）——自基点沿方向单向无限延伸
+    Ray,        ///< 射线（DXF: RAY）——自基点沿方向单向无限延伸
+    Insert      ///< 块参照（DXF: INSERT / MINSERT）——对块定义的带变换引用
 };
 
 /// 英文类型名（DXF 中的实体名，如 "LINE"）
@@ -97,11 +99,15 @@ public:
     const QString& layerName() const noexcept { return m_layerName; }
     void setLayerName(const QString& name) { m_layerName = name; }
 
-    // ---- 颜色（ACI 索引，<0 表示随层） -----------------------------------------
+    // ---- 颜色（ACI 索引，<0 表示随层，0 表示随块） ------------------------------
     bool isColorByLayer() const noexcept { return m_colorIndex < 0; }
+    /// 随块（DXF 颜色 0）：颜色由引用它的块参照决定，块定义内的图元常用它。
+    /// 顶层图元若也是随块，解析时退回随层（与 AutoCAD 的兜底一致）。
+    bool isColorByBlock() const noexcept { return m_colorIndex == aci::kByBlock; }
     int  colorIndex() const noexcept { return m_colorIndex; }
     void setColorIndex(int aci) noexcept { m_colorIndex = aci; }
     void setColorByLayer() noexcept { m_colorIndex = -1; }
+    void setColorByBlock() noexcept { m_colorIndex = aci::kByBlock; }
 
     /// 解析出最终显示颜色（考虑随层继承与主题反相）
     QColor resolvedColor(const LayerManager& layers, bool themeIsDark = false) const;

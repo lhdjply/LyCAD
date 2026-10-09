@@ -64,6 +64,11 @@ public:
     bool writeInsert(DRW_Insert *ent);
     bool writeMText(DRW_MText *ent);
     bool writeText(DRW_Text *ent);
+    bool writeAttrib(DRW_Attrib *ent);
+    /// 属性定义（ATTDEF）：写在块定义里
+    bool writeAttdef(DRW_Attdef *ent);
+    /// INSERT 之后的 SEQEND（属性列表的结束标记）
+    bool writeSeqEnd(DRW_Entity *ent);
     bool writeHatch(DRW_Hatch *ent);
     bool writeViewport(DRW_Viewport *ent);
     DRW_ImageDef *writeImage(DRW_Image *ent, std::string name);
@@ -102,6 +107,10 @@ private:
     bool processPolyline();
     bool processVertex(DRW_Polyline* pl);
     bool processText();
+    bool processAttdef();
+    bool processAttrib();
+    /// 读完 SEQEND 的剩余组码，把 nextentity 推到下一个实体
+    bool processSeqEnd();
     bool processMText();
     bool processHatch();
     bool processSpline();

@@ -112,6 +112,9 @@ EntityRenderer::DrawContext CadCanvas::drawContext() const
     context.view = &m_view;
     context.settings = &m_display;
     context.viewport = QRectF(rect());
+    // 块参照要按子图元各自的图层重新解析样式，因此上下文必须带上图层表
+    context.layers = m_document ? &m_document->layers() : nullptr;
+    context.lineweightWorldScale = 1.0;      // 屏幕上「线宽 1 mm」即按像素宽画
     return context;
 }
 

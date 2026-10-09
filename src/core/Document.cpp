@@ -4,11 +4,14 @@
 #include "core/Document.h"
 
 #include "core/Commands.h"
+#include "core/InsertEntity.h"
 
 #include <QFileInfo>
 #include <QUndoStack>
 
 #include <algorithm>
+#include <cmath>
+#include <unordered_set>
 
 namespace lycad {
 
@@ -221,6 +224,90 @@ bool Document::removeEntities(const std::vector<EntityId>& ids)
     return true;
 }
 
+bool Document::explodeEntities(const std::vector<EntityId>& ids, int* explodedCount)
+{
+    if (explodedCount) *explodedCount = 0;
+    if (ids.empty()) return false;
+
+    // 先取几何、再删除：展开结果的包围盒与图层继承都依赖源图元仍然存在。
+    std::vector<EntityId> targets;
+    std::vector<std::unique_ptr<Entity>> children;
+
+    for (EntityId id : ids) {
+        const Entity* entity = this->entity(id);
+        if (!entity || entity->type() != EntityType::Insert) continue;
+
+        const auto& insert = static_cast<const InsertEntity&>(*entity);
+        // 块定义缺失（文件里引用了未定义的块）时分解只会把图元删掉，
+        // 那不是用户想要的——保持原样，由导入警告负责说明。
+        if (!insert.hasBlock()) continue;
+
+        std::vector<std::unique_ptr<Entity>> pieces = insert.explode();
+        for (std::unique_ptr<Entity>& piece : pieces) {
+            if (piece) children.push_back(std::move(piece));
+        }
+        targets.push_back(id);
+    }
+
+    if (targets.empty()) return false;
+    if (explodedCount) *explodedCount = static_cast<int>(targets.size());
+
+    if (isBatchLoading()) {
+        for (const std::unique_ptr<Entity>& child : children) internalAdd(child->clone());
+        for (EntityId id : targets) {
+            internalTake(id);
+            emit entityRemoved(id);
+        }
+        afterEntitiesMutated();
+        return true;
+    }
+
+    // 删除 + 添加合成一条撤销记录：分开压栈的话，用户要按两次撤销才能回到分解前
+    m_undoStack->beginMacro(QStringLiteral("分解块参照"));
+    removeEntities(targets);
+    if (!children.empty()) addEntities(std::move(children));
+    m_undoStack->endMacro();
+    return true;
+}
+
+std::vector<std::shared_ptr<BlockDefinition>> Document::referencedBlocks() const
+{
+    std::vector<std::shared_ptr<BlockDefinition>> out;
+    std::unordered_set<QString> seen;
+
+    std::vector<std::shared_ptr<BlockDefinition>> pending;
+    for (const std::shared_ptr<BlockDefinition>& block : m_blocks.all()) {
+        if (block) pending.push_back(block);
+    }
+    for (EntityId id : m_order) {
+        const Entity* item = entity(id);
+        if (!item || item->type() != EntityType::Insert) continue;
+        const auto& insert = static_cast<const InsertEntity&>(*item);
+        if (insert.block()) pending.push_back(insert.block());
+    }
+
+    while (!pending.empty()) {
+        std::shared_ptr<BlockDefinition> block = pending.back();
+        pending.pop_back();
+        if (!block) continue;
+
+        const QString key = BlockTable::normalizedKey(block->name());
+        if (key.isEmpty() || seen.count(key) != 0) continue;
+        seen.insert(key);
+        out.push_back(block);
+
+        // 嵌套块同样要写出去，否则外层块里的 INSERT 会指向一个不存在的定义
+        for (const std::unique_ptr<Entity>& child : block->entities()) {
+            if (!child || child->type() != EntityType::Insert) continue;
+            const auto& nested = static_cast<const InsertEntity&>(*child);
+            if (nested.block()) pending.push_back(nested.block());
+        }
+    }
+
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
 bool Document::transformEntities(const std::vector<EntityId>& ids,
                                  const Transform2D& transform,
                                  const QString& actionLabel)
@@ -306,6 +393,18 @@ std::vector<EntityId> textEntitiesIn(const Document& document, const std::vector
     return texts;
 }
 
+/// 选择集里的块参照。与 textEntitiesIn 同理：先筛一遍，避免空命令进撤销栈。
+std::vector<EntityId> insertEntitiesIn(const Document& document, const std::vector<EntityId>& ids)
+{
+    std::vector<EntityId> inserts;
+    inserts.reserve(ids.size());
+    for (EntityId id : ids) {
+        const Entity* entity = document.entity(id);
+        if (entity && entity->type() == EntityType::Insert) inserts.push_back(id);
+    }
+    return inserts;
+}
+
 } // namespace
 
 bool Document::setEntitiesTextHeight(const std::vector<EntityId>& ids, double height)
@@ -355,6 +454,35 @@ bool Document::setEntitiesTextVAlign(const std::vector<EntityId>& ids, TextEntit
     values.vAlign = vAlign;
     m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
                                               QStringLiteral("修改文字垂直对齐")));
+    return true;
+}
+
+bool Document::setEntitiesInsertScale(const std::vector<EntityId>& ids,
+                                      double scaleX, double scaleY)
+{
+    // 比例为 0 会把块压成一条线，之后再也无法通过属性面板恢复
+    if (std::abs(scaleX) <= kGeomTol || std::abs(scaleY) <= kGeomTol) return false;
+
+    std::vector<EntityId> inserts = insertEntitiesIn(*this, ids);
+    if (inserts.empty()) return false;
+
+    InsertPropertyValues values;
+    values.scaleX = scaleX;
+    values.scaleY = scaleY;
+    m_undoStack->push(new InsertPropertyCommand(this, std::move(inserts), values,
+                                                QStringLiteral("修改插入比例")));
+    return true;
+}
+
+bool Document::setEntitiesInsertRotation(const std::vector<EntityId>& ids, double radians)
+{
+    std::vector<EntityId> inserts = insertEntitiesIn(*this, ids);
+    if (inserts.empty()) return false;
+
+    InsertPropertyValues values;
+    values.rotation = radians;
+    m_undoStack->push(new InsertPropertyCommand(this, std::move(inserts), values,
+                                                QStringLiteral("修改插入旋转")));
     return true;
 }
 
@@ -591,6 +719,7 @@ void Document::endBatchLoad()
 
     emit documentReset();
     emit layersChanged();
+    emit blocksChanged();
     emit extentsChanged();
 }
 
@@ -606,6 +735,7 @@ void Document::clear(bool resetLayers)
     if (resetLayers) {
         m_layers.clear();
         m_textStyles.clear();
+        m_blocks.clear();
     }
 
     if (!wasBatch) {
@@ -615,6 +745,7 @@ void Document::clear(bool resetLayers)
 
     emit documentReset();
     emit layersChanged();
+    emit blocksChanged();
     emit extentsChanged();
 }
 

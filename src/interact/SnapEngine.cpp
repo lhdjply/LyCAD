@@ -3,6 +3,8 @@
 // =============================================================================
 #include "interact/SnapEngine.h"
 
+#include "core/InsertEntity.h"
+
 #include "core/ArcEntity.h"
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
@@ -62,6 +64,21 @@ std::vector<std::pair<Point2D, Point2D>> nearbySegments(const Entity& entity,
 {
     std::vector<std::pair<Point2D, Point2D>> out;
     if (radius <= kGeomTol) return out;
+
+    // 块参照：把展开后的子图元**分别**离散。直接把整块的离散点首尾连成一条
+    // 折线，会在「上一个子图元的末点」与「下一个的首点」之间造出并不存在的
+    // 线段——交点捕捉于是在块内的空白处冒出假交点。
+    if (entity.type() == EntityType::Insert) {
+        const auto& insert = static_cast<const InsertEntity&>(entity);
+        for (const std::unique_ptr<Entity>& child : insert.expanded()) {
+            if (!child) continue;
+            const std::vector<std::pair<Point2D, Point2D>> sub =
+                nearbySegments(*child, cursor, radius);
+            out.insert(out.end(), sub.begin(), sub.end());
+            if (out.size() >= kMaxSegmentsPerEntity) break;
+        }
+        return out;
+    }
 
     // 无界图元（构造线、射线）不能按「离散整条图元」处理：它名义上有一百万
     // 单位长，拿它去算交点会白白丢掉精度（两端点相差如此悬殊时，交点的有效
@@ -131,6 +148,145 @@ void SnapEngine::collectEntityCandidates(const Document& document,
         return false;
     };
 
+    // 单个图元的捕捉候选。写成可递归的 lambda，是为了让块参照直接复用同一份
+    // 判定：块内的圆心/象限点/中点不能一律退化成「端点」。
+    auto collectFrom = [&](auto&& self, const Entity& e) -> bool {
+        bool hit = false;
+        switch (e.type()) {
+        case EntityType::Line: {
+            const auto& line = static_cast<const LineEntity&>(e);
+            if (m_settings.endpoint) {
+                hit |= add(line.start(), SnapKind::Endpoint);
+                hit |= add(line.end(), SnapKind::Endpoint);
+            }
+            if (m_settings.midpoint) hit |= add(line.midpoint(), SnapKind::Midpoint);
+            break;
+        }
+        case EntityType::Circle: {
+            const auto& circle = static_cast<const CircleEntity&>(e);
+            if (m_settings.center) hit |= add(circle.center(), SnapKind::Center);
+            if (m_settings.quadrant) {
+                for (int i = 0; i < 4; ++i) {
+                    hit |= add(circle.quadrantPoint(i), SnapKind::Quadrant);
+                }
+            }
+            break;
+        }
+        case EntityType::Arc: {
+            const auto& arc = static_cast<const ArcEntity&>(e);
+            if (m_settings.center) hit |= add(arc.center(), SnapKind::Center);
+            if (m_settings.endpoint) {
+                hit |= add(arc.startPoint(), SnapKind::Endpoint);
+                hit |= add(arc.endPoint(), SnapKind::Endpoint);
+            }
+            if (m_settings.midpoint) hit |= add(arc.middlePoint(), SnapKind::Midpoint);
+            if (m_settings.quadrant) {
+                const std::array<double, 4> quadrants = { 0.0, kHalfPi, kPi, 3.0 * kHalfPi };
+                for (double q : quadrants) {
+                    if (arc.containsAngle(q)) {
+                        hit |= add(arc.pointAtAngle(q), SnapKind::Quadrant);
+                    }
+                }
+            }
+            break;
+        }
+        case EntityType::Polyline: {
+            const auto& polyline = static_cast<const PolylineEntity&>(e);
+            if (m_settings.endpoint) {
+                for (const auto& vertex : polyline.vertices()) {
+                    hit |= add(vertex.point, SnapKind::Endpoint);
+                }
+            }
+            if (m_settings.midpoint) {
+                const std::size_t count = polyline.segmentCount();
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (auto seg = polyline.segment(i)) {
+                        hit |= add(seg->middlePoint(), SnapKind::Midpoint);
+                    }
+                }
+            }
+            if (m_settings.center) {
+                const std::size_t count = polyline.segmentCount();
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (auto seg = polyline.segment(i); seg && seg->isArc) {
+                        hit |= add(seg->center, SnapKind::Center);
+                    }
+                }
+            }
+            break;
+        }
+        case EntityType::Point: {
+            const auto& point = static_cast<const PointEntity&>(e);
+            if (m_settings.node) hit |= add(point.position(), SnapKind::NodePoint);
+            break;
+        }
+        case EntityType::Text: {
+            // 文字只有一个定位点（NodePoint 捕捉语义）
+            const auto& text = static_cast<const TextEntity&>(e);
+            if (m_settings.node) hit |= add(text.effectivePosition(), SnapKind::NodePoint);
+            break;
+        }
+        case EntityType::Hatch: {
+            const auto& hatch = static_cast<const HatchEntity&>(e);
+            if (m_settings.endpoint) {
+                for (const Point2D& vertex : hatch.boundary()) {
+                    hit |= add(vertex, SnapKind::Endpoint);
+                }
+            }
+            break;
+        }
+        case EntityType::Dimension: {
+            // 标注的定义点按端点语义捕捉
+            const auto& dim = static_cast<const DimensionEntity&>(e);
+            if (m_settings.endpoint) {
+                hit |= add(dim.firstPoint(), SnapKind::Endpoint);
+                hit |= add(dim.secondPoint(), SnapKind::Endpoint);
+            }
+            break;
+        }
+        case EntityType::Spline: {
+            // 样条：捕捉两端点（闭合样条首尾重合，只报一次）
+            if (m_settings.endpoint) {
+                for (const Point2D& p : e.snapPoints()) {
+                    hit |= add(p, SnapKind::Endpoint);
+                }
+            }
+            break;
+        }
+        case EntityType::Ellipse: {
+            const auto& ellipse = static_cast<const EllipseEntity&>(e);
+            if (m_settings.center) hit |= add(ellipse.center(), SnapKind::Center);
+            if (m_settings.quadrant) {
+                for (const Point2D& p : ellipse.snapPoints()) {
+                    if (p == ellipse.center()) continue;
+                    hit |= add(p, SnapKind::Quadrant);
+                }
+            }
+            break;
+        }
+        case EntityType::XLine:
+        case EntityType::Ray: {
+            // 无界图元没有端点、中点、圆心，AutoCAD 对它们也只提供最近点与交点。
+            // 前者由下面的通用逻辑处理（走精确的投影解），后者由 collectIntersections
+            // 的邻域裁剪处理。定义点额外按节点语义给出：辅助线常被当作基准来用。
+            const auto& line = static_cast<const InfiniteLineEntity&>(e);
+            if (m_settings.node) hit |= add(line.basePoint(), SnapKind::NodePoint);
+            break;
+        }
+        case EntityType::Insert: {
+            // 块参照：把块内图元按**各自的类型**重新走一遍上面的判定。
+            // 若一律按端点上报，块里的圆就再也捕捉不到圆心与象限点。
+            // 展开结果里不会再有 Insert（嵌套已在展开阶段解析），递归至多两层。
+            const auto& insert = static_cast<const InsertEntity&>(e);
+            for (const std::unique_ptr<Entity>& child : insert.expanded()) {
+                if (child) hit |= self(self, *child);
+            }
+            break;
+        }
+        }
+        return hit;
+    };
+
     for (EntityId id : document.drawOrder()) {
         const Entity* entity = document.entity(id);
         if (!entity || !entity->isDisplayable(layers)) continue;
@@ -145,130 +301,7 @@ void SnapEngine::collectEntityCandidates(const Document& document,
             if (!box.contains(cursor)) continue;
         }
 
-        bool touched = false;
-
-        switch (entity->type()) {
-        case EntityType::Line: {
-            const auto& line = static_cast<const LineEntity&>(*entity);
-            if (m_settings.endpoint) {
-                touched |= add(line.start(), SnapKind::Endpoint);
-                touched |= add(line.end(), SnapKind::Endpoint);
-            }
-            if (m_settings.midpoint) touched |= add(line.midpoint(), SnapKind::Midpoint);
-            break;
-        }
-        case EntityType::Circle: {
-            const auto& circle = static_cast<const CircleEntity&>(*entity);
-            if (m_settings.center) touched |= add(circle.center(), SnapKind::Center);
-            if (m_settings.quadrant) {
-                for (int i = 0; i < 4; ++i) {
-                    touched |= add(circle.quadrantPoint(i), SnapKind::Quadrant);
-                }
-            }
-            break;
-        }
-        case EntityType::Arc: {
-            const auto& arc = static_cast<const ArcEntity&>(*entity);
-            if (m_settings.center) touched |= add(arc.center(), SnapKind::Center);
-            if (m_settings.endpoint) {
-                touched |= add(arc.startPoint(), SnapKind::Endpoint);
-                touched |= add(arc.endPoint(), SnapKind::Endpoint);
-            }
-            if (m_settings.midpoint) touched |= add(arc.middlePoint(), SnapKind::Midpoint);
-            if (m_settings.quadrant) {
-                const std::array<double, 4> quadrants = { 0.0, kHalfPi, kPi, 3.0 * kHalfPi };
-                for (double q : quadrants) {
-                    if (arc.containsAngle(q)) {
-                        touched |= add(arc.pointAtAngle(q), SnapKind::Quadrant);
-                    }
-                }
-            }
-            break;
-        }
-        case EntityType::Polyline: {
-            const auto& polyline = static_cast<const PolylineEntity&>(*entity);
-            if (m_settings.endpoint) {
-                for (const auto& vertex : polyline.vertices()) {
-                    touched |= add(vertex.point, SnapKind::Endpoint);
-                }
-            }
-            if (m_settings.midpoint) {
-                const std::size_t count = polyline.segmentCount();
-                for (std::size_t i = 0; i < count; ++i) {
-                    if (auto seg = polyline.segment(i)) {
-                        touched |= add(seg->middlePoint(), SnapKind::Midpoint);
-                    }
-                }
-            }
-            if (m_settings.center) {
-                const std::size_t count = polyline.segmentCount();
-                for (std::size_t i = 0; i < count; ++i) {
-                    if (auto seg = polyline.segment(i); seg && seg->isArc) {
-                        touched |= add(seg->center, SnapKind::Center);
-                    }
-                }
-            }
-            break;
-        }
-        case EntityType::Point: {
-            const auto& point = static_cast<const PointEntity&>(*entity);
-            if (m_settings.node) touched |= add(point.position(), SnapKind::NodePoint);
-            break;
-        }
-        case EntityType::Text: {
-            // 文字只有一个定位点（NodePoint 捕捉语义）
-            const auto& text = static_cast<const TextEntity&>(*entity);
-            if (m_settings.node) touched |= add(text.effectivePosition(), SnapKind::NodePoint);
-            break;
-        }
-        case EntityType::Hatch: {
-            const auto& hatch = static_cast<const HatchEntity&>(*entity);
-            if (m_settings.endpoint) {
-                for (const Point2D& vertex : hatch.boundary()) {
-                    touched |= add(vertex, SnapKind::Endpoint);
-                }
-            }
-            break;
-        }
-        case EntityType::Dimension: {
-            // 标注的定义点按端点语义捕捉
-            const auto& dim = static_cast<const DimensionEntity&>(*entity);
-            if (m_settings.endpoint) {
-                touched |= add(dim.firstPoint(), SnapKind::Endpoint);
-                touched |= add(dim.secondPoint(), SnapKind::Endpoint);
-            }
-            break;
-        }
-        case EntityType::Spline: {
-            // 样条：捕捉两端点（闭合样条首尾重合，只报一次）
-            if (m_settings.endpoint) {
-                for (const Point2D& p : entity->snapPoints()) {
-                    touched |= add(p, SnapKind::Endpoint);
-                }
-            }
-            break;
-        }
-        case EntityType::Ellipse: {
-            const auto& ellipse = static_cast<const EllipseEntity&>(*entity);
-            if (m_settings.center) touched |= add(ellipse.center(), SnapKind::Center);
-            if (m_settings.quadrant) {
-                for (const Point2D& p : ellipse.snapPoints()) {
-                    if (p == ellipse.center()) continue;
-                    touched |= add(p, SnapKind::Quadrant);
-                }
-            }
-            break;
-        }
-        case EntityType::XLine:
-        case EntityType::Ray: {
-            // 无界图元没有端点、中点、圆心，AutoCAD 对它们也只提供最近点与交点。
-            // 前者由下面的通用逻辑处理（走精确的投影解），后者由 collectIntersections
-            // 的邻域裁剪处理。定义点额外按节点语义给出：辅助线常被当作基准来用。
-            const auto& line = static_cast<const InfiniteLineEntity&>(*entity);
-            if (m_settings.node) touched |= add(line.basePoint(), SnapKind::NodePoint);
-            break;
-        }
-        }
+        bool touched = collectFrom(collectFrom, *entity);
 
         // 最近点：候选为图元上离光标最近的位置
         if (m_settings.nearest) {

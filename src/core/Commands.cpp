@@ -280,6 +280,77 @@ void TextPropertyCommand::undo()
 }
 
 // -----------------------------------------------------------------------------
+//  InsertPropertyCommand
+// -----------------------------------------------------------------------------
+namespace {
+
+/// 取出块参照的比例/旋转快照（三个字段全取，assign 只写赋了值的那些）
+bool insertValuesOf(const Entity* entity, InsertPropertyValues& values)
+{
+    if (!entity || entity->type() != EntityType::Insert) return false;
+    const auto& insert = static_cast<const InsertEntity&>(*entity);
+
+    values.scaleX = insert.scaleX();
+    values.scaleY = insert.scaleY();
+    values.rotation = insert.rotation();
+    return true;
+}
+
+} // namespace
+
+void InsertPropertyCommand::assign(InsertEntity& insert, const InsertPropertyValues& values)
+{
+    // 只写已赋值的字段：未赋值 = 本次不动它，撤销时同样成立
+    if (values.scaleX || values.scaleY) {
+        insert.setScale(values.scaleX.value_or(insert.scaleX()),
+                        values.scaleY.value_or(insert.scaleY()),
+                        insert.scaleZ());
+    }
+    if (values.rotation) insert.setRotation(*values.rotation);
+}
+
+InsertPropertyCommand::InsertPropertyCommand(Document* document,
+                                             std::vector<EntityId> ids,
+                                             InsertPropertyValues values,
+                                             const QString& text)
+    : QUndoCommand(text)
+    , m_document(document)
+    , m_new(std::move(values))
+{
+    m_ids.reserve(ids.size());
+    m_before.reserve(ids.size());
+    for (EntityId id : ids) {
+        InsertPropertyValues snapshot;
+        if (!insertValuesOf(m_document->entity(id), snapshot)) continue;
+        m_ids.push_back(id);
+        m_before.push_back(snapshot);
+    }
+}
+
+void InsertPropertyCommand::redo()
+{
+    for (std::size_t i = 0; i < m_ids.size(); ++i) {
+        Entity* entity = m_document->entity(m_ids[i]);
+        if (!entity || entity->type() != EntityType::Insert) continue;
+        assign(static_cast<InsertEntity&>(*entity), m_new);
+        emit m_document->entityChanged(m_ids[i]);
+    }
+    m_document->afterEntitiesMutated();
+}
+
+void InsertPropertyCommand::undo()
+{
+    // 逐图元还原，因此不能走统一的赋值：旧值各不相同
+    for (std::size_t i = 0; i < m_ids.size(); ++i) {
+        Entity* entity = m_document->entity(m_ids[i]);
+        if (!entity || entity->type() != EntityType::Insert) continue;
+        assign(static_cast<InsertEntity&>(*entity), m_before[i]);
+        emit m_document->entityChanged(m_ids[i]);
+    }
+    m_document->afterEntitiesMutated();
+}
+
+// -----------------------------------------------------------------------------
 //  ReplaceEntityCommand
 // -----------------------------------------------------------------------------
 ReplaceEntityCommand::ReplaceEntityCommand(Document* document,

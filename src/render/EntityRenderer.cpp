@@ -9,6 +9,8 @@
 #include "core/EllipseEntity.h"
 #include "core/HatchEntity.h"
 #include "core/InfiniteLineEntity.h"
+#include "core/InsertEntity.h"
+#include "core/Layer.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
@@ -648,6 +650,19 @@ QPainterPath toDevicePath(const Entity& entity, const ViewTransform& view, const
 {
     QPainterPath path;
 
+    // 块参照：由若干**互不相连**的子图元组成，必须各自成一条子路径。
+    // 走下面的 flatten 会把「上一个子图元的末点」与「下一个的首点」连起来，
+    // 选择高亮与拖拽预览里会凭空多出几条斜线。
+    if (entity.type() == EntityType::Insert) {
+        const auto& insert = static_cast<const InsertEntity&>(entity);
+        QPainterPath combined;
+        for (const std::unique_ptr<Entity>& child : insert.expanded()) {
+            if (!child) continue;
+            combined.addPath(toDevicePath(*child, view, clip));
+        }
+        return combined;
+    }
+
     // 无界图元：形状 = 裁到给定矩形的线段。isUnbounded() 为真的只有
     // InfiniteLineEntity 一族，因此这里的向下转换是安全的。
     if (entity.isUnbounded()) {
@@ -805,6 +820,34 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
     case EntityType::XLine:
     case EntityType::Ray: {
         drawInfiniteLine(painter, static_cast<const InfiniteLineEntity&>(entity), context);
+        break;
+    }
+    case EntityType::Insert: {
+        // 块参照自己没有几何：把展开后的子图元逐个交给同一个绘制函数，每个
+        // 子图元用**它自己**的图层与样式（随层/随块已在展开阶段解析完毕）。
+        //
+        // 刻意不用 painter 变换去套整块内容：本文件里所有像素量——线宽
+        // （penWidthPixels）、虚线节距、文字像素高、填充间距、视口剔除——
+        // 都是按未变换的 view 算出来的，套上 painter 变换后它们会随块内比例
+        // 一起被缩放，块内缩得越小线越细、字越小，与块外不是一套规则。
+        const auto& insert = static_cast<const InsertEntity&>(entity);
+        if (context.layers == nullptr) break;
+
+        for (const std::unique_ptr<Entity>& child : insert.expanded()) {
+            if (!child || !child->isDisplayable(*context.layers)) continue;
+
+            const QColor childColor = child->resolvedColor(*context.layers, settings.themeIsDark);
+            const double childLineweight =
+                child->resolvedLineweight(*context.layers) * context.lineweightWorldScale;
+
+            QString childLinetype = child->linetypeName();
+            if (childLinetype.isEmpty()) {
+                childLinetype = context.layers->linetypeOf(child->layerName(),
+                                                           QStringLiteral("CONTINUOUS"));
+            }
+
+            draw(painter, *child, context, childColor, childLineweight, childLinetype);
+        }
         break;
     }
     }

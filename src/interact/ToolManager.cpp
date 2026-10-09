@@ -168,6 +168,10 @@ void ToolManager::registerBuiltinTools()
                  QStringLiteral("镜像对象（指定镜像线两点）"),
                  [](ToolContext& c) { return std::make_unique<MirrorTool>(c); });
 
+    registerTool(QStringLiteral("EXPLODE"), { QStringLiteral("X") },
+                 QStringLiteral("分解块参照（打散为独立图元）"),
+                 [](ToolContext& c) { return std::make_unique<ExplodeTool>(c); });
+
     registerTool(QStringLiteral("ERASE"), { QStringLiteral("E"), QStringLiteral("DELETE") },
                  QStringLiteral("删除对象"),
                  [](ToolContext& c) { return std::make_unique<EraseTool>(c); });

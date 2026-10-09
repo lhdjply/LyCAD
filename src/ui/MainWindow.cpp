@@ -526,6 +526,9 @@ void MainWindow::createRibbon()
         panel->addSmallCommand(QStringLiteral("mirror"), QStringLiteral("镜像"),
                                QStringLiteral("MIRROR"), QStringLiteral("镜像 (MIRROR / MI)"));
         panel->addSeparator();
+        panel->addSmallCommand(QStringLiteral("explode"), QStringLiteral("分解"),
+                               QStringLiteral("EXPLODE"),
+                               QStringLiteral("分解块参照 (EXPLODE / X)"));
         panel->addSmallCommand(QStringLiteral("erase"), QStringLiteral("删除"),
                                QStringLiteral("ERASE"), QStringLiteral("删除 (ERASE / E)"));
         panel->addSmallCommand(QStringLiteral("select-all"), QStringLiteral("全选"),
@@ -1009,6 +1012,21 @@ void MainWindow::connectSignals()
     connect(m_propertyPanel, &PropertyPanel::textVAlignChangeRequested, this,
             [this](TextEntity::VAlign vAlign) {
                 m_document->setEntitiesTextVAlign(m_document->selection().ids(), vAlign);
+                m_propertyPanel->refresh(m_document);
+            });
+
+    // ---- 块参照属性（插入比例 / 旋转）----------------------------------------
+    // 与文字属性同理：Document 的入口在选择集里没有块参照时返回 false 且不产生
+    // 撤销记录，改完回读一次面板（比例会被钳制、旋转会归一化）。
+    connect(m_propertyPanel, &PropertyPanel::blockScaleChangeRequested, this,
+            [this](double scaleX, double scaleY) {
+                m_document->setEntitiesInsertScale(m_document->selection().ids(),
+                                                   scaleX, scaleY);
+                m_propertyPanel->refresh(m_document);
+            });
+    connect(m_propertyPanel, &PropertyPanel::blockRotationChangeRequested, this,
+            [this](double radians) {
+                m_document->setEntitiesInsertRotation(m_document->selection().ids(), radians);
                 m_propertyPanel->refresh(m_document);
             });
 }

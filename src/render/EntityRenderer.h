@@ -44,6 +44,16 @@ struct DrawContext {
     /// 当前视口（设备坐标），用于图元剔除
     QRectF viewport;
 
+    /// 图层表。**只有块参照需要它**：块内图元要按各自的图层重新解析
+    /// 颜色/线宽/线型（随层、随块都已在此解析完毕），而 draw() 的入参
+    /// 是调用方**已经解析好**的一组样式，没有图层表就无从下手。
+    const LayerManager* layers = nullptr;
+
+    /// 线宽参数的单位换算系数。屏幕渲染是 1（毫米即像素意义上的线宽），
+    /// 打印/预览要把它折算成「与纸面 1 mm 等长的世界长度」，块内子图元
+    /// 的线宽必须走同一个系数，否则同一张图里块内块外的粗线不一样粗。
+    double lineweightWorldScale = 1.0;
+
     bool isValid() const { return view != nullptr && settings != nullptr; }
 };
 
