@@ -17,6 +17,7 @@
 #include "core/PolylineEntity.h"
 #include "core/SplineEntity.h"
 #include "core/TableEntity.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 
 #include <QFontDatabase>
@@ -505,6 +506,68 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
 }
 
 // -----------------------------------------------------------------------------
+//  多行文字
+// -----------------------------------------------------------------------------
+/// 绘制 MTEXT。
+///
+/// 排版（分行、行起点、首行基线）全部取自 MTextEntity::layout()——模型与渲染共用
+/// 同一份结果，包围盒、拾取框与画出来的字形因此不会各算一套。分行只认内容里的
+/// 段落分隔（\P），不依据参考栏宽（41）重新折行，与 AutoCAD / 浩辰的显示一致。
+///
+/// 垂直基准按 MTEXT 自身的语义：附着点的**中间行**量的是「首行小写高度顶与末行基线
+/// 的中点」，不是 TEXT 的大写高度框（两者差 (capHeight − xHeight)/2 ≈ 0.13 倍字高，
+/// 这也正是把 MTEXT 降级成 TEXT 会在 AutoCAD / 浩辰里整体错位的原因）。
+///
+/// 内联格式码只做「尽力还原」：内容已由模型剥成可见文本，这里额外采用内容里声明的
+/// 内联字体（\f…;），字号与颜色等其余格式码不再解析（文件里的原文一字未改，别的
+/// CAD 仍按原样显示）。
+void drawMTextEntity(QPainter& painter, const MTextEntity& text,
+                     const DrawContext& context)
+{
+    const MTextEntity::Layout laid = text.layout();
+    if (!laid.valid || laid.lines.empty()) return;
+
+    const double capHeightPixels = text.height() * context.view->scale();
+    if (capHeightPixels < 2.0) {
+        // 缩得太小时画一个点占位，保持「这里有文字」的可见性
+        const Point2D anchor = context.view->toDevice(text.insertionPoint());
+        painter.drawPoint(QPointF(anchor.x, anchor.y));
+        return;
+    }
+
+    QFont font = painter.font();
+    font.setPixelSize(std::max(2, static_cast<int>(std::lround(capHeightPixels
+                                                              / kCapHeightToEmRatio))));
+    // 内联字体码声明了字体时优先采用它；否则退回图元的样式名
+    const QString inlineName = text.inlineFontName();
+    const QString family = (!inlineName.isEmpty() && QFontDatabase::hasFamily(inlineName))
+                               ? inlineName
+                               : text.fontStyle();
+    if (!family.isEmpty() && QFontDatabase::hasFamily(family)) {
+        font.setFamily(family);
+    }
+    painter.setFont(font);
+
+    const Point2D anchorDevice = context.view->toDevice(text.insertionPoint());
+    const double scale = context.view->scale();
+
+    painter.save();
+    painter.translate(anchorDevice.x, anchorDevice.y);
+    // 世界坐标逆时针为正；设备坐标 Y 轴向下，方向相反
+    painter.rotate(-radToDeg(text.rotation()));
+
+    // 局部坐标 -> 设备像素：X 沿文字方向、Y 向上（设备帧里取负）
+    for (std::size_t i = 0; i < laid.lines.size(); ++i) {
+        const MTextEntity::LayoutLine& line = laid.lines[i];
+        if (line.text.isEmpty()) continue;
+        const double x = line.x * scale;
+        const double y = -(laid.firstBaseline - static_cast<double>(i) * laid.lineHeight) * scale;
+        painter.drawText(QPointF(x, y), line.text);
+    }
+    painter.restore();
+}
+
+// -----------------------------------------------------------------------------
 //  表格
 // -----------------------------------------------------------------------------
 /// 单元格对齐（表格枚举）-> 文字图元的水平/垂直对齐
@@ -898,6 +961,10 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
     }
     case EntityType::Text: {
         drawTextEntity(painter, static_cast<const TextEntity&>(entity), context);
+        break;
+    }
+    case EntityType::MText: {
+        drawMTextEntity(painter, static_cast<const MTextEntity&>(entity), context);
         break;
     }
     case EntityType::Hatch: {

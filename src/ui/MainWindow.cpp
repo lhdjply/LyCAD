@@ -8,6 +8,7 @@
 #include "core/Entity.h"
 #include "core/Format.h"
 #include "core/Layer.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
@@ -306,7 +307,8 @@ void MainWindow::createMenus()
         { "构造线(&X)", "XLINE" },
         { "射线(&Y)", "RAY" },
         { nullptr, "" },                    // 分隔线
-        { "文字(&T)", "TEXT" },
+        { "单行文字(&T)", "TEXT" },
+        { "多行文字(&W)", "MTEXT" },
         { "填充(&H)", "HATCH" },
         { nullptr, "" },
         { "对齐标注(&G)", "DIMALIGNED" },
@@ -587,8 +589,22 @@ void MainWindow::createRibbon()
     // ---- 注释 ----
     {
         RibbonPanel* panel = m_ribbon->addPanel(QStringLiteral("注释"));
-        panel->addLargeCommand(QStringLiteral("text"), QStringLiteral("文字"),
-                               QStringLiteral("TEXT"), QStringLiteral("单行文字 (TEXT / DT)"));
+        // 两种文字合成一格下拉，与标注同一种做法：主体点击即执行当前生效的那一项，
+        // 右侧箭头展开可切换（选过别的项后按钮会跟着改名，见
+        // RibbonPanel::selectDropDownItem）。主体取**单行文字**——延续原「文字」按钮
+        // 的手感（单击即 TEXT），多行文字收在箭头里。
+        // 单行与多行并非"同一命令的两个参数"：对象类型（TEXT / MTEXT）、定位语义
+        // （对齐档 vs 附着点 + 参考栏宽）、双击后的编辑框都不同，所以是两项而不是
+        // 一个带选项的命令。
+        auto* textButton =
+            panel->addLargeDropDown(
+                QStringLiteral("text"), QStringLiteral("单行文字"),
+                QStringLiteral("下拉可切换：单行文字 / 多行文字"),
+                QStringLiteral("TEXT"));
+        panel->addDropDownItem(textButton, QStringLiteral("text"),
+                               QStringLiteral("单行文字"), QStringLiteral("TEXT"));
+        panel->addDropDownItem(textButton, QStringLiteral("mtext"),
+                               QStringLiteral("多行文字"), QStringLiteral("MTEXT"));
         // 六种标注全部收进一个下拉：它们只是量取对象或量取方式不同，用户一次只会
         // 用到一种，摊成六个按钮会把注释面板撑满。
         // 按钮文字写的是**当前生效的那一项**（初值 = 最常用的线性标注）：选过别的
@@ -1023,6 +1039,17 @@ void MainWindow::connectSignals()
                 m_document->setEntitiesTextFont(m_document->selection().ids(), family);
                 m_propertyPanel->refresh(m_document);
             });
+    // 多行文字独有：附着点与参考栏宽（单行文字没有这两项，Document 侧只作用于 MTEXT）
+    connect(m_propertyPanel, &PropertyPanel::mtextAttachmentChangeRequested, this,
+            [this](MTextEntity::Attachment attachment) {
+                m_document->setEntitiesMTextAttachment(m_document->selection().ids(), attachment);
+                m_propertyPanel->refresh(m_document);
+            });
+    connect(m_propertyPanel, &PropertyPanel::mtextWidthChangeRequested, this,
+            [this](double width) {
+                m_document->setEntitiesMTextWidth(m_document->selection().ids(), width);
+                m_propertyPanel->refresh(m_document);
+            });
 
     // ---- 块参照属性（插入比例 / 旋转）----------------------------------------
     // 与文字属性同理：Document 的入口在选择集里没有块参照时返回 false 且不产生
@@ -1157,6 +1184,23 @@ void MainWindow::connectSession(DocumentSession* session)
     CadCanvas* canvas = session->canvas;
     ToolManager* tools = session->tools;
 
+    // ---- 文字工具的内容输入：工具发请求，编辑框由界面层弹 ----------------------
+    //
+    // interact 层不依赖 ui 层（工具不该 include 对话框），所以把"弹出编辑框"作为
+    // 回调装进工具上下文。单行文字走单行输入框、多行文字走可换行的多行编辑框——
+    // 两种形态是不同的控件，用户在框里就能看出自己正在写的是哪一种文字。
+    tools->context().editText =
+        [this](bool multiLine, const QString& initialContent, const QString& initialFont,
+               QString& content, QString& fontFamily) {
+            TextEditDialog dialog(multiLine ? TextEditDialog::Mode::MultiLine
+                                            : TextEditDialog::Mode::SingleLine,
+                                  initialContent, initialFont, this);
+            if (dialog.exec() != QDialog::Accepted) return false;
+            content = dialog.content();
+            fontFamily = dialog.fontFamily();
+            return true;
+        };
+
     // ---- 文档 -> 界面 ----
     // 修改与重置涉及标签页文字：文件名或未保存标记变了，标签要跟着变；
     // 活动会话还须同步窗口标题
@@ -1260,41 +1304,73 @@ void MainWindow::connectSession(DocumentSession* session)
         if (session == m_session) refreshPanels();
     });
 
-    // ---- 双击文字 -> 编辑内容 ----
+    // ---- 双击文字 -> 编辑内容（两种文字走**不同的编辑框**）--------------------
+    //
+    // 单行文字（TEXT）与多行文字（MTEXT）的对象语义不同，编辑入口也分开：
+    //   · MTEXT -> 多行编辑框（QPlainTextEdit，Enter 确认 / Alt+Enter 换行）
+    //   · TEXT  -> 单行输入框（QLineEdit，Enter 确认，没有换行入口）
+    // 单行框不给换行，是因为换行会改变单行文字的版面语义（画布按多行绘制、
+    // 导出到 R2000 会被写成 MTEXT）——"看起来只是换了个行、对象却换了类型"。
     connect(tools, &ToolManager::textEditRequested, this, [this](EntityId id) {
         Entity* entity = m_document->entity(id);
-        if (!entity || entity->type() != EntityType::Text) return;
-        auto* text = static_cast<TextEntity*>(entity);
+        if (!entity) return;
 
-        // 多行编辑：MTEXT 降级导入的文字内容里带 '\n'，单行输入框会把它们吃掉，
-        // 而回车又直接提交，用户补不出换行。对话框内 Enter 确认、Alt+Enter 换行。
-        // 同时可在对话框里改字体（初值取图元当前字体）。
-        TextEditDialog dialog(text->content(), text->fontStyle(), this);
+        const bool isMText = entity->type() == EntityType::MText;
+        if (!isMText && entity->type() != EntityType::Text) return;
+
+        // 多行文字的内容是「原始字符串」：段落以 \P 分隔、内联格式码（\f、\H…）原样保留。
+        // 编辑框里按换行显示段落，提交时再转回 \P——这样格式码一个字符都不会被改动，
+        // 别的 CAD 打开时仍是原来那份内容。
+        QString currentContent = isMText ? static_cast<MTextEntity*>(entity)->content()
+                                         : static_cast<TextEntity*>(entity)->content();
+        if (isMText) currentContent.replace(QStringLiteral("\\P"), QStringLiteral("\n"));
+        const QString currentFont = isMText ? static_cast<MTextEntity*>(entity)->fontStyle()
+                                            : static_cast<TextEntity*>(entity)->fontStyle();
+
+        // 按文字的类别选编辑框。例外：单行文字的内容里若含换行（旧文件或手工构造，
+        // 本版工具不会再产生），仍用多行编辑框——单行框只会显示第一行，让用户在
+        // 不完整的内容上编辑等于盲改，多出来的行会在确认时被悄悄丢掉。
+        const bool contentHasNewline = currentContent.contains(QLatin1Char('\n'));
+        const bool useMultiLine = isMText || contentHasNewline;
+
+        TextEditDialog dialog(useMultiLine ? TextEditDialog::Mode::MultiLine
+                                          : TextEditDialog::Mode::SingleLine,
+                              currentContent, currentFont, this);
         if (dialog.exec() != QDialog::Accepted) return;
 
         // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留。
-        const QString newContent = dialog.content().trimmed();
-        if (newContent.isEmpty()) {
+        const QString editedContent = dialog.content().trimmed();
+        if (editedContent.isEmpty()) {
             pushMessage(QStringLiteral("文字内容不能为空，编辑已取消。"));
             return;
         }
         const QString newFont = dialog.fontFamily();
-        const bool contentChanged = newContent != text->content();
-        const bool fontChanged = newFont != text->fontStyle();
+        const bool contentChanged = editedContent != currentContent;
+        const bool fontChanged = newFont != currentFont;
         if (!contentChanged && !fontChanged) return;   // 未变化不产生撤销记录
 
         // 行数会随内容变化（也可能从单行变成多行，版面与包围盒都不一样），
         // 命令行里说清楚结果，用户不必自己数。
-        auto replacement = text->clone();
-        auto* edited = static_cast<TextEntity*>(replacement.get());
-        edited->setContent(newContent);
+        auto replacement = entity->clone();
+        int lines = editedContent.count(QLatin1Char('\n')) + 1;
         if (fontChanged) {
             // 与特性面板同一口径：先把字体登记进文字样式表（否则导出时会退化成
-            // txt.shx），再把样式名写到图元上。
+            // txt.shx），再把样式名写到图元上。两种文字的样式都取自同一张表。
             m_document->ensureTextFontStyle(newFont);
-            edited->setFontStyle(newFont);
         }
-        const int lines = edited->lineCount();
+        if (isMText) {
+            // 提交时把编辑框里的换行转回段落码 \P（模型内部一律存 \P）
+            QString raw = editedContent;
+            raw.replace(QStringLiteral("\n"), QStringLiteral("\\P"));
+            auto* edited = static_cast<MTextEntity*>(replacement.get());
+            edited->setContent(raw);
+            if (fontChanged) edited->setFontStyle(newFont);
+        } else {
+            auto* edited = static_cast<TextEntity*>(replacement.get());
+            edited->setContent(editedContent);
+            if (fontChanged) edited->setFontStyle(newFont);
+            lines = edited->lineCount();
+        }
         if (m_document->replaceEntity(id, std::move(replacement),
                                       QStringLiteral("编辑文字"))) {
             pushMessage(lines > 1

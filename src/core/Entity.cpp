@@ -22,6 +22,7 @@ QString entityTypeName(EntityType type)
     case EntityType::Arc:      return QStringLiteral("ARC");
     case EntityType::Polyline: return QStringLiteral("LWPOLYLINE");
     case EntityType::Text:     return QStringLiteral("TEXT");
+    case EntityType::MText:    return QStringLiteral("MTEXT");
     case EntityType::Hatch:    return QStringLiteral("HATCH");
     case EntityType::Dimension:return QStringLiteral("DIMENSION");
     case EntityType::Spline:   return QStringLiteral("SPLINE");
@@ -43,6 +44,7 @@ QString entityTypeDisplayName(EntityType type)
     case EntityType::Arc:      return QStringLiteral("圆弧");
     case EntityType::Polyline: return QStringLiteral("多段线");
     case EntityType::Text:     return QStringLiteral("文字");
+    case EntityType::MText:    return QStringLiteral("多行文字");
     case EntityType::Hatch:    return QStringLiteral("填充");
     case EntityType::Dimension:return QStringLiteral("尺寸标注");
     case EntityType::Spline:   return QStringLiteral("样条曲线");

@@ -21,14 +21,19 @@
 namespace lycad {
 
 // -----------------------------------------------------------------------------
-//  文字
+//  文字：单行（TEXT）与多行（MTEXT）
+//
+//  交互：指定插入点 -> 弹出编辑框确认内容 -> 生成图元。
+//  编辑框的形态由文字类型决定（ToolContext::editText 的 multiLine 参数）：
+//  单行文字用单行输入框，多行文字用可换行的多行编辑框。
+//
+//  命令行仍可先输入一段内容，作为编辑框的初值——老手感（先打内容再点位置）
+//  因此没有丢，只是内容不再是"打进去就直接落图"，而是先经编辑框过一遍。
 // -----------------------------------------------------------------------------
-class DrawTextTool final : public Tool {
+class DrawTextToolBase : public Tool {
 public:
-    explicit DrawTextTool(ToolContext& context);
+    explicit DrawTextToolBase(ToolContext& context) : Tool(context) {}
 
-    QString name() const override;
-    QString displayName() const override;
     QString prompt() const override;
 
     bool mousePress(const CanvasEvent& event) override;
@@ -37,10 +42,41 @@ public:
     void paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context) override;
     void deactivate() override;
 
+protected:
+    /// 用多行编辑框（MTEXT）还是单行输入框（TEXT）
+    virtual bool multiLine() const = 0;
+
 private:
-    QString m_text;
+    /// 把用户确认的内容落成图元（单行 TextEntity / 多行 MTextEntity）
+    void commit(const Point2D& position, const QString& content, const QString& fontFamily);
+
+    QString m_text;                 ///< 命令行预输入的内容（可为空）
     ResolvedPoint m_cursor;
     bool m_hasCursor = false;
+};
+
+/// 单行文字（命令 TEXT / DT）
+class DrawTextTool final : public DrawTextToolBase {
+public:
+    using DrawTextToolBase::DrawTextToolBase;
+
+    QString name() const override;
+    QString displayName() const override;
+
+protected:
+    bool multiLine() const override { return false; }
+};
+
+/// 多行文字（命令 MTEXT / MT）
+class DrawMTextTool final : public DrawTextToolBase {
+public:
+    using DrawTextToolBase::DrawTextToolBase;
+
+    QString name() const override;
+    QString displayName() const override;
+
+protected:
+    bool multiLine() const override { return true; }
 };
 
 // -----------------------------------------------------------------------------

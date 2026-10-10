@@ -127,6 +127,33 @@ PropertyPanel::PropertyPanel(QWidget* parent)
     m_textVAlign->setObjectName(QStringLiteral("propertyPanel.textVAlign"));
     m_textVAlign->setToolTip(QStringLiteral("垂直对齐（DXF 73）"));
 
+    // 多行文字：定位靠「附着点 + 参考栏宽」，没有 72/73 对齐档，
+    // 因此这两行与单行文字的对齐两行互斥显示（见 refresh）。
+    m_mtextAttachment = new QComboBox(this);
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            const auto attachment = MTextEntity::attachmentFromRowColumn(row, column);
+            m_mtextAttachment->addItem(MTextEntity::attachmentDisplayName(attachment),
+                                       static_cast<int>(attachment));
+        }
+    }
+    m_mtextAttachment->setPlaceholderText(QStringLiteral("多种取值"));
+    m_mtextAttachment->setObjectName(QStringLiteral("propertyPanel.mtextAttachment"));
+    m_mtextAttachment->setToolTip(QStringLiteral(
+        "附着点（DXF 71）：插入点贴在参考矩形的哪个角/边。中间行的垂直基准是"
+        "「基线到小写高度的中点」，与单行文字的 72=1/73=2（大写高度）不是同一档"));
+
+    m_mtextWidth = new QDoubleSpinBox(this);
+    m_mtextWidth->setDecimals(3);
+    m_mtextWidth->setRange(0.0, 100000.0);
+    m_mtextWidth->setSingleStep(1.0);
+    m_mtextWidth->setKeyboardTracking(false);
+    m_mtextWidth->setSpecialValueText(QStringLiteral("无限制"));
+    m_mtextWidth->setToolTip(QStringLiteral(
+        "参考矩形宽度（DXF 41）：在真实 CAD 里编辑多行文字时的折行宽度，"
+        "折行结果以 \\P 写进内容；显示时按内容里的换行分段，不依据它重排。0 = 无限制"));
+    m_mtextWidth->setObjectName(QStringLiteral("propertyPanel.mtextWidth"));
+
     auto* textForm = new QFormLayout();
     textForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
     textForm->addRow(QStringLiteral("字体"), m_textFont);
@@ -134,6 +161,11 @@ PropertyPanel::PropertyPanel(QWidget* parent)
     textForm->addRow(QStringLiteral("旋转"), m_textRotation);
     textForm->addRow(QStringLiteral("水平对齐"), m_textHAlign);
     textForm->addRow(QStringLiteral("垂直对齐"), m_textVAlign);
+    // QFormLayout 的 addRow(文字, 控件) 返回 QLabel*，留下指针以便按类型整行隐藏
+    m_mtextAttachmentLabel = new QLabel(QStringLiteral("附着点"), this);
+    textForm->addRow(m_mtextAttachmentLabel, m_mtextAttachment);
+    m_mtextWidthLabel = new QLabel(QStringLiteral("参考栏宽"), this);
+    textForm->addRow(m_mtextWidthLabel, m_mtextWidth);
 
     m_textGroup = new QGroupBox(QStringLiteral("文字"), this);
     m_textGroup->setLayout(textForm);
@@ -247,6 +279,15 @@ PropertyPanel::PropertyPanel(QWidget* parent)
         if (m_updating || index < 0) return;
         emit textVAlignChangeRequested(
             static_cast<TextEntity::VAlign>(m_textVAlign->itemData(index).toInt()));
+    });
+    connect(m_mtextAttachment, &QComboBox::currentIndexChanged, this, [this](int index) {
+        if (m_updating || index < 0) return;
+        emit mtextAttachmentChangeRequested(
+            static_cast<MTextEntity::Attachment>(m_mtextAttachment->itemData(index).toInt()));
+    });
+    connect(m_mtextWidth, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        if (m_updating) return;
+        emit mtextWidthChangeRequested(value);
     });
 
     // 比例两个框一起发：它们是同一次「改比例」的两个分量，分开改会让块在
@@ -420,43 +461,73 @@ void PropertyPanel::refresh(const Document* document)
     // ---- 文字属性（只统计选择集里的文字图元）--------------------------------
     //
     // 混合选择（文字 + 直线）时只看文字：用户关心的是「这几条文字现在是多少」，
-    // 而不是被非文字图元带成「多种取值」。
+    // 而不是被非文字图元带成「多种取值」。单行文字与多行文字合在一起统计共有的
+    // 属性（字体 / 字高 / 旋转），各自独有的属性（对齐档 vs 附着点与栏宽）分行显示。
     std::vector<const TextEntity*> texts;
+    std::vector<const MTextEntity*> mtexts;
     for (EntityId id : ids) {
-        if (const auto* text = dynamic_cast<const TextEntity*>(document->entity(id))) {
+        const Entity* entity = document->entity(id);
+        if (const auto* text = dynamic_cast<const TextEntity*>(entity)) {
             texts.push_back(text);
+        } else if (const auto* mtext = dynamic_cast<const MTextEntity*>(entity)) {
+            mtexts.push_back(mtext);
         }
     }
 
-    // 选择集里没有文字就整组隐藏——留着四个改不动的控件只会让人以为程序坏了
-    m_textGroup->setVisible(!texts.empty());
+    // 选择集里没有文字就整组隐藏——留着改不动的控件只会让人以为程序坏了
+    const bool hasText = !texts.empty();
+    const bool hasMText = !mtexts.empty();
+    m_textGroup->setVisible(hasText || hasMText);
 
-    if (!texts.empty()) {
-        const TextEntity* first = texts.front();
+    // 单行文字没有附着点/栏宽，多行文字没有 72/73 对齐档：按选中类型整行显示/隐藏
+    m_textHAlign->setVisible(hasText);
+    m_textVAlign->setVisible(hasText);
+    m_mtextAttachment->setVisible(hasMText);
+    m_mtextAttachmentLabel->setVisible(hasMText);
+    m_mtextWidth->setVisible(hasMText);
+    m_mtextWidthLabel->setVisible(hasMText);
+
+    if (hasText || hasMText) {
+        // 两种文字共有的取值：逐项比较，任一不一致就置「多种取值」
+        const auto heightOf = [](const Entity* e) -> double {
+            if (const auto* t = dynamic_cast<const TextEntity*>(e)) return t->height();
+            return static_cast<const MTextEntity*>(e)->height();
+        };
+        const auto rotationOf = [](const Entity* e) -> double {
+            if (const auto* t = dynamic_cast<const TextEntity*>(e)) return t->rotation();
+            return static_cast<const MTextEntity*>(e)->rotation();
+        };
+        const auto fontOf = [](const Entity* e) -> QString {
+            if (const auto* t = dynamic_cast<const TextEntity*>(e)) return t->fontStyle();
+            return static_cast<const MTextEntity*>(e)->fontStyle();
+        };
+
+        std::vector<const Entity*> all;
+        all.reserve(texts.size() + mtexts.size());
+        for (const TextEntity* text : texts) all.push_back(text);
+        for (const MTextEntity* mtext : mtexts) all.push_back(mtext);
+
+        const Entity* first = all.front();
         bool sameHeight = true;
         bool sameRotation = true;
-        bool sameHAlign = true;
-        bool sameVAlign = true;
         bool sameFont = true;
-        const long long firstHeight = displayKey(first->height(), 100.0);
-        const long long firstRotation = displayKey(radToDeg(first->rotation()), 100.0);
-
-        for (const TextEntity* text : texts) {
-            sameHeight = sameHeight && displayKey(text->height(), 100.0) == firstHeight;
+        const long long firstHeight = displayKey(heightOf(first), 100.0);
+        const long long firstRotation = displayKey(radToDeg(rotationOf(first)), 100.0);
+        const QString firstFont = fontOf(first);
+        for (const Entity* entity : all) {
+            sameHeight = sameHeight && displayKey(heightOf(entity), 100.0) == firstHeight;
             sameRotation = sameRotation
-                           && displayKey(radToDeg(text->rotation()), 100.0) == firstRotation;
-            sameHAlign = sameHAlign && text->hAlign() == first->hAlign();
-            sameVAlign = sameVAlign && text->vAlign() == first->vAlign();
-            sameFont = sameFont && text->fontStyle() == first->fontStyle();
+                           && displayKey(radToDeg(rotationOf(entity)), 100.0) == firstRotation;
+            sameFont = sameFont && fontOf(entity) == firstFont;
         }
 
         // 字体：取值一致时定位到对应项（空串落在「（默认）」上，它带的数据也是空串）；
         // 文档引用的字体本机没装（不在系统字体列表里）时临时补一项显示原名，
         // 否则会被误显示成「（默认）」，用户以为字体设置丢了。
         if (sameFont) {
-            int index = m_textFont->findData(first->fontStyle());
-            if (index < 0 && !first->fontStyle().isEmpty()) {
-                m_textFont->addItem(first->fontStyle(), first->fontStyle());
+            int index = m_textFont->findData(firstFont);
+            if (index < 0 && !firstFont.isEmpty()) {
+                m_textFont->addItem(firstFont, firstFont);
                 index = m_textFont->count() - 1;
             }
             m_textFont->setCurrentIndex(index);
@@ -464,23 +535,50 @@ void PropertyPanel::refresh(const Document* document)
             m_textFont->setCurrentIndex(-1);
         }
 
-        if (sameHeight) m_textHeight->setValue(first->height());
+        if (sameHeight) m_textHeight->setValue(heightOf(first));
         else setMixed(m_textHeight);
 
-        if (sameRotation) m_textRotation->setValue(radToDeg(first->rotation()));
+        if (sameRotation) m_textRotation->setValue(radToDeg(rotationOf(first)));
         else setMixed(m_textRotation);
 
-        // 取值不一致时清空到 -1（显示占位文字「多种取值」）；
-        // 水平与垂直各自判断，一列不一致不影响另一列照常显示与修改。
-        m_textHAlign->setCurrentIndex(sameHAlign
-                                          ? m_textHAlign->findData(
-                                                static_cast<int>(first->hAlign()))
-                                          : -1);
-        m_textVAlign->setCurrentIndex(sameVAlign
-                                          ? m_textVAlign->findData(
-                                                static_cast<int>(first->vAlign()))
-                                          : -1);
+        if (hasText) {
+            // 取值不一致时清空到 -1（显示占位文字「多种取值」）；
+            // 水平与垂直各自判断，一列不一致不影响另一列照常显示与修改。
+            bool sameHAlign = true;
+            bool sameVAlign = true;
+            const TextEntity* textFirst = texts.front();
+            for (const TextEntity* text : texts) {
+                sameHAlign = sameHAlign && text->hAlign() == textFirst->hAlign();
+                sameVAlign = sameVAlign && text->vAlign() == textFirst->vAlign();
+            }
+            m_textHAlign->setCurrentIndex(sameHAlign
+                                              ? m_textHAlign->findData(
+                                                    static_cast<int>(textFirst->hAlign()))
+                                              : -1);
+            m_textVAlign->setCurrentIndex(sameVAlign
+                                              ? m_textVAlign->findData(
+                                                    static_cast<int>(textFirst->vAlign()))
+                                              : -1);
+        }
+
+        if (hasMText) {
+            const MTextEntity* mtextFirst = mtexts.front();
+            bool sameAttachment = true;
+            bool sameWidth = true;
+            const long long widthKey = displayKey(mtextFirst->referenceWidth(), 100.0);
+            for (const MTextEntity* mtext : mtexts) {
+                sameAttachment = sameAttachment && mtext->attachment() == mtextFirst->attachment();
+                sameWidth = sameWidth && displayKey(mtext->referenceWidth(), 100.0) == widthKey;
+            }
+            m_mtextAttachment->setCurrentIndex(
+                sameAttachment
+                    ? m_mtextAttachment->findData(static_cast<int>(mtextFirst->attachment()))
+                    : -1);
+            if (sameWidth) m_mtextWidth->setValue(mtextFirst->referenceWidth());
+            else setMixed(m_mtextWidth);
+        }
     }
+
 
     // ---- 块参照属性（只统计选择集里的块参照）--------------------------------
     std::vector<const InsertEntity*> inserts;

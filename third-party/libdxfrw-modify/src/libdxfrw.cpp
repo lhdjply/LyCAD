@@ -1503,10 +1503,18 @@ bool dxfRW::writeMText(DRW_MText *ent){
         writer->writeDouble(210, ent->extPoint.x);
         writer->writeDouble(220, ent->extPoint.y);
         writer->writeDouble(230, ent->extPoint.z);
-        writer->writeDouble(50, ent->angle);
+        /* MTEXT 的旋转本来就写在 11 组码的「X 轴方向向量」里（50 组码只是 DXF 的
+        输入便利写法，两者同时出现时后者胜出）。写出方向向量，与 DWG 路径一致；
+        没有方向向量时才退回 50，避免旋转在往返中丢失。 */
+        if (ent->hasXAxisDirection()) {
+            writer->writeDouble(11, ent->secPoint.x);
+            writer->writeDouble(21, ent->secPoint.y);
+            writer->writeDouble(31, ent->secPoint.z);
+        } else {
+            writer->writeDouble(50, ent->angle);
+        }
         writer->writeInt16(73, ent->alignV);
         writer->writeDouble(44, ent->interlin);
-//RLZ ... 11, 21, 31 needed?
     } else {
         //RLZ: TODO convert mtext in text lines (not exist in acad 12)
     }

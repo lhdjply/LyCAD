@@ -91,17 +91,10 @@ void TextEntity::setWidthFactor(double factor)
     if (factor < 0.0) m_backwards = true;     // 负宽度因子 = 水平镜像
 }
 
-double TextEntity::estimatedWidth() const noexcept
+double TextEntity::estimateLineWidth(const QString& line, double height, double widthFactor)
 {
-    // 多行文字：宽度取各行中的最大值
     double width = 0.0;
-    double line = 0.0;
-    for (const QChar ch : m_content) {
-        if (ch == QLatin1Char('\n')) {
-            width = std::max(width, line);
-            line = 0.0;
-            continue;
-        }
+    for (const QChar ch : line) {
         // QString 是 UTF-16：增补平面字符按代理对出现，此处跳过低代理项
         const ushort code = ch.unicode();
         if (code >= 0xDC00 && code <= 0xDFFF) continue;
@@ -110,10 +103,24 @@ double TextEntity::estimatedWidth() const noexcept
             // 高代理项：与后续低代理项合成码点（估算宽度按 CJK 处理即可）
             cp = isWideChar(code) ? 0x4E00 : code;
         }
-        line += charWidthFactor(cp);
+        width += charWidthFactor(cp);
     }
-    width = std::max(width, line);
-    return width * m_height * m_widthFactor;
+    return width * height * widthFactor;
+}
+
+double TextEntity::estimatedWidth() const noexcept
+{
+    // 多行文字：宽度取各行中的最大值
+    double width = 0.0;
+    int start = 0;
+    for (int i = 0; i <= m_content.size(); ++i) {
+        if (i == m_content.size() || m_content.at(i) == QLatin1Char('\n')) {
+            width = std::max(width, estimateLineWidth(m_content.mid(start, i - start),
+                                                      m_height, m_widthFactor));
+            start = i + 1;
+        }
+    }
+    return width;
 }
 
 double TextEntity::baselineOffsetWorld() const noexcept

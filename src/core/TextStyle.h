@@ -52,6 +52,23 @@ public:
     int ttfFlags() const noexcept { return m_ttfFlags; }
     void setTtfFlags(int flags) noexcept { m_ttfFlags = flags; }
 
+    /// 宽度因子（DXF 41）：字符宽度与字高之比。真实 CAD 按它压缩/拉伸字形，
+    /// 不随样式往返的话，浩辰/AutoCAD 里整表文字会按错误宽度重排（实测
+    /// Standard 由 0.8 变 1.0，全部文字横向拉宽 25%，图面上文字整体错位）。
+    double widthFactor() const noexcept { return m_widthFactor; }
+    void setWidthFactor(double factor)
+    {
+        m_widthFactor = factor > kMinWidthFactor ? factor : kMinWidthFactor;
+    }
+
+    /// 固定字高（DXF 40）。0 = 不固定（由单条文字自定字高）
+    double fixedHeight() const noexcept { return m_fixedHeight; }
+    void setFixedHeight(double h) noexcept { m_fixedHeight = h > 0.0 ? h : 0.0; }
+
+    /// 倾角（DXF 50，度）。0 = 不倾斜
+    double oblique() const noexcept { return m_oblique; }
+    void setOblique(double angleDeg) noexcept { m_oblique = angleDeg; }
+
     /// 是否携带任何字体信息。全为空说明文件没告诉我们可以用什么字体，
     /// 导出时应当回退到内置的中文安全字体，而不是写出一个没有字形的样式。
     bool hasFontInfo() const noexcept
@@ -60,11 +77,17 @@ public:
     }
 
 private:
-    QString m_name;
-    QString m_fontFile;
-    QString m_bigFontFile;
-    QString m_ttfName;
+    /// 宽度因子下限（DXF 41 的合法范围 0.01 ~ 100，越界值按 1 处理）
+    static constexpr double kMinWidthFactor = 0.01;
+
+    QString   m_name;
+    QString   m_fontFile;
+    QString   m_bigFontFile;
+    QString   m_ttfName;
     int     m_ttfFlags = 0;
+    double  m_widthFactor = 1.0;
+    double  m_fixedHeight = 0.0;
+    double  m_oblique = 0.0;
 };
 
 // -----------------------------------------------------------------------------

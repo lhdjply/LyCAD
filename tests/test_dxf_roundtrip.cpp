@@ -24,6 +24,7 @@
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 #include "core/XLineEntity.h"
 #include "io/CadFile.h"
@@ -692,6 +693,34 @@ LINE
 31
 0.0
 0
+3DFACE
+8
+0
+10
+0.0
+20
+0.0
+30
+0.0
+11
+1.0
+21
+0.0
+31
+0.0
+12
+1.0
+22
+1.0
+32
+0.0
+13
+0.0
+23
+1.0
+33
+0.0
+0
 ENDSEC
 0
 EOF
@@ -707,35 +736,36 @@ EOF
     const IoResult result = CadFile::load(path, document);
 
     QVERIFY2(result.ok, qPrintable(result.error));
+    // LINE 与 MTEXT 各自成图元；3DFACE 未建模，计数跳过
     QCOMPARE(document.entityCount(), std::size_t(2));
 
-    // LINE 原样导入
     bool hasLine = false;
-    // MTEXT 降级成的单行文字：内容与位置都应保留
-    bool hasDegradedText = false;
+    // MTEXT 现在按**原生多行文字**导入：内容与插入点都应保留，且不再降级
+    bool hasMText = false;
     for (EntityId id : document.drawOrder()) {
         const Entity* entity = document.entity(id);
         if (!entity) continue;
         if (entity->type() == EntityType::Line) {
             hasLine = true;
-        } else if (entity->type() == EntityType::Text) {
-            const auto& text = static_cast<const TextEntity&>(*entity);
-            hasDegradedText = text.content() == QStringLiteral("Hello")
-                              && std::abs(text.position().x) < 1e-9
-                              && std::abs(text.position().y) < 1e-9;
+        } else if (entity->type() == EntityType::MText) {
+            const auto& text = static_cast<const MTextEntity&>(*entity);
+            hasMText = text.content() == QStringLiteral("Hello")
+                       && std::abs(text.insertionPoint().x) < 1e-9
+                       && std::abs(text.insertionPoint().y) < 1e-9;
         }
     }
     QVERIFY2(hasLine, "同文件的 LINE 必须正常导入");
-    QVERIFY2(hasDegradedText, "MTEXT 应降级为保留内容与位置的单行文字");
+    QVERIFY2(hasMText, "MTEXT 应作为原生多行文字导入（内容与插入点保留）");
 
+    // 未建模的实体必须出现在导入警告里（计数跳过，而不是静默丢弃）
     bool reported = false;
     for (const QString& warning : result.warnings) {
-        if (warning.contains(QStringLiteral("MTEXT"))) {
+        if (warning.contains(QStringLiteral("3DFACE"))) {
             reported = true;
             break;
         }
     }
-    QVERIFY2(reported, "降级处理的实体类型必须出现在导入警告中");
+    QVERIFY2(reported, "跳过处理的实体类型必须出现在导入警告中");
 }
 
 // -----------------------------------------------------------------------------

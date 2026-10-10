@@ -10,6 +10,7 @@
 // =============================================================================
 #pragma once
 
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 
 #include <QWidget>
@@ -50,6 +51,9 @@ signals:
     void textVAlignChangeRequested(TextEntity::VAlign vAlign);
     /// 字体（字体族名；空串表示回退到默认字体）
     void textFontChangeRequested(const QString& fontFamily);
+    /// 多行文字（MTEXT）独有：附着点（DXF 71）与参考矩形宽度（DXF 41，编辑时的折行宽度；0 = 无限制）
+    void mtextAttachmentChangeRequested(MTextEntity::Attachment attachment);
+    void mtextWidthChangeRequested(double width);
 
     /// 块参照插入比例（X / Y；Z 保持不变）
     void blockScaleChangeRequested(double scaleX, double scaleY);
@@ -73,6 +77,12 @@ private:
     QDoubleSpinBox* m_textRotation = nullptr;      ///< 显示单位是度
     QComboBox*      m_textHAlign = nullptr;
     QComboBox*      m_textVAlign = nullptr;
+    /// 多行文字专有行：附着点九宫格与参考栏宽（单行文字没有这两个属性，
+    /// 两种文字混选时按类型各自显示）
+    QComboBox*      m_mtextAttachment = nullptr;
+    QDoubleSpinBox* m_mtextWidth = nullptr;
+    QLabel*         m_mtextAttachmentLabel = nullptr;
+    QLabel*         m_mtextWidthLabel = nullptr;
 
     QGroupBox*      m_blockGroup = nullptr;
     QLabel*         m_blockName = nullptr;

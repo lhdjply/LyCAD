@@ -13,6 +13,7 @@
 #include "core/Entity.h"
 #include "core/InsertEntity.h"
 #include "core/Layer.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 
 #include <QUndoCommand>
@@ -156,6 +157,10 @@ struct TextPropertyValues {
     /// 字体（DXF 7 样式名，同时也是渲染所用的字体族名）。空串表示「不指定、
     /// 用默认字体」，因此这里用 optional 区分「本次不动」与「清空字体」。
     std::optional<QString> fontStyle;
+    /// 多行文字（MTEXT）独有：附着点（DXF 71）与参考矩形宽度（DXF 41，编辑时的折行宽度；0 = 无限制）。
+    /// 单行文字没有这两个属性，写入时按图元类型各自忽略不适用的字段。
+    std::optional<MTextEntity::Attachment> mtextAttachment;
+    std::optional<double> mtextWidth;
 };
 
 class TextPropertyCommand : public QUndoCommand {
@@ -171,8 +176,11 @@ public:
     void redo() override;
 
 private:
-    /// 按「已赋值才写」的规则把 values 落到图元上（redo 与 undo 共用）
+    /// 按「已赋值才写」的规则把 values 落到图元上（redo 与 undo 共用）。
+    /// 单行文字与多行文字各有一个重载：两者共用的字段（字高/旋转/字体）写法一致，
+    /// 对齐/附着点这类各自独有的字段互不影响。
     static void assign(TextEntity& text, const TextPropertyValues& values);
+    static void assign(MTextEntity& text, const TextPropertyValues& values);
 
     Document* m_document;
     std::vector<EntityId> m_ids;                ///< 命中的文字图元

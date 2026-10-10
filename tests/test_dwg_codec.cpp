@@ -17,6 +17,8 @@
 #include "core/CircleEntity.h"
 #include "core/Document.h"
 #include "core/LineEntity.h"
+#include "core/MTextEntity.h"
+#include "core/TextEntity.h"
 #include "io/CadFile.h"
 #include "io/DwgCodec.h"
 
@@ -34,6 +36,9 @@ private slots:
     void versionSignatureTable();
     void probeRecognizesDwgOnly();
     void nativeReadWriteRoundTrip();
+    void textStyleMetricsAndMiddleAlignSurviveDwgRoundTrip();
+    void mtextKeepsItsOwnAnchorAndLayoutOnDwgRoundTrip();
+    void realSampleMtextSurvivesRoundTrip();
     void textMasqueradingAsDwgIsRejectedBeforeParsing();
     void brokenDwgIsReportedNotSwallowed();
 
@@ -161,6 +166,156 @@ void TestDwgCodec::nativeReadWriteRoundTrip()
     const Entity* first = loaded.entity(loaded.drawOrder().at(0));
     QCOMPARE(first->type(), EntityType::Line);
     QVERIFY(std::abs(first->length() - 50.0) < 1e-9);       // 3-4-5 直角三角形
+}
+
+void TestDwgCodec::textStyleMetricsAndMiddleAlignSurviveDwgRoundTrip()
+{
+    // 文字样式的度量字段（宽度因子 DXF 41）与 TEXT 的「Middle」对齐（DXF 72=4）
+    // 必须随 DWG 往返保留：样式宽度丢成 1.0 会让浩辰/AutoCAD 按错误宽度重排
+    // 全部文字（实测中文图纸 Standard=0.8，重存后所有文字横向拉宽 25%、
+    // 图面整体错位）；Middle 丢成（居中，基线）会让文字抬高约半个字高。
+    Document document;
+    document.beginBatchLoad();
+
+    TextStyle& narrow = document.textStyles().ensure(QStringLiteral("窄体"));
+    narrow.setFontFile(QStringLiteral("txt"));
+    narrow.setBigFontFile(QStringLiteral("gbcbig.shx"));
+    narrow.setWidthFactor(0.8);
+
+    auto text = std::make_unique<TextEntity>(QStringLiteral("图签文字"),
+                                             Point2D(100.0, 50.0), 3.5, 0.0);
+    // Middle：渲染与「中中」等价——用（居中，中部）模拟，落盘后应原样取回
+    text->setHAlign(TextEntity::HAlign::Center);
+    text->setVAlign(TextEntity::VAlign::Middle);
+    text->setAlignmentPoint(Point2D(110.0, 52.0));
+    text->setFontStyle(QStringLiteral("窄体"));
+    const EntityId textId = document.addEntity(std::move(text));
+    document.endBatchLoad();
+
+    const QString dwgPath = m_dir.filePath(QStringLiteral("text-metrics.dwg"));
+    const IoResult writeResult = CadFile::save(dwgPath, document, WriteOptions{});
+    QVERIFY2(writeResult.ok, qPrintable(writeResult.error));
+
+    Document loaded;
+    const IoResult readResult = CadFile::load(dwgPath, loaded);
+    QVERIFY2(readResult.ok, qPrintable(readResult.error));
+
+    const TextStyle* roundTripped = loaded.textStyles().find(QStringLiteral("窄体"));
+    QVERIFY2(roundTripped != nullptr, "文字样式应随 DWG 往返保留");
+    QVERIFY2(std::abs(roundTripped->widthFactor() - 0.8) < 1e-9,
+             "样式宽度因子应随 DWG 往返保留");
+
+    const auto* roundTrippedText =
+        dynamic_cast<const TextEntity*>(loaded.entity(textId));
+    QVERIFY2(roundTrippedText != nullptr, "文字实体应随 DWG 往返保留");
+    QVERIFY(roundTrippedText->hAlign() == TextEntity::HAlign::Center);
+    QVERIFY(roundTrippedText->vAlign() == TextEntity::VAlign::Middle);
+    QVERIFY2(roundTrippedText->alignmentPoint().distanceTo(Point2D(110.0, 52.0)) < 1e-9,
+             "对齐点应随 DWG 往返保留");
+}
+
+void TestDwgCodec::mtextKeepsItsOwnAnchorAndLayoutOnDwgRoundTrip()
+{
+    // 多行文字必须是**独立图元**，不能降级成单行文字。三条理由各自都有回归价值：
+    //   · 降级会丢掉附着点语义——MTEXT 中间行的垂直基准是「基线到小写高度的中点」，
+    //     而 TEXT 的 72=1/73=2 用的是「基线到大写高度的中点」，两者差
+    //     (capHeight − xHeight)/2 ≈ 0.13 倍字高，实测在浩辰/AutoCAD 里整条文字偏移，
+    //     而本软件自读自写（两条路径用同一套换算）永远看不出来；
+    //   · 参考栏宽（41）、书写方向（72）、行距样式（73）与行距系数（44）会一并丢失；
+    //   · 内容里的内联格式码（\P、\f…）是给真实 CAD 读的，剥掉就再也回不去。
+    // 因此这里逐字段盯住：类型、内容（逐字）、附着点、栏宽、字高、旋转、行距、样式、法向。
+    Document document;
+    document.beginBatchLoad();
+
+    const QString content = QStringLiteral("第一段\\P{\\fSimSun|b0|i0|c134|p2;第二段}~尾");
+    auto text = std::make_unique<MTextEntity>(content, Point2D(120.0, -35.0), 2.5);
+    text->setAttachment(MTextEntity::Attachment::MiddleCenter);
+    text->setReferenceWidth(12.5);
+    text->setDirection(Vector2D(0.0, 1.0));                 // 旋转 90°
+    text->setLineSpacingStyle(MTextEntity::LineSpacingStyle::Exact);
+    text->setLineSpacingFactor(1.5);
+    text->setFontStyle(QStringLiteral("Standard"));
+    text->setExtents(6.0, 4.0);
+    MTextEntity::Normal3D normal;
+    normal.z = -1.0;                                        // 翻转法向也要原样带走
+    text->setNormal(normal);
+    const EntityId textId = document.addEntity(std::move(text));
+    document.endBatchLoad();
+
+    const QString dwgPath = m_dir.filePath(QStringLiteral("mtext.dwg"));
+    const IoResult writeResult = CadFile::save(dwgPath, document, WriteOptions{});
+    QVERIFY2(writeResult.ok, qPrintable(writeResult.error));
+
+    Document loaded;
+    const IoResult readResult = CadFile::load(dwgPath, loaded);
+    QVERIFY2(readResult.ok, qPrintable(readResult.error));
+
+    const Entity* roundTripped = loaded.entity(textId);
+    QVERIFY2(roundTripped != nullptr, "多行文字实体应随 DWG 往返保留");
+    QVERIFY2(roundTripped->type() == EntityType::MText,
+             "多行文字不应被降级成单行文字（降级会丢掉附着点的垂直基准）");
+
+    const auto* mtext = static_cast<const MTextEntity*>(roundTripped);
+    QCOMPARE(mtext->content(), content);                    // 内容逐字保留（含内联格式码）
+    QVERIFY(mtext->attachment() == MTextEntity::Attachment::MiddleCenter);
+    QVERIFY(std::abs(mtext->referenceWidth() - 12.5) < 1e-9);
+    QVERIFY(std::abs(mtext->height() - 2.5) < 1e-9);
+    QVERIFY(std::abs(mtext->rotation() - kPi * 0.5) < 1e-9);
+    QVERIFY(mtext->lineSpacingStyle() == MTextEntity::LineSpacingStyle::Exact);
+    QVERIFY(std::abs(mtext->lineSpacingFactor() - 1.5) < 1e-9);
+    QCOMPARE(mtext->fontStyle(), QStringLiteral("Standard"));
+    QVERIFY2(mtext->normal().z < 0.0, "翻转的挤出方向应原样往返");
+    QVERIFY(std::abs(mtext->insertionPoint().x - 120.0) < 1e-9);
+    QVERIFY(std::abs(mtext->insertionPoint().y + 35.0) < 1e-9);
+}
+
+void TestDwgCodec::realSampleMtextSurvivesRoundTrip()
+{
+    // 真实图纸实样逐条比对：重存前后的多行文字必须一一对应。
+    // 需要外部样本，未设置环境变量时自行跳过（与 test_libdxfrw 的实样用例同一口径）：
+    //   LYCAD_MTEXT_SAMPLE=/path/to/file.dwg ctest -R test_dwg_codec
+    const QByteArray sample = qgetenv("LYCAD_MTEXT_SAMPLE");
+    if (sample.isEmpty()) QSKIP("未设置 LYCAD_MTEXT_SAMPLE，跳过真实图纸实样测试");
+    const QString samplePath = QString::fromLocal8Bit(sample);
+    if (!QFileInfo::exists(samplePath)) {
+        QSKIP("LYCAD_MTEXT_SAMPLE 指向的文件不存在");
+    }
+
+    Document original;
+    const IoResult loadResult = CadFile::load(samplePath, original);
+    QVERIFY2(loadResult.ok, qPrintable(loadResult.error));
+
+    // 源文件里的多行文字（降级成单行文字的实现在这里会得到 0 条）
+    std::vector<EntityId> mtextIds;
+    for (EntityId id : original.drawOrder()) {
+        const Entity* entity = original.entity(id);
+        if (entity && entity->type() == EntityType::MText) mtextIds.push_back(id);
+    }
+    QVERIFY2(!mtextIds.empty(), "实样里应能读出多行文字（MTEXT）");
+
+    const QString dwgPath = m_dir.filePath(QStringLiteral("mtext-sample.dwg"));
+    const IoResult writeResult = CadFile::save(dwgPath, original, WriteOptions{});
+    QVERIFY2(writeResult.ok, qPrintable(writeResult.error));
+
+    Document reloaded;
+    const IoResult readResult = CadFile::load(dwgPath, reloaded);
+    QVERIFY2(readResult.ok, qPrintable(readResult.error));
+    QCOMPARE(reloaded.entityCount(), original.entityCount());
+
+    for (EntityId id : mtextIds) {
+        const auto* before = static_cast<const MTextEntity*>(original.entity(id));
+        const Entity* after = reloaded.entity(id);
+        QVERIFY2(after != nullptr, "重存后图元应仍在（id 稳定）");
+        QVERIFY2(after->type() == EntityType::MText,
+                 "重存后仍应是多行文字，不得降级成 TEXT");
+        const auto* afterText = static_cast<const MTextEntity*>(after);
+        QCOMPARE(afterText->content(), before->content());
+        QVERIFY(afterText->attachment() == before->attachment());
+        QVERIFY(std::abs(afterText->referenceWidth() - before->referenceWidth()) < 1e-9);
+        QVERIFY(std::abs(afterText->height() - before->height()) < 1e-9);
+        QVERIFY(std::abs(afterText->rotation() - before->rotation()) < 1e-9);
+        QCOMPARE(afterText->fontStyle(), before->fontStyle());
+    }
 }
 
 void TestDwgCodec::textMasqueradingAsDwgIsRejectedBeforeParsing()

@@ -26,6 +26,7 @@
         <file alias="lineweight.svg">icons/lineweight.svg</file>
         <file alias="mirror.svg">icons/mirror.svg</file>
         <file alias="move.svg">icons/move.svg</file>
+        <file alias="mtext.svg">icons/mtext.svg</file>
         <file alias="new.svg">icons/new.svg</file>
         <file alias="open.svg">icons/open.svg</file>
         <file alias="ortho.svg">icons/ortho.svg</file>

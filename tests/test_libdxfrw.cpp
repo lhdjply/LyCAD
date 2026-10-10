@@ -192,7 +192,8 @@ private slots:
     void writtenHatchBoundaryKeepsBulgeSlots();
     void mtextParagraphAlignmentAndRectAnchor();
     void mtextRotationFromXAxisDirection();
-    void mtextInlineFontBecomesTextStyle();
+    void mtextInlineFontStaysInTheContent();
+    void mtextLineBreaksComeFromContentNotReferenceWidth();
     void writtenHatchPatternDefinitionRoundTrips();
     /// 无界图元（构造线 / 射线）经原生 dwgW 写出后必须原样读回
     void infiniteLinesRoundTripThroughNativeDwg();
@@ -740,12 +741,13 @@ void TestLibDxfRw::writtenHatchPatternDefinitionRoundTrips()
 }
 
 // -----------------------------------------------------------------------------
-//  MTEXT 降级为单行文字：段落对齐码与「插入点 + 参考矩形宽度」都要算进去。
+//  MTEXT 的段落对齐码与「插入点 + 参考矩形宽度」必须共同决定行的横向位置。
 //
-//  MTEXT 的文字排在一个参考矩形里（10/20 = 附着点，41 = 矩形宽度）：附着点决定
-//  矩形哪条边贴着插入点，段落对齐码（\pxqc; 等）决定行在矩形里的横向位置。
-//  只看附着点、把格式码一律剥掉，整块文字就会错位——实测某图纸的 "JK" 偏了
-//  40 个单位（矩形宽 79.24），中文说明行则从居中变成左对齐。
+//  多行文字排在一个参考矩形里（10/20 = 附着点，41 = 矩形宽度）：附着点的列决定
+//  矩形哪条竖边贴着插入点，段落对齐码（\pxqc; 等）决定行在矩形里的位置。这条几何
+//  关系现在由原生 MTextEntity 的排版（layout）给出，不再是"降级成单行文字时换算
+//  一个对齐点"——两者算出来的位置必须一致，否则整块文字会错位（实测某图纸的 "JK"
+//  偏了 40 个单位，矩形宽 79.24）。
 void TestLibDxfRw::mtextParagraphAlignmentAndRectAnchor()
 {
     QTemporaryDir dir;
@@ -774,24 +776,45 @@ void TestLibDxfRw::mtextParagraphAlignmentAndRectAnchor()
     QVERIFY2(result.ok, qPrintable(result.error));
     QCOMPARE(document.entityCount(), std::size_t(2));
 
-    std::vector<const TextEntity*> texts;
+    std::vector<const MTextEntity*> texts;
     for (EntityId id : document.drawOrder()) {
         const Entity* e = document.entity(id);
-        if (e && e->type() == EntityType::Text) texts.push_back(static_cast<const TextEntity*>(e));
+        if (e && e->type() == EntityType::MText) {
+            texts.push_back(static_cast<const MTextEntity*>(e));
+        }
     }
-    QCOMPARE(texts.size(), std::size_t(2));
+    QVERIFY2(texts.size() == std::size_t(2), "MTEXT 应作为多行文字原生导入，而不是降级成 TEXT");
 
-    for (const TextEntity* text : texts) {
+    for (const MTextEntity* text : texts) {
+        // 附着点与参考栏宽必须原样保留——它们是 MTEXT 的定位本体
+        QVERIFY(text->attachment() == MTextEntity::Attachment::TopLeft);
+        QVERIFY(std::abs(text->referenceWidth() - 40.0) < 1e-9);
+        QVERIFY(std::abs(text->height() - 2.5) < 1e-9);
+
         if (text->content().contains(QStringLiteral("测试文字"))) {
-            // 段落码 \pxqc; → 居中；锚点 = 矩形中心 = 插入点 + 宽度/2
-            QCOMPARE(text->hAlign(), TextEntity::HAlign::Center);
-            QVERIFY(std::abs(text->effectivePosition().x - (100.0 + 40.0 * 0.5)) < 1e-6);
-            QVERIFY(std::abs(text->effectivePosition().y - 50.0) < 1e-6);
+            // 内容整段保留（段落码还在串里），剥码后是纯文本
+            QVERIFY(text->content().contains(QStringLiteral("\\pxqc;")));
+            QCOMPARE(text->plainText(), QStringLiteral("测试文字"));
+            QVERIFY(std::abs(text->insertionPoint().x - 100.0) < 1e-9);
+
+            // 段落码 \pxqc; → 该行在矩形内居中：行中点落在矩形中点（插入点 + 宽/2）
+            const std::vector<int> align = MTextEntity::paragraphJustifications(text->content());
+            QCOMPARE(align.size(), std::size_t(1));
+            QCOMPARE(align.front(), 1);                    // 1 = 居中
+            const MTextEntity::Layout laid = text->layout();
+            QCOMPARE(laid.lines.size(), std::size_t(1));
+            const double lineCenter = laid.lines.front().x + laid.lines.front().width * 0.5;
+            QVERIFY(std::abs(lineCenter - 20.0) < 1e-6);    // 矩形宽 40 的中点
         } else {
             QCOMPARE(text->content(), QStringLiteral("左对齐文字"));
-            QCOMPARE(text->hAlign(), TextEntity::HAlign::Left);
-            // 没有段落码：按附着点（左上）左对齐，锚点就是插入点
-            QVERIFY(std::abs(text->effectivePosition().x - 200.0) < 1e-6);
+            QVERIFY(std::abs(text->insertionPoint().x - 200.0) < 1e-9);
+            // 没有段落码：按附着点（左上）左对齐，行自插入点（= 矩形左边界）起笔
+            const std::vector<int> align = MTextEntity::paragraphJustifications(text->content());
+            QCOMPARE(align.size(), std::size_t(1));
+            QCOMPARE(align.front(), -1);                   // 无码 → 由附着点的列决定
+            const MTextEntity::Layout laid = text->layout();
+            QCOMPARE(laid.lines.size(), std::size_t(1));
+            QVERIFY(std::abs(laid.lines.front().x) < 1e-6);
         }
     }
 }
@@ -844,11 +867,19 @@ void TestLibDxfRw::mtextRotationFromXAxisDirection()
         double rotation = -1.0;
         for (EntityId id : document.drawOrder()) {
             const Entity* e = document.entity(id);
-            if (!e || e->type() != EntityType::Text) continue;
-            const auto& text = static_cast<const TextEntity&>(*e);
-            if (!text.content().contains(needle)) continue;
+            if (!e) continue;
+            if (e->type() == EntityType::Text) {
+                const auto& text = static_cast<const TextEntity&>(*e);
+                if (!text.content().contains(needle)) continue;
+                rotation = text.rotation();
+            } else if (e->type() == EntityType::MText) {
+                const auto& text = static_cast<const MTextEntity&>(*e);
+                if (!text.content().contains(needle)) continue;
+                rotation = text.rotation();
+            } else {
+                continue;
+            }
             found = true;
-            rotation = text.rotation();
         }
         Q_ASSERT(found);
         return rotation;
@@ -860,13 +891,12 @@ void TestLibDxfRw::mtextRotationFromXAxisDirection()
 }
 
 // -----------------------------------------------------------------------------
-//  MTEXT 的内联字体码 \f<字体>|...; 必须还原成文字样式。
+//  MTEXT 的内联字体码 \f<字体>|...; 必须**原样留在内容里**。
 //
-//  内联字体的优先级高于图元样式；剥码时把它一并丢掉，导出后整段字退回样式里的
-//  字体——实测某图纸的英文 "KC-DZS05"/"JK" 因此从宋体变成单线笔画字体（浩辰里
-//  一眼就能看出）。还原方式：按字体名建一条文字样式（TrueType 族名 + 字符集标志，
-//  或 .shx 文件名），图元挂到该样式上，显示与导出都能还原原字体。
-void TestLibDxfRw::mtextInlineFontBecomesTextStyle()
+//  内联字体的优先级高于图元样式。早先的降级实现是"剥掉该码、另建一条同名文字样式
+//  再把图元挂上去"——内容被改写、样式表被塞进一条凭空出现的样式。现在内容一字不动，
+//  字体由渲染时的 inlineFontName() 取用，真实 CAD 打开时也按原文的 \f 取字。
+void TestLibDxfRw::mtextInlineFontStaysInTheContent()
 {
     QTemporaryDir dir;
     QVERIFY(dir.isValid());
@@ -889,29 +919,107 @@ void TestLibDxfRw::mtextInlineFontBecomesTextStyle()
     QVERIFY2(result.ok, qPrintable(result.error));
     QCOMPARE(document.entityCount(), std::size_t(1));
 
-    const auto* text = static_cast<const TextEntity*>(
-        document.entity(document.drawOrder().front()));
-    QVERIFY(text != nullptr);
-    QCOMPARE(text->content(), QStringLiteral("KC-DZS05"));
-    QCOMPARE(text->fontStyle(), QStringLiteral("SimSun"));
+    const Entity* entity = document.entity(document.drawOrder().front());
+    QVERIFY(entity != nullptr);
+    QVERIFY2(entity->type() == EntityType::MText, "MTEXT 应原生导入");
+    const auto* text = static_cast<const MTextEntity*>(entity);
 
-    const TextStyle* style = document.textStyles().find(QStringLiteral("SimSun"));
-    QVERIFY2(style != nullptr, "内联字体没有变成文字样式");
-    QCOMPARE(style->ttfName(), QStringLiteral("SimSun"));
-    // 字符集 134（GB2312）与 pitch 2 打包进字体族标志（AutoCAD 的 1071 组码）
-    QCOMPARE(style->ttfFlags(), (134 << 8) | 2);
+    // 内容逐字保留（内联码、分组括号都在），可见文本与内联字体另取
+    QCOMPARE(text->content(), QStringLiteral("{\\fSimSun|b0|i0|c134|p2;KC-DZS05}"));
+    QCOMPARE(text->plainText(), QStringLiteral("KC-DZS05"));
+    QCOMPARE(text->inlineFontName(), QStringLiteral("SimSun"));
 
-    // 写出：图元引用该样式，且样式记录带上 TrueType 扩展数据
+    // 不再凭空多出一条样式：样式表里只有默认那条
+    QVERIFY2(document.textStyles().find(QStringLiteral("SimSun")) == nullptr,
+             "内联字体不该再被改写成一条文字样式（内容已原样保留）");
+
+    // 写出后内容照旧：真实 CAD 仍按原文的 \f 取字
     const QString out = dir.filePath(QStringLiteral("mtext_font_out.dxf"));
     DxfCodec dxf;
     QVERIFY(dxf.write(out, document, r2000Options()).ok);
     QFile written(out);
     QVERIFY(written.open(QIODevice::ReadOnly));
-    const QString text2 = QString::fromLatin1(written.readAll());
+    const QString writtenText = QString::fromLatin1(written.readAll());
     written.close();
-    QVERIFY2(text2.contains(QStringLiteral("\n  2\nSimSun\n")), "样式表里没有 SimSun");
-    QVERIFY2(text2.contains(QStringLiteral("\n1000\nSimSun\n")), "缺少 TrueType 族名扩展数据");
-    QVERIFY2(text2.contains(QStringLiteral("\n1071\n34306\n")), "缺少字体族标志");
+    QVERIFY2(writtenText.contains(QStringLiteral("\\fSimSun|b0|i0|c134|p2;")),
+             "内联字体码应在写出的文件里原样保留");
+    QVERIFY2(writtenText.contains(QStringLiteral("\nMTEXT\n")), "应仍按 MTEXT 写出");
+}
+
+// -----------------------------------------------------------------------------
+//  MTEXT 的分行**只认内容里的 `\P`**，不依据参考栏宽（41）重新折行。
+//
+//  这是 AutoCAD 打开文件时的实际显示行为：换行位置在**编辑时**就已写进内容
+//  （以 `\P` 记录），打开时按内容原样分段；41 只是"编辑时的折行宽度"。早期实现按
+//  41 重排，把本来单行的文字硬折成多行——实测一张 47 条 MTEXT 的图纸有 26 条被
+//  误折（"USB"、"±12V"、"GND"、"WZJ-Z1 信号采集模块"等原本都是一行）。根因是 41
+//  由生成器按「字高即 em」的口径估宽（统计 47 条：41/行宽 全部 ≥ 1，条条都"装得下"），
+//  而显示字体按「字高 = 0.72 em」解释，同样的字符串要宽出约 1.39 倍——用显示的度量
+//  去比对按另一套口径写出的宽度，就必然误折。下面三条分别盯住这条边界。
+void TestLibDxfRw::mtextLineBreaksComeFromContentNotReferenceWidth()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("mtext_wrap.dxf"));
+
+    //   A. 栏宽 1.0（远窄于内容），内容 10 个 ASCII 且**没有** `\P` —— 必须仍是一行
+    //   B. 栏宽 200.0（足够宽），内容含 `\P` —— 必须正好两行
+    //   C. 栏宽 0.0（无限制），内容含 `\P` —— 必须正好两行
+    const QByteArray content =
+        "0\nSECTION\n2\nENTITIES\n"
+        "0\nMTEXT\n5\n100\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n0.0\n20\n0.0\n40\n2.5\n41\n1.0\n71\n1\n72\n5\n"
+        "1\nABCDEFGHIJ\n"
+        "0\nMTEXT\n5\n101\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n0.0\n20\n50.0\n40\n2.5\n41\n200.0\n71\n1\n72\n5\n"
+        "1\nAB\\PCD\n"
+        "0\nMTEXT\n5\n102\n100\nAcDbEntity\n8\n0\n100\nAcDbMText\n"
+        "10\n0.0\n20\n100.0\n40\n2.5\n41\n0.0\n71\n1\n72\n5\n"
+        "1\nEF\\PGH\n"
+        "0\nENDSEC\n0\nEOF\n";
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write(content);
+    file.close();
+
+    Document document;
+    const IoResult result = readDxfWithLibDxfRw(path, document);
+    QVERIFY2(result.ok, qPrintable(result.error));
+
+    std::vector<const MTextEntity*> texts;
+    for (EntityId id : document.drawOrder()) {
+        const Entity* e = document.entity(id);
+        if (e && e->type() == EntityType::MText) {
+            texts.push_back(static_cast<const MTextEntity*>(e));
+        }
+    }
+    QCOMPARE(texts.size(), std::size_t(3));
+
+    // 按内容取，不依赖文件里的先后顺序
+    const auto findText = [&texts](const QString& c) -> const MTextEntity* {
+        for (const MTextEntity* t : texts) {
+            if (t->content() == c) return t;
+        }
+        return nullptr;
+    };
+
+    // A：栏宽极小，但内容里没有 `\P` —— 仍是一行（不按栏宽折行）
+    const MTextEntity* narrow = findText(QStringLiteral("ABCDEFGHIJ"));
+    QVERIFY2(narrow != nullptr, "应能读出窄栏宽的那条 MTEXT");
+    QVERIFY2(std::abs(narrow->referenceWidth() - 1.0) < 1e-9, "参考栏宽应原样保留");
+    QCOMPARE(narrow->layout().lines.size(), std::size_t(1));
+
+    // B：栏宽足够宽，内容含 `\P` —— 两行
+    const MTextEntity* wide = findText(QStringLiteral("AB\\PCD"));
+    QVERIFY2(wide != nullptr, "应能读出含段落分隔的那条 MTEXT");
+    QCOMPARE(wide->layout().lines.size(), std::size_t(2));
+
+    // C：栏宽 0（无限制），内容含 `\P` —— 两行
+    const MTextEntity* unlimited = findText(QStringLiteral("EF\\PGH"));
+    QVERIFY2(unlimited != nullptr, "应能读出栏宽为 0 的那条 MTEXT");
+    QVERIFY(std::abs(unlimited->referenceWidth()) < 1e-9);
+    QCOMPARE(unlimited->layout().lines.size(), std::size_t(2));
 }
 
 void TestLibDxfRw::readsDwgSample()

@@ -213,31 +213,51 @@ void EntityPropertyCommand::undo()
 // -----------------------------------------------------------------------------
 namespace {
 
-/// 取出图元的文字属性快照（四个字段全取，与 m_new 里赋值了哪些字段无关——
-/// 快照多取不影响正确性，assign 只写 m_new 里赋了值的那些字段）。
+/// 取出图元的文字属性快照。单行文字与多行文字都算「文字」：两者共享字高/旋转/字体，
+/// 各自独有的属性（对齐档 / 附着点与栏宽）一并取出——快照多取不影响正确性，
+/// assign 只写 m_new 里赋了值的那些字段。
 bool textValuesOf(const Entity* entity, TextPropertyValues& values)
 {
-    const auto* text = dynamic_cast<const TextEntity*>(entity);
-    if (!text) return false;
-
-    values.height = text->height();
-    values.rotation = text->rotation();
-    values.hAlign = text->hAlign();
-    values.vAlign = text->vAlign();
-    values.fontStyle = text->fontStyle();
-    return true;
+    if (const auto* text = dynamic_cast<const TextEntity*>(entity)) {
+        values.height = text->height();
+        values.rotation = text->rotation();
+        values.hAlign = text->hAlign();
+        values.vAlign = text->vAlign();
+        values.fontStyle = text->fontStyle();
+        return true;
+    }
+    if (const auto* text = dynamic_cast<const MTextEntity*>(entity)) {
+        values.height = text->height();
+        values.rotation = text->rotation();
+        values.fontStyle = text->fontStyle();
+        values.mtextAttachment = text->attachment();
+        values.mtextWidth = text->referenceWidth();
+        return true;
+    }
+    return false;
 }
 
 } // namespace
 
 void TextPropertyCommand::assign(TextEntity& text, const TextPropertyValues& values)
 {
-    // 只写已赋值的字段：未赋值 = 本次不动它，撤销时同样成立
+    // 只写已赋值的字段：未赋值 = 本次不动它，撤销时同样成立。
+    // hAlign/vAlign 是 TEXT 独有的对齐档，MTEXT 用附着点表达，故此处互不影响。
     if (values.height) text.setHeight(*values.height);
     if (values.rotation) text.setRotation(*values.rotation);
     if (values.hAlign) text.setHAlign(*values.hAlign);
     if (values.vAlign) text.setVAlign(*values.vAlign);
     if (values.fontStyle) text.setFontStyle(*values.fontStyle);
+}
+
+void TextPropertyCommand::assign(MTextEntity& text, const TextPropertyValues& values)
+{
+    if (values.height) text.setHeight(*values.height);
+    if (values.rotation) text.setDirection(Vector2D(std::cos(*values.rotation),
+                                                   std::sin(*values.rotation)));
+    if (values.fontStyle) text.setFontStyle(*values.fontStyle);
+    if (values.mtextAttachment) text.setAttachment(*values.mtextAttachment);
+    if (values.mtextWidth) text.setReferenceWidth(*values.mtextWidth);
 }
 
 TextPropertyCommand::TextPropertyCommand(Document* document,
@@ -261,9 +281,15 @@ TextPropertyCommand::TextPropertyCommand(Document* document,
 void TextPropertyCommand::redo()
 {
     for (std::size_t i = 0; i < m_ids.size(); ++i) {
-        auto* text = dynamic_cast<TextEntity*>(m_document->entity(m_ids[i]));
-        if (!text) continue;
-        assign(*text, m_new);
+        Entity* entity = m_document->entity(m_ids[i]);
+        if (!entity) continue;
+        if (auto* text = dynamic_cast<TextEntity*>(entity)) {
+            assign(*text, m_new);
+        } else if (auto* mtext = dynamic_cast<MTextEntity*>(entity)) {
+            assign(*mtext, m_new);
+        } else {
+            continue;
+        }
         emit m_document->entityChanged(m_ids[i]);
     }
     m_document->afterEntitiesMutated();
@@ -273,9 +299,15 @@ void TextPropertyCommand::undo()
 {
     // 逐图元还原，因此不能走统一的赋值：旧值各不相同
     for (std::size_t i = 0; i < m_ids.size(); ++i) {
-        auto* text = dynamic_cast<TextEntity*>(m_document->entity(m_ids[i]));
-        if (!text) continue;
-        assign(*text, m_before[i]);
+        Entity* entity = m_document->entity(m_ids[i]);
+        if (!entity) continue;
+        if (auto* text = dynamic_cast<TextEntity*>(entity)) {
+            assign(*text, m_before[i]);
+        } else if (auto* mtext = dynamic_cast<MTextEntity*>(entity)) {
+            assign(*mtext, m_before[i]);
+        } else {
+            continue;
+        }
         emit m_document->entityChanged(m_ids[i]);
     }
     m_document->afterEntitiesMutated();

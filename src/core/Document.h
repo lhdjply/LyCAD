@@ -18,6 +18,7 @@
 #include "core/Entity.h"
 #include "core/Layer.h"
 #include "core/Selection.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 #include "core/TextStyle.h"
 #include "core/Types.h"
@@ -112,6 +113,16 @@ public:
     /// 修改文字字体（字体族名；同名的真实字体在渲染时被采用）。
     /// 空串表示清除字体设置、回退到默认字体。
     bool setEntitiesTextFont(const std::vector<EntityId>& ids, const QString& fontFamily);
+
+    // ---- 多行文字（MTEXT）独有属性 --------------------------------------------
+    //
+    // MTEXT 的定位靠「附着点 + 参考矩形宽度」，没有 72/73 对齐档，因此单独两个入口；
+    // 与上面同一口径：选择集里一个多行文字都没有时返回 false 且不产生撤销记录。
+    /// 修改附着点（DXF 71 九宫格）
+    bool setEntitiesMTextAttachment(const std::vector<EntityId>& ids,
+                                    MTextEntity::Attachment attachment);
+    /// 修改参考矩形宽度（DXF 41，世界单位；编辑时的折行宽度，0 = 无限制）
+    bool setEntitiesMTextWidth(const std::vector<EntityId>& ids, double width);
 
     // ---- 块参照属性（只作用于选择集里的块参照，其它类型忽略） -------------------
     //

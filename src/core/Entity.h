@@ -35,6 +35,7 @@ enum class EntityType {
     Arc,
     Polyline,
     Text,
+    MText,      ///< 多行文字（DXF: MTEXT）——附着点 + 参考矩形宽度的多行排版文字
     Hatch,
     Dimension,
     Spline,

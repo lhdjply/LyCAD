@@ -106,6 +106,11 @@ public:
     /// 单位字符宽度估计（CJK 记 1.0，ASCII 记 0.55，单位为字高；含宽度因子）
     double estimatedWidth() const noexcept;
 
+    /// 单行文本的估算宽度（世界单位）。宽度按「字宽表逐字符累加 × 字高 × 宽度因子」
+    /// 计算，与本类 estimatedWidth() 同一口径；MTextEntity 的包围盒与行在参考矩形内的
+    /// 对齐位置也用它，保证模型层（包围盒、拾取）与渲染层不会各算一套。
+    static double estimateLineWidth(const QString& line, double height, double widthFactor = 1.0);
+
     /// 基线相对锚点的世界偏移（向上为正；与渲染器各对齐档的偏移换算一致）
     double baselineOffsetWorld() const noexcept;
 

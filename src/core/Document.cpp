@@ -388,7 +388,7 @@ bool Document::setEntitiesVisible(const std::vector<EntityId>& ids, bool visible
 
 namespace {
 
-/// 选择集里的文字图元。
+/// 选择集里的文字图元（单行文字）。
 ///
 /// 文字属性命令本身就只改文字，这里先筛一遍是为了「一个文字都没有时不压撤销栈」：
 /// 否则在纯直线选择集上点一下字高，栈里会多出一条什么也没做的记录，
@@ -400,6 +400,34 @@ std::vector<EntityId> textEntitiesIn(const Document& document, const std::vector
     for (EntityId id : ids) {
         const Entity* entity = document.entity(id);
         if (entity && entity->type() == EntityType::Text) texts.push_back(id);
+    }
+    return texts;
+}
+
+/// 选择集里的「文字」（单行 + 多行）。字高 / 旋转 / 字体是两种文字共有的属性，
+/// 对它们取并集；而 72/73 对齐档只有单行文字有，因此那些入口仍用 textEntitiesIn，
+/// 免得纯多行文字选择集上压出一条什么也没改的记录（与上面的口径一致）。
+std::vector<EntityId> textLikeEntitiesIn(const Document& document, const std::vector<EntityId>& ids)
+{
+    std::vector<EntityId> texts;
+    texts.reserve(ids.size());
+    for (EntityId id : ids) {
+        const Entity* entity = document.entity(id);
+        if (entity && (entity->type() == EntityType::Text || entity->type() == EntityType::MText)) {
+            texts.push_back(id);
+        }
+    }
+    return texts;
+}
+
+/// 选择集里的多行文字。附着点与参考栏宽是 MTEXT 独有的属性，同样先筛一遍。
+std::vector<EntityId> mtextEntitiesIn(const Document& document, const std::vector<EntityId>& ids)
+{
+    std::vector<EntityId> texts;
+    texts.reserve(ids.size());
+    for (EntityId id : ids) {
+        const Entity* entity = document.entity(id);
+        if (entity && entity->type() == EntityType::MText) texts.push_back(id);
     }
     return texts;
 }
@@ -422,7 +450,7 @@ bool Document::setEntitiesTextHeight(const std::vector<EntityId>& ids, double he
 {
     if (!(height > 0.0)) return false;
 
-    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    std::vector<EntityId> texts = textLikeEntitiesIn(*this, ids);
     if (texts.empty()) return false;
 
     TextPropertyValues values;
@@ -434,13 +462,41 @@ bool Document::setEntitiesTextHeight(const std::vector<EntityId>& ids, double he
 
 bool Document::setEntitiesTextRotation(const std::vector<EntityId>& ids, double radians)
 {
-    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    std::vector<EntityId> texts = textLikeEntitiesIn(*this, ids);
     if (texts.empty()) return false;
 
     TextPropertyValues values;
     values.rotation = radians;
     m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
                                               QStringLiteral("修改文字旋转")));
+    return true;
+}
+
+// ---- 多行文字独有属性（附着点 / 参考栏宽） ------------------------------------
+bool Document::setEntitiesMTextAttachment(const std::vector<EntityId>& ids,
+                                          MTextEntity::Attachment attachment)
+{
+    std::vector<EntityId> texts = mtextEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    TextPropertyValues values;
+    values.mtextAttachment = attachment;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改文字附着点")));
+    return true;
+}
+
+bool Document::setEntitiesMTextWidth(const std::vector<EntityId>& ids, double width)
+{
+    if (width < 0.0) return false;
+
+    std::vector<EntityId> texts = mtextEntitiesIn(*this, ids);
+    if (texts.empty()) return false;
+
+    TextPropertyValues values;
+    values.mtextWidth = width;
+    m_undoStack->push(new TextPropertyCommand(this, std::move(texts), values,
+                                              QStringLiteral("修改参考栏宽")));
     return true;
 }
 
@@ -494,7 +550,7 @@ bool Document::setEntitiesTextFont(const std::vector<EntityId>& ids, const QStri
 {
     const QString family = fontFamily.trimmed();
 
-    std::vector<EntityId> texts = textEntitiesIn(*this, ids);
+    std::vector<EntityId> texts = textLikeEntitiesIn(*this, ids);
     if (texts.empty()) return false;
 
     // 先登记样式、再让图元引用它。顺序反过来的话，导出时样式表里还没有这条样式，

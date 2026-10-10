@@ -16,6 +16,7 @@
 
 #include <QString>
 
+#include <functional>
 #include <optional>
 
 namespace lycad {
@@ -97,6 +98,23 @@ struct ToolContext {
     /// 可选：工具预览需要在文档中临时插入图元时使用的辅助
     /// （例如多段线绘制过程中的实时线段）
     const LayerManager* layers() const;
+
+    // ---- 界面交互回调（由主窗口装配）------------------------------------------
+    //
+    // 文字工具需要一个"输入内容"的编辑框，但对话框属于界面层：工具若直接
+    // include ui/TextEditDialog.h，interact 就不再是能独立测试的纯交互层。
+    // 因此这里只留一个回调，由 MainWindow 在装配会话时填上。
+    //
+    /// 请求弹出文字编辑对话框。
+    ///   multiLine      true = 多行编辑框（可换行），false = 单行输入框
+    ///   initialContent 初值（工具允许命令行预输入内容）
+    ///   initialFont    图元当前字体（新建时为空）
+    ///   content        输出：用户确认后的内容（换行为 '\n'）
+    ///   fontFamily     输出：用户选定的字体族名（空串 = 默认）
+    /// 返回 false 表示用户取消。未装配时工具按"取消"处理。
+    std::function<bool(bool multiLine, const QString& initialContent,
+                       const QString& initialFont, QString& content,
+                       QString& fontFamily)> editText;
 };
 
 } // namespace lycad

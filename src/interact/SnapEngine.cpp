@@ -17,6 +17,7 @@
 #include "core/PolylineEntity.h"
 #include "core/SplineEntity.h"
 #include "core/TableEntity.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 
 #include <algorithm>
@@ -225,6 +226,12 @@ void SnapEngine::collectEntityCandidates(const Document& document,
             // 文字只有一个定位点（NodePoint 捕捉语义）
             const auto& text = static_cast<const TextEntity&>(e);
             if (m_settings.node) hit |= add(text.effectivePosition(), SnapKind::NodePoint);
+            break;
+        }
+        case EntityType::MText: {
+            // 多行文字同理：抓插入点
+            const auto& text = static_cast<const MTextEntity&>(e);
+            if (m_settings.node) hit |= add(text.insertionPoint(), SnapKind::NodePoint);
             break;
         }
         case EntityType::Hatch: {

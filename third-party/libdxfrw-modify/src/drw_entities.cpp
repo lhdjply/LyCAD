@@ -2305,9 +2305,10 @@ bool DRW_MText::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     }
     height = buf->getBitDouble();/* Text height BD 40 Undocumented */
     textgen = buf->getBitShort(); /* Attachment BS 71 Similar to justification; */
-    /* Drawing dir BS 72 Left to right, etc.; see DXF doc */
-    dint16 draw_dir = buf->getBitShort();
-    DRW_UNUSED(draw_dir);
+    /* Drawing dir BS 72 Left to right, etc.; see DXF doc
+    MTEXT 的 72 组码是**书写方向**（不是 TEXT 的横向对齐），与 DXF 路径同义地存进 alignH：
+    不读它，TopToBottom（竖排）的 MTEXT 往返后会被写成从左到右。 */
+    alignH = (HAlign)buf->getBitShort();
     /* Extents ht BD Undocumented and not present in DXF or entget */
     double ext_ht = buf->getBitDouble();
     DRW_UNUSED(ext_ht);
@@ -2325,8 +2326,11 @@ bool DRW_MText::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     therefore, the 3's are always 250 chars long. */
     text = sBuf->getVariableText(version, false); /* Text value TV 1 */
     if (version > DRW::AC1014) {//2000+
-        buf->getBitShort();/* Linespacing Style BS 73 */
-        buf->getBitDouble();/* Linespacing Factor BD 44 */
+        /* MTEXT 的 73 = **行距样式**（不是 TEXT 的纵向对齐）、44 = 行距系数，
+        与 DXF 路径同义地存进 alignV / interlin：不读它们，往返后「固定行距」
+        会被写成「至少」，行距系数也会退回默认 1.0。 */
+        alignV = (VAlign)buf->getBitShort(); /* Linespacing Style BS 73 */
+        interlin = buf->getBitDouble();      /* Linespacing Factor BD 44 */
         buf->getBit();/* Unknown bit B */
     }
     if (version > DRW::AC1015) {//2004+

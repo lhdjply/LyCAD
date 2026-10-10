@@ -8,6 +8,7 @@
 #include "core/Document.h"
 #include "core/Format.h"
 #include "core/HatchEntity.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 #include "render/CadCanvas.h"
 
@@ -24,6 +25,9 @@ namespace {
 
 /// 预览线条的颜色与样式，与最终实体区分开
 const QColor kPreviewColor(0x1E, 0x88, 0xE5);
+
+/// 新建文字的默认字高（世界单位）。与绘图单位无关，是 CAD 里最常用的 3.5。
+constexpr double kDefaultTextHeight = 3.5;
 
 /// 新图元归入当前图层，颜色随层
 template <typename T>
@@ -148,25 +152,28 @@ bool pickCircleGeometry(const ToolContext& context, const Point2D& worldPos,
 } // namespace
 
 // =============================================================================
-//  文字
+//  文字（单行 / 多行）
+//
+//  两种文字的差别只在两处，因此共用一份交互：
+//    · 内容输入走哪种编辑框（单行输入框 / 可换行的多行编辑框）——multiLine()；
+//    · 落成哪种图元（TextEntity / MTextEntity）——commit() 里按 multiLine() 分支。
 // =============================================================================
-DrawTextTool::DrawTextTool(ToolContext& context)
-    : Tool(context)
+QString DrawTextToolBase::prompt() const
 {
-}
-
-QString DrawTextTool::name() const { return QStringLiteral("TEXT"); }
-QString DrawTextTool::displayName() const { return QStringLiteral("文字"); }
-
-QString DrawTextTool::prompt() const
-{
-    if (m_text.isEmpty()) return QStringLiteral("输入文字内容 <回车确认>:");
+    // 内容还没预输入时，提示里点明"确认后会弹编辑框"，用户不会以为必须先在
+    // 命令行打字；已经预输入过内容时，提示直接指向插入点。
+    if (m_text.isEmpty()) {
+        return multiLine() ? QStringLiteral("指定多行文字插入点（确认后弹出编辑框）:")
+                           : QStringLiteral("指定文字插入点（确认后弹出编辑框）:");
+    }
     return QStringLiteral("指定文字插入点:");
 }
 
-bool DrawTextTool::textInput(const QString& text)
+bool DrawTextToolBase::textInput(const QString& text)
 {
-    if (!m_text.isEmpty()) return false;    // 已进入定位阶段，交给坐标解析
+    // 命令行预输入：仅作为编辑框的初值。已经预输入过之后不再吃文本，
+    // 好让插入点仍可用键盘坐标输入（"100,50"）。
+    if (!m_text.isEmpty()) return false;
 
     if (text.trimmed().isEmpty()) {
         message(QStringLiteral("文字内容不能为空。"));
@@ -177,26 +184,35 @@ bool DrawTextTool::textInput(const QString& text)
     return true;
 }
 
-bool DrawTextTool::mousePress(const CanvasEvent& event)
+bool DrawTextToolBase::mousePress(const CanvasEvent& event)
 {
     if (event.button != Qt::LeftButton || !ctx().document) return false;
 
-    if (m_text.isEmpty()) {
-        message(QStringLiteral("请先在命令行输入文字内容并回车。"));
+    const ResolvedPoint resolved = resolve(event.worldPos);
+
+    // 内容与字体都从编辑框取。未装配回调（纯交互环境 / 单元测试）时按"取消"
+    // 处理——不能静默落一条空文字下去，那会让用户以为点击没反应。
+    QString content = m_text;
+    QString fontFamily;
+    if (!ctx().editText
+        || !ctx().editText(multiLine(), m_text, QString(), content, fontFamily)) {
+        message(QStringLiteral("已取消文字输入。"));
         return true;
     }
 
-    const ResolvedPoint resolved = resolve(event.worldPos);
-    auto entity = std::make_unique<TextEntity>(m_text, resolved.position, 3.5);
-    applyDefaults(*entity, ctx());
-    ctx().document->addEntity(std::move(entity));
+    // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留
+    content = content.trimmed();
+    if (content.isEmpty()) {
+        message(QStringLiteral("文字内容不能为空。"));
+        return true;
+    }
 
-    message(QStringLiteral("已创建文字 \"%1\"").arg(m_text));
+    commit(resolved.position, content, fontFamily);
     finish();
     return true;
 }
 
-bool DrawTextTool::mouseMove(const CanvasEvent& event)
+bool DrawTextToolBase::mouseMove(const CanvasEvent& event)
 {
     m_cursor = resolve(event.worldPos);
     m_hasCursor = true;
@@ -207,13 +223,13 @@ bool DrawTextTool::mouseMove(const CanvasEvent& event)
     return true;
 }
 
-void DrawTextTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
+void DrawTextToolBase::paintOverlay(QPainter& painter, const EntityRenderer::DrawContext& context)
 {
     if (m_text.isEmpty() || !m_hasCursor) return;
 
-    // 预览：在光标处显示即将插入的文字
+    // 预览：在光标处显示即将插入的文字（预输入的内容，换行按空格排成一行）
     const Point2D d = context.view->toDevice(m_cursor.position);
-    const double hPx = 3.5 * context.view->scale();
+    const double hPx = kDefaultTextHeight * context.view->scale();
 
     QFont font = painter.font();
     font.setPixelSize(std::max(2, static_cast<int>(std::lround(hPx))));
@@ -221,14 +237,58 @@ void DrawTextTool::paintOverlay(QPainter& painter, const EntityRenderer::DrawCon
     painter.save();
     painter.setFont(font);
     painter.setPen(kPreviewColor);
-    painter.drawText(QPointF(d.x, d.y), m_text);
+    painter.drawText(QPointF(d.x, d.y),
+                     QString(m_text).replace(QLatin1Char('\n'), QLatin1Char(' ')));
     painter.restore();
 }
 
-void DrawTextTool::deactivate()
+void DrawTextToolBase::commit(const Point2D& position, const QString& content,
+                              const QString& fontFamily)
+{
+    Document* document = ctx().document;
+    if (!document) return;
+
+    // 字体：与双击编辑、特性面板同一口径——先登记进文字样式表（否则导出时会
+    // 退化成 txt.shx），再把样式名写到图元上。
+    const QString style = fontFamily.trimmed();
+    if (!style.isEmpty()) document->ensureTextFontStyle(style);
+
+    if (multiLine()) {
+        // 多行文字：编辑框里的换行是段落分隔，模型内部一律存 \P
+        // （与文件里的写法一致，双击编辑时再转回换行显示）。
+        QString raw = content;
+        raw.replace(QStringLiteral("\n"), QStringLiteral("\\P"));
+        auto entity = std::make_unique<MTextEntity>(raw, position, kDefaultTextHeight);
+        if (!style.isEmpty()) entity->setFontStyle(style);
+        applyDefaults(*entity, ctx());
+        const int paragraphs = entity->paragraphCount();
+        document->addEntity(std::move(entity));
+        message(paragraphs > 1
+                    ? QStringLiteral("已创建多行文字（%1 段）").arg(paragraphs)
+                    : QStringLiteral("已创建多行文字"));
+    } else {
+        // 单行文字：编辑框就是单行输入框，内容里本不该有换行；仍做一次防御性
+        // 归并，避免换行混进单行对象把版面语义（以及导出时的对象类型）改掉。
+        QString plain = content;
+        plain.replace(QLatin1Char('\n'), QLatin1Char(' '));
+        auto entity = std::make_unique<TextEntity>(plain, position, kDefaultTextHeight);
+        if (!style.isEmpty()) entity->setFontStyle(style);
+        applyDefaults(*entity, ctx());
+        document->addEntity(std::move(entity));
+        message(QStringLiteral("已创建文字 \"%1\"").arg(plain));
+    }
+}
+
+void DrawTextToolBase::deactivate()
 {
     m_text.clear();
 }
+
+QString DrawTextTool::name() const { return QStringLiteral("TEXT"); }
+QString DrawTextTool::displayName() const { return QStringLiteral("单行文字"); }
+
+QString DrawMTextTool::name() const { return QStringLiteral("MTEXT"); }
+QString DrawMTextTool::displayName() const { return QStringLiteral("多行文字"); }
 
 // =============================================================================
 //  填充

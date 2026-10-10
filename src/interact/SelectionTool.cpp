@@ -4,6 +4,7 @@
 #include "interact/SelectionTool.h"
 
 #include "core/Document.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "render/CadCanvas.h"
@@ -205,12 +206,17 @@ bool SelectionTool::mouseDoubleClick(const CanvasEvent& event)
     double nearestAnchor = std::numeric_limits<double>::max();
     for (auto it = order.rbegin(); it != order.rend(); ++it) {
         const Entity* e = ctx().document->entity(*it);
-        if (!e || e->type() != EntityType::Text) continue;
+        if (!e) continue;
+        const bool isText = e->type() == EntityType::Text;
+        const bool isMText = e->type() == EntityType::MText;
+        if (!isText && !isMText) continue;
         if (!ctx().document->isSelectable(*it)) continue;
         if (e->distanceTo(event.worldPos) > tolerance) continue;
 
         const double anchorDist =
-            static_cast<const TextEntity*>(e)->effectivePosition().distanceTo(event.worldPos);
+            (isText ? static_cast<const TextEntity*>(e)->effectivePosition()
+                    : static_cast<const MTextEntity*>(e)->insertionPoint())
+                .distanceTo(event.worldPos);
         if (anchorDist < nearestAnchor) {
             nearestAnchor = anchorDist;
             target = *it;
@@ -222,7 +228,9 @@ bool SelectionTool::mouseDoubleClick(const CanvasEvent& event)
         const EntityId picked = ctx().canvas->pickEntity(event.worldPos, tolerance);
         if (picked != kInvalidEntityId) {
             const Entity* e = ctx().document->entity(picked);
-            if (e && e->type() == EntityType::Text) target = picked;
+            if (e && (e->type() == EntityType::Text || e->type() == EntityType::MText)) {
+                target = picked;
+            }
         }
     }
 

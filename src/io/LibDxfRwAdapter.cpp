@@ -51,6 +51,7 @@
 #include "core/Layer.h"
 #include "core/Linetype.h"
 #include "core/LineEntity.h"
+#include "core/MTextEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
@@ -621,6 +622,14 @@ void Builder::addTextStyle(const DRW_Textstyle& data)
     imported.setFontFile(toQString(data.font));
     imported.setBigFontFile(toQString(data.bigFont));
 
+    // 度量字段（DXF 40/41/50）必须随样式走：真实 CAD 用**样式级**宽度因子
+    // 压缩字形（中文图纸的 Standard 常是 0.8），丢掉它，重存的文件在
+    // 浩辰/AutoCAD 里所有文字都会按 1.0 重排，图面上文字整体错位。
+    // 文件里 41 为 0 表示「未设置」，按默认 1.0 归一。
+    imported.setWidthFactor(data.width > 0.0 ? data.width : 1.0);
+    imported.setFixedHeight(data.height);
+    imported.setOblique(data.oblique);
+
     // TrueType 字体：AutoCAD 把「从字体列表里选中的族名」写进样式的扩展数据
     // （1001 <应用名> / 1000 <族名> / 1071 <族标志>），此时 3/4 组码都是空的——
     // 字体信息**只**存在于扩展数据里。中文图纸的 Standard 几乎都是这种形态，
@@ -1073,99 +1082,12 @@ void Builder::addTrace(const DRW_Trace& data)
 // -----------------------------------------------------------------------------
 //  文字
 // -----------------------------------------------------------------------------
-/// 清理 MTEXT 的内联格式码：\P（段落）→ 空格；{…} 分组括号剥除；
-/// \W/\H/\A/\C/\c/\f/\F/\T/\Q/\S…; 这类「到分号为止」的控制串整段剥除；
-/// \\ 与 \{、\} 是转义字面量，还原后保留。
-/// MTEXT 的内联字体码：\f<字体名>|b<粗>|i<斜>|c<字符集>|p<pitch>;
-/// AutoCAD 把「这一段用哪款字体」直接写在文字里（优先级高于图元的样式）。
-struct MTextFontOverride {
-    QString name;        ///< 字体名（TrueType 族名，或 .shx 文件名）
-    int charset = 0;     ///< c 值（134 = GB2312）
-    int pitch = 0;       ///< p 值
-};
-
-bool mtextFontOverride(const QString& raw, MTextFontOverride& out)
-{
-    for (int i = 0; i + 2 < raw.size(); ++i) {
-        if (raw.at(i) != QLatin1Char('\\') || raw.at(i + 1) != QLatin1Char('f')) continue;
-        int end = i + 2;
-        while (end < raw.size() && raw.at(end) != QLatin1Char(';')) ++end;
-        const QString spec = raw.mid(i + 2, end - i - 2);
-        const QStringList parts = spec.split(QLatin1Char('|'));
-        if (parts.isEmpty() || parts.first().trimmed().isEmpty()) { i = end; continue; }
-        out = MTextFontOverride();
-        out.name = parts.first().trimmed();
-        for (int k = 1; k < parts.size(); ++k) {
-            const QString token = parts.at(k).trimmed();
-            if (token.startsWith(QLatin1Char('c'))) out.charset = token.mid(1).toInt();
-            else if (token.startsWith(QLatin1Char('p'))) out.pitch = token.mid(1).toInt();
-        }
-        return true;
-    }
-    return false;
-}
-
-/// 从 MTEXT 的内联格式码里取出**段落对齐**。
-///
-/// AutoCAD 的段落码形如 \pxql;（左）/ \pxqc;（中）/ \pxqr;（右）/ \pxqj;（两端）/
-/// \pxqd;（分散），见 Autodesk 的 MTEXT 格式码表。段落对齐**优先于**附着点里的
-/// 隐含对齐：实测某图纸的 MTEXT 附着点是「左上」，内容里却写着 \pxqc;，GstarCAD
-/// 按居中绘制——只按附着点换算会把整块文字画成左对齐，正是「文字错位」的来源。
-/// 返回 false 表示文件里没有段落对齐码，沿用附着点的换算结果。
-bool paragraphAlignment(const QString& raw, TextEntity::HAlign& alignment)
-{
-    for (int i = 0; i + 2 < raw.size(); ++i) {
-        if (raw.at(i) != QLatin1Char('\\')) continue;
-        if (raw.at(i + 1) != QLatin1Char('p')) continue;
-        // \p<...>; 里找 xq + 对齐字母
-        int end = i + 2;
-        while (end < raw.size() && raw.at(end) != QLatin1Char(';')) ++end;
-        for (int k = i + 2; k + 1 < end; ++k) {
-            if (raw.at(k) != QLatin1Char('q')) continue;
-            switch (raw.at(k + 1).toLatin1()) {
-            case 'l': alignment = TextEntity::HAlign::Left;   return true;
-            case 'c': alignment = TextEntity::HAlign::Center; return true;
-            case 'r': alignment = TextEntity::HAlign::Right;  return true;
-            // 两端/分散对齐在单行文字上没有对应画法，居中是最接近的近似
-            case 'j':
-            case 'd': alignment = TextEntity::HAlign::Center; return true;
-            default: break;
-            }
-        }
-        i = end;
-    }
-    return false;
-}
-
-QString stripMTextCodes(const QString& raw)
-{
-    QString out;
-    out.reserve(raw.size());
-    for (int i = 0; i < raw.size(); ++i) {
-        const QChar ch = raw.at(i);
-        if (ch != QLatin1Char('\\')) {
-            if (ch != QLatin1Char('{') && ch != QLatin1Char('}')) out.append(ch);
-            continue;
-        }
-        if (i + 1 >= raw.size()) break;
-        const QChar next = raw.at(i + 1);
-        if (next == QLatin1Char('\\')) { out.append(QLatin1Char('\\')); ++i; continue; }
-        if (next == QLatin1Char('{') || next == QLatin1Char('}')) {
-            out.append(next); ++i; continue;
-        }
-        if (next == QLatin1Char('~')) {
-            out.append(QLatin1Char(' ')); ++i; continue;    // 不换行空格
-        }
-        if (next == QLatin1Char('P')) {
-            out.append(QLatin1Char('\n')); ++i; continue;   // 段落换行
-        }
-        int j = i + 1;
-        while (j < raw.size() && raw.at(j) != QLatin1Char(';')) ++j;
-        if (j < raw.size()) { i = j; continue; }   // 到分号为止整段剥除
-        out.append(ch);                            // 没有分号：按字面保留
-    }
-    return out;
-}
+// MTEXT 的内联格式码（\P 段落、\f 字体、\H 字高…）与「附着点 + 参考矩形」的
+// 排版语义都由核心图元 MTextEntity 负责解析与还原（core/MTextEntity.cpp）：
+//   · stripInlineCodes()        剥码取可见文本（显示 / 编辑用）
+//   · paragraphJustifications() 段落对齐码（\pxqc; 等）优先于附着点隐含的横向对齐
+//   · inlineFontNameOf()        内容里声明的内联字体
+// 导入不再「剥码 + 另建样式 + 降级成单行文字」，内容与排版字段整体交给模型保真往返。
 
 /// 建立单行文字图元。旋转角由调用方按**弧度**给出——libdxfrw 的两条读取路径
 /// 对角度用的单位不同（见本文件头部说明），换算是调用方的事，这里只认弧度。
@@ -1178,10 +1100,24 @@ std::unique_ptr<TextEntity> Builder::makeText(const DRW_Text& data, double rotat
 
     // 对齐：libdxfrw 的枚举与 DXF 72/73 一致；Aligned(3)/Middle(4)/Fit(5)
     // 只在垂直对齐为基线时出现，这里分别映射到最接近的语义。
+    // 先垂直后水平：Middle(4) 要在垂直档**之后**同时置 Center 与 Middle——
+    // DXF 规范明确 Middle 渲染与「中中」完全等价，仅 72/73 的存法不同；
+    // 若只改水平档，写回会变成（居中，基线），文字整体抬高约半个字高
+    // （实测某图纸 52 条图签文字因此错位）。
+    switch (data.alignV) {
+    case DRW_Text::VBottom: entity->setVAlign(TextEntity::VAlign::Bottom); break;
+    case DRW_Text::VMiddle: entity->setVAlign(TextEntity::VAlign::Middle); break;
+    case DRW_Text::VTop:    entity->setVAlign(TextEntity::VAlign::Top);    break;
+    default:                entity->setVAlign(TextEntity::VAlign::Baseline); break;
+    }
+
     switch (data.alignH) {
     case DRW_Text::HCenter:
+        entity->setHAlign(TextEntity::HAlign::Center);
+        break;
     case DRW_Text::HMiddle:
         entity->setHAlign(TextEntity::HAlign::Center);
+        entity->setVAlign(TextEntity::VAlign::Middle);
         break;
     case DRW_Text::HRight:
         entity->setHAlign(TextEntity::HAlign::Right);
@@ -1189,13 +1125,6 @@ std::unique_ptr<TextEntity> Builder::makeText(const DRW_Text& data, double rotat
     default:
         entity->setHAlign(TextEntity::HAlign::Left);
         break;
-    }
-
-    switch (data.alignV) {
-    case DRW_Text::VBottom: entity->setVAlign(TextEntity::VAlign::Bottom); break;
-    case DRW_Text::VMiddle: entity->setVAlign(TextEntity::VAlign::Middle); break;
-    case DRW_Text::VTop:    entity->setVAlign(TextEntity::VAlign::Top);    break;
-    default:                entity->setVAlign(TextEntity::VAlign::Baseline); break;
     }
 
     // 第二对齐点（11/21）：缺省时回落至插入点，避免对齐文字跑到原点
@@ -1272,28 +1201,29 @@ void Builder::addText(const DRW_Text& data)
 
 void Builder::addMText(const DRW_MText& data)
 {
-    // 多行文字未建模，但内容仍值得保留：取其中的文字并按单行导入。
-    // 这里如实计数，让用户知道它被降级处理过。
-    // MTEXT 的内联格式码（\P 段落、{\W1;…} 宽度、\H/\A/\C/\f 等）
-    // 若原样带出会以反斜杠乱码出现在图面上，先做一次尽力清理。
+    // 多行文字**不再降级**成单行文字：MTEXT 与 TEXT 的定位语义不同（MTEXT 由
+    // 附着点 + 参考矩形宽度定位，中间行的垂直基准是基线到小写高度的中点；TEXT 的
+    // 72=1/73=2 用的是基线到大写高度的中点），降级会让文件在 AutoCAD / 浩辰里
+    // 重新打开时每条文字整体偏移约 0.13 倍字高。这里按 MTEXT 自身语义建独立图元。
     //
-    // 更关键的是 MTEXT 与 TEXT 的组码语义差异——直接复用 DRW_Text 的字段
-    // 会把位置和大小全带偏（实测本文件：文字散落到 x=-5，整图视野失效）：
-    //   · 71 组码在 MTEXT 里是**附着点**（1~9），被库读进了 textgen；
-    //   · 72/73 是流向与行距，被读进了 alignH/alignV；
-    //   · 11 组码是**X 轴方向向量**，被读进了 secPoint（对齐点）；
-    //   · 41 组码是**栏宽**，被读进了 widthscale。
-    // 降级时按 MTEXT 语义重新映射：旋转取自 X 轴方向向量，对齐由附着点换算，
-    // 对齐点 = 插入点，宽度因子固定 1。
-    const QString rawText = toQString(data.text);
-    DRW_Text plain;
-    plain.text = stripMTextCodes(rawText).toStdString();
-    plain.basePoint = data.basePoint;
-    plain.height = data.height;
+    // 组码与库字段的对应（与 DXF 一致，不能照搬 TEXT 的语义）：
+    //   · 10      插入点            -> data.basePoint
+    //   · 11      X 轴方向向量      -> data.secPoint（旋转的唯一来源）
+    //   · 40      字高              -> data.height
+    //   · 41      参考矩形宽度      -> data.widthscale
+    //   · 71      附着点(1~9)       -> data.textgen
+    //   · 72      书写方向          -> data.alignH
+    //   · 73      行距样式          -> data.alignV
+    //   · 44      行距系数          -> data.interlin
+    //   · 210     挤出方向          -> data.extPoint
+    //   · 1/3     内容（原始字符串，含内联格式码）-> data.text
+    //   · 7       文字样式名        -> data.style
+    auto entity = std::make_unique<MTextEntity>(toQString(data.text),
+                                                toPoint(data.basePoint),
+                                                (data.height > kGeomTol) ? data.height : 3.5);
 
-    // 旋转角（弧度）。MTEXT 的旋转写在 11 组码的 X 轴方向向量里——50 组码在
-    // MTEXT 中几乎不出现，只有极少数生成器会直接给角度。因此只要有方向向量就
-    // 按它算 atan2，不依赖 libdxfrw 的 angle 字段。
+    // 旋转：MTEXT 的旋转写在 11 组码的 X 轴方向向量里——50 组码在 MTEXT 中几乎不出现，
+    // 只有极少数生成器会直接给角度。因此只要有方向向量就按它算 atan2。
     //
     // 这里曾经踩过一个坑：libdxfrw-modify 原实现在 DWG 路径上没置位 haveXAxis，
     // hasXAxisDirection() 恒为 false，于是 DWG 里的 MTEXT 一律退回 angle——而 DWG
@@ -1301,83 +1231,48 @@ void Builder::addMText(const DRW_MText& data)
     // 272 条文字里 202 条旋转 90° 的 MTEXT 被画成水平，同一张图的 DXF 全部正确。
     // 库那边已修正，这里同时保留方向向量的优先级。
     double rotationRad = textRotationRadians(data, m_source);
-
-    // 文字 X 轴方向（11 组码）：参考矩形的宽度沿这个方向量
-    Point2D dir(1.0, 0.0);
     if (data.hasXAxisDirection()
         && std::hypot(data.secPoint.x, data.secPoint.y) > kGeomTol) {
-        const double dirLen = std::hypot(data.secPoint.x, data.secPoint.y);
-        dir = Point2D(data.secPoint.x / dirLen, data.secPoint.y / dirLen);
-        rotationRad = std::atan2(dir.y, dir.x);
+        rotationRad = std::atan2(data.secPoint.y, data.secPoint.x);
     }
+    entity->setDirection(Vector2D(std::cos(rotationRad), std::sin(rotationRad)));
 
-    const int attachment = std::clamp(data.textgen, 1, 9);
-    const int column = (attachment - 1) % 3;  // 附着点落在矩形哪条竖边：0 左 1 中 2 右
-    switch (attachment) {                     // 列：0 左 1 中 2 右
-    case 2: case 5: case 8: plain.alignH = DRW_Text::HCenter; break;
-    case 3: case 6: case 9: plain.alignH = DRW_Text::HRight;  break;
-    default:                plain.alignH = DRW_Text::HLeft;   break;
-    }
-    switch (attachment) {                     // 行：0 上 1 中 2 下
-    case 4: case 5: case 6: plain.alignV = DRW_Text::VMiddle; break;
-    case 7: case 8: case 9: plain.alignV = DRW_Text::VBottom; break;
-    default:                plain.alignV = DRW_Text::VTop;    break;
-    }
-    // 段落对齐码（\pxqc; 等）覆盖附着点隐含的横向对齐
-    TextEntity::HAlign paragraph = TextEntity::HAlign::Left;
-    if (paragraphAlignment(rawText, paragraph)) {
-        switch (paragraph) {
-        case TextEntity::HAlign::Center: plain.alignH = DRW_Text::HCenter; break;
-        case TextEntity::HAlign::Right:  plain.alignH = DRW_Text::HRight;  break;
-        default:                         plain.alignH = DRW_Text::HLeft;   break;
-        }
-    }
+    // 附着点（71）：库把 1~9 读进了 textgen，越界值按左上处理
+    entity->setAttachment(MTextEntity::attachmentFromRowColumn(
+        (std::clamp(data.textgen, 1, 9) - 1) / 3,
+        (std::clamp(data.textgen, 1, 9) - 1) % 3));
 
-    // MTEXT 的文字是在一个「插入点 + 宽度」的参考矩形里排版的（41 组码 = 矩形宽度，
-    // 11/21 = 文字 X 轴方向）：插入点是附着点所在的那条边/角，行内文字再按对齐方式
-    // 落在矩形里。降级成单行文字时必须把这份「矩形内的对齐」换算成对齐点，否则整块
-    // 文字会偏最多一个矩形宽——实测本文件 "JK" 偏了 40 个单位（矩形宽 79.24）。
-    const double rectWidth = std::abs(data.widthscale) > kGeomTol
-                             ? std::abs(data.widthscale) : 0.0;
-    const double rectLeft = -column * 0.5 * rectWidth;     // 相对插入点，沿文字方向
-    double anchorAlong = rectLeft;
-    if (plain.alignH == DRW_Text::HCenter)      anchorAlong = rectLeft + rectWidth * 0.5;
-    else if (plain.alignH == DRW_Text::HRight)  anchorAlong = rectLeft + rectWidth;
+    // 参考矩形宽度（41）：真实文件里的**编辑时折行宽度**（显示不据此重排，见 MTextEntity）；
+    // 负值表示"无限制"，统一归一为 0
+    const double rectWidth = std::abs(data.widthscale);
+    entity->setReferenceWidth(rectWidth > kGeomTol ? rectWidth : 0.0);
 
-    plain.secPoint = DRW_Coord(data.basePoint.x + dir.x * anchorAlong,
-                               data.basePoint.y + dir.y * anchorAlong,
-                               data.basePoint.z);
-    plain.textgen = 0;
-    plain.widthscale = 1.0;
-    plain.style = data.style;
+    // 书写方向（72）与行距样式（73）：MTEXT 的这两个组码被库读进了 alignH/alignV
+    switch (static_cast<int>(data.alignH)) {
+    case 3:  entity->setDrawingDirection(MTextEntity::DrawingDirection::TopToBottom); break;
+    case 5:  entity->setDrawingDirection(MTextEntity::DrawingDirection::ByStyle); break;
+    default: entity->setDrawingDirection(MTextEntity::DrawingDirection::LeftToRight); break;
+    }
+    switch (static_cast<int>(data.alignV)) {
+    case 2:  entity->setLineSpacingStyle(MTextEntity::LineSpacingStyle::Exact); break;
+    default: entity->setLineSpacingStyle(MTextEntity::LineSpacingStyle::AtLeast); break;
+    }
+    entity->setLineSpacingFactor(data.interlin);
 
-    // 内联字体码（\fSimSun|b0|i0|c134|p2;）：MTEXT 的字体写在文字里，**优先于**
-    // 图元的样式；剥码时把它一并丢掉，导出后整段字就退回样式里的字体——实测某图纸
-    // 的英文 "KC-DZS05"/"JK" 因此从宋体变成了单线笔画字体。这里把它还原成一条文字
-    // 样式（TrueType 族名 + 字符集标志，或 .shx 文件名），图元挂到该样式上：本软件
-    // 的显示和导出到别的 CAD 都能还原原本的字体。
-    MTextFontOverride inlineFont;
-    if (mtextFontOverride(rawText, inlineFont) && !inlineFont.name.isEmpty()) {
-        const QString styleName = inlineFont.name;
-        TextStyle& style = m_doc.textStyles().ensure(styleName);
-        if (!style.hasFontInfo()) {
-            if (styleName.endsWith(QLatin1String(".shx"), Qt::CaseInsensitive)) {
-                style.setFontFile(styleName);
-            } else {
-                style.setTtfName(styleName);
-                // 字符集与 pitch 打包进字体族标志（AutoCAD 的 1071 组码）：
-                // 高字节是字符集（134 = GB2312），低字节是 pitch
-                style.setTtfFlags((inlineFont.charset << 8) | (inlineFont.pitch & 0xFF));
-            }
-        }
-        plain.style = styleName.toStdString();
-    }
-    auto entity = makeText(plain, rotationRad);
-    if (entity) {
-        applyCommon(*entity, data);
-        place(std::move(entity));
-        downgrade(QStringLiteral("MTEXT(按单行文字导入)"));
-    }
+    // 挤出方向（210）：只做原样往返（几何按文字落在 XY 平面计算）
+    MTextEntity::Normal3D normal;
+    normal.x = data.extPoint.x;
+    normal.y = data.extPoint.y;
+    normal.z = data.extPoint.z;
+    entity->setNormal(normal);
+
+    const QString style = toQString(data.style);
+    if (!style.isEmpty()) entity->setFontStyle(style);
+
+    // 内联字体码（\fSimSun|b0|i0|c134|p2;）原样留在内容里——真实 CAD 打开时按它取字，
+    // 不再像降级时代那样"剥码 + 另建一条文字样式"（那会改掉文件里的内容）。
+    applyCommon(*entity, data);
+    place(std::move(entity));
 }
 
 // -----------------------------------------------------------------------------
@@ -2831,6 +2726,13 @@ public:
             record.name = (style ? style->name() : name).toStdString();
             record.font = font.toStdString();
             record.bigFont = bigFont.toStdString();
+            // 度量字段（DXF 40/41/50）与字体同样属于样式本体：宽度因子不写回，
+            // 浩辰/AutoCAD 会按 1.0 重排全部文字（见 addTextStyle 里的说明）。
+            // DRW_Textstyle 的默认值恰是 height=0 / width=1 / oblique=0，
+            // 文档没有这条样式时保持默认即可。
+            record.height = style ? style->fixedHeight() : 0.0;
+            record.width = style ? style->widthFactor() : 1.0;
+            record.oblique = style ? style->oblique() : 0.0;
             if (style && style->ttfName().isEmpty()) {
                 // 只有字体族标志、没有族名（DWG 路径常见）：写在记录本体上
                 record.fontFamily = style->ttfFlags();
@@ -2856,8 +2758,15 @@ public:
         // 补一条同名的安全样式，避免图元挂在不存在的样式上。
         for (EntityId id : m_doc.drawOrder()) {
             const Entity* entity = m_doc.entity(id);
-            if (!entity || entity->type() != EntityType::Text) continue;
-            const QString name = static_cast<const TextEntity*>(entity)->fontStyle();
+            if (!entity) continue;
+            QString name;
+            if (entity->type() == EntityType::Text) {
+                name = static_cast<const TextEntity*>(entity)->fontStyle();
+            } else if (entity->type() == EntityType::MText) {
+                name = static_cast<const MTextEntity*>(entity)->fontStyle();
+            } else {
+                continue;
+            }
             if (name.isEmpty()) continue;
             const bool already = std::any_of(
                 written.begin(), written.end(),
@@ -2958,6 +2867,7 @@ private:
         case EntityType::Polyline:  writePolyline(static_cast<const PolylineEntity&>(entity)); break;
         case EntityType::Point:     writePoint(static_cast<const PointEntity&>(entity)); break;
         case EntityType::Text:      writeText(static_cast<const TextEntity&>(entity)); break;
+        case EntityType::MText:     writeMText(static_cast<const MTextEntity&>(entity)); break;
         case EntityType::Hatch:     writeHatch(static_cast<const HatchEntity&>(entity)); break;
         case EntityType::Dimension: writeDimension(static_cast<const DimensionEntity&>(entity)); break;
         case EntityType::Spline:    writeSplineCurve(static_cast<const SplineEntity&>(entity)); break;
@@ -3409,7 +3319,7 @@ private:
             record.alignH = static_cast<DRW_Text::HAlign>(1);
             record.alignV = static_cast<DRW_Text::VAlign>(1);
             record.interlin = 1.0;
-            record.widthscale = 0.0;           // 41=0：不按栏宽折行
+            record.widthscale = 0.0;           // 41=0：无宽度限制（对方 CAD 打开时也不会重新折行）
             record.angle = text.rotation() * kRadToDeg;
             record.style = styleName;
             m_rw->writeMText(&record);
@@ -3437,6 +3347,50 @@ private:
             applyCoord(record.secPoint, text.alignmentPoint());
         }
         m_rw->writeText(&record);
+    }
+
+    /// 多行文字的写出：按 MTEXT 自身的组码语义逐字段回写。
+    ///
+    /// 与 TEXT 的区别（也是不能共享一条通道的原因）：
+    ///   · 71 = 附着点（1~9），不是对齐枚举；
+    ///   · 72 = 书写方向、73 = 行距样式、44 = 行距系数；
+    ///   · 11 = X 轴方向向量（旋转的唯一来源，DWG 与 DXF 两条路径同义）；
+    ///   · 41 = 参考矩形宽度（编辑时的折行宽度，0 = 无限制；显示不改内容）；
+    ///   · 内容原样带出——内联格式码（\P、\f、\H…）由模型逐字保存，不再改写。
+    void writeMText(const MTextEntity& text)
+    {
+        if (text.content().isEmpty()) {
+            // 空文字不是合法的 DXF 实体，跳过而非产出坏文件
+            return;
+        }
+
+        const std::string styleName =
+            (text.fontStyle().isEmpty() ? QStringLiteral("Standard") : text.fontStyle())
+                .toStdString();
+
+        DRW_MText record;
+        applyCommonWrite(record, text);
+        applyCoord(record.basePoint, text.insertionPoint());
+
+        record.height = text.height();
+        record.widthscale = text.referenceWidth();
+        record.textgen = static_cast<int>(text.attachment());
+        record.alignH = static_cast<DRW_Text::HAlign>(static_cast<int>(text.drawingDirection()));
+        record.alignV = static_cast<DRW_Text::VAlign>(static_cast<int>(text.lineSpacingStyle()));
+        record.interlin = text.lineSpacingFactor();
+        record.text = text.content().toStdString();
+        record.style = styleName;
+
+        // 210 挤出方向：原样回写（几何按 XY 平面计算，这里只保证文件一致）
+        const MTextEntity::Normal3D normal = text.normal();
+        record.extPoint = DRW_Coord(normal.x, normal.y, normal.z);
+
+        // 旋转：DWG 写出路径由 angle（度）反算方向向量；DXF 路径由 11 组码带出
+        record.angle = text.rotation() * kRadToDeg;
+        const Vector2D direction = text.direction();
+        record.setXAxisDirection(DRW_Coord(direction.x, direction.y, 0.0));
+
+        m_rw->writeMText(&record);
     }
 
     void writeHatch(const HatchEntity& hatch)

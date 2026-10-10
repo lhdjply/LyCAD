@@ -2098,11 +2098,18 @@ bool dwgW::writeMText(DRW_MText* ent)
         dint16 attachment = static_cast<dint16>(ent->textgen);
         if (attachment < 1) attachment = 1;
         b.w.writeBS(attachment);
-        b.w.writeBS(1);                 // 绘制方向：从左到右
+        // 绘制方向（DXF 72）与行距样式（DXF 73）从字段写出：MTEXT 的这两个组码由
+        // DRW_MText 的 alignH / alignV 承载（与读取端同义）。硬编码 1 会把竖排
+        // （TopToBottom）与「固定行距」在往返中悄悄改成默认值。
+        dint16 direction = static_cast<dint16>(ent->alignH);
+        if (direction < 1) direction = 1;               // 1 = 从左到右
+        b.w.writeBS(direction);
         b.w.writeBD(0.0);               // 范围高
         b.w.writeBD(0.0);               // 范围宽
         b.w.writeT(ent->text, d->codec);
-        b.w.writeBS(1);                 // 行距样式：至少
+        dint16 spacingStyle = static_cast<dint16>(ent->alignV);
+        if (spacingStyle < 1) spacingStyle = 1;         // 1 = 至少
+        b.w.writeBS(spacingStyle);
         b.w.writeBD(ent->interlin);
         b.w.writeB(false);
     }, [&](Private::ObjBuilder& b) {

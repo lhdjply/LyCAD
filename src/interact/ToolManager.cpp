@@ -128,8 +128,12 @@ void ToolManager::registerBuiltinTools()
 
     // ---- 注释 ---------------------------------------------------------------
     registerTool(QStringLiteral("TEXT"), { QStringLiteral("DT") },
-                 QStringLiteral("标注文字（先输入内容，再指定插入点）"),
+                 QStringLiteral("单行文字（指定插入点后弹出编辑框）"),
                  [](ToolContext& c) { return std::make_unique<DrawTextTool>(c); });
+
+    registerTool(QStringLiteral("MTEXT"), { QStringLiteral("MT") },
+                 QStringLiteral("多行文字（指定插入点后弹出多行编辑框）"),
+                 [](ToolContext& c) { return std::make_unique<DrawMTextTool>(c); });
 
     registerTool(QStringLiteral("HATCH"), { QStringLiteral("H"), QStringLiteral("BHATCH") },
                  QStringLiteral("填充（取点构成闭合边界，回车填充）"),

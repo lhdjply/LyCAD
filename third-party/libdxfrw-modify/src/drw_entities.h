@@ -860,6 +860,14 @@ public:
     /// 11 组码是否携带 X 轴方向向量（此时 secPoint 是方向而非对齐点）
     bool hasXAxisDirection() const { return haveXAxis; }
 
+    /// 置位 11 组码为「X 轴方向向量」。MTEXT 的旋转只存在这个字段里（没有 50 组码），
+    /// DXF 与 DWG 两条路径同义；写出时也必须置位，否则读者拿不到方向。
+    void setXAxisDirection(const DRW_Coord& dir)
+    {
+        secPoint = dir;
+        haveXAxis = true;
+    }
+
     DRW_MText() {
         eType = DRW::MTEXT;
         interlin = 1;

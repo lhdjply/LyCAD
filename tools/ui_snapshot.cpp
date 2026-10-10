@@ -19,6 +19,7 @@
 #include "core/EllipseEntity.h"
 #include "core/Layer.h"
 #include "core/TableEntity.h"
+#include "core/MTextEntity.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
@@ -31,6 +32,8 @@
 
 #include <QAction>
 #include <QApplication>
+
+#include <algorithm>
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
@@ -1138,14 +1141,36 @@ int main(int argc, char* argv[])
         // 优先挑一条**多行**文字：MTEXT 降级导入的文字内容里带换行，双击后编辑框
         // 必须把每一行都显示出来——这正是「双击多行文字点开没有多行」要盯的场景。
         // 文档里没有多行文字时退回第一条，至少验证单行的编辑链路。
-        const EntityId textId = [doc]() -> EntityId {
+        // 文字有两个图元类型（TEXT / MTEXT），锚点与内容各有一处取法不同：
+        // 用三个小访问器抹平，后面的验证逻辑两种类型共用。
+        const auto isTextEntity = [](const Entity* e) {
+            return e != nullptr
+                   && (e->type() == EntityType::Text || e->type() == EntityType::MText);
+        };
+        const auto textAnchor = [](const Entity* e) {
+            return e->type() == EntityType::Text
+                       ? static_cast<const TextEntity*>(e)->effectivePosition()
+                       : static_cast<const MTextEntity*>(e)->insertionPoint();
+        };
+        const auto textContent = [](const Entity* e) -> QString {
+            return e->type() == EntityType::Text
+                       ? static_cast<const TextEntity*>(e)->content()
+                       : static_cast<const MTextEntity*>(e)->content();
+        };
+        const auto textLineCount = [](const Entity* e) {
+            return e->type() == EntityType::Text
+                       ? static_cast<const TextEntity*>(e)->lineCount()
+                       : static_cast<const MTextEntity*>(e)->paragraphCount();
+        };
+
+        const EntityId textId = [doc, &isTextEntity, &textLineCount]() -> EntityId {
             if (!doc) return kInvalidEntityId;
             EntityId first = kInvalidEntityId;
             for (EntityId id : doc->drawOrder()) {
                 const Entity* entity = doc->entity(id);
-                if (!entity || entity->type() != EntityType::Text) continue;
+                if (!isTextEntity(entity)) continue;
                 if (first == kInvalidEntityId) first = id;
-                if (static_cast<const TextEntity*>(entity)->lineCount() > 1) return id;
+                if (textLineCount(entity) > 1) return id;
             }
             return first;
         }();
@@ -1153,10 +1178,10 @@ int main(int argc, char* argv[])
         if (textId == kInvalidEntityId || !doc) {
             out() << QStringLiteral("  文档中没有文字图元，跳过双击编辑验证。") << Qt::endl;
         } else {
-            auto* text = static_cast<const TextEntity*>(doc->entity(textId));
+            const Entity* text = doc->entity(textId);
 
             // 文字插入点 → 屏幕坐标
-            const Point2D device = canvas->view().toDevice(text->effectivePosition());
+            const Point2D device = canvas->view().toDevice(textAnchor(text));
             const QPoint screen(static_cast<int>(device.x), static_cast<int>(device.y));
 
             // 记录双击实际命中的文字：光标处可能有多条文字的包围盒重叠
@@ -1168,9 +1193,8 @@ int main(int argc, char* argv[])
             // 编辑前记录全部文字内容（命中对象在双击前不可预知）
             QHash<EntityId, QString> contentsBefore;
             for (EntityId id : doc->drawOrder()) {
-                if (doc->entity(id) && doc->entity(id)->type() == EntityType::Text) {
-                    contentsBefore[id] = static_cast<const TextEntity*>(doc->entity(id))->content();
-                }
+                const Entity* entity = doc->entity(id);
+                if (isTextEntity(entity)) contentsBefore[id] = textContent(entity);
             }
 
             // 预约自动应答：先把「刚打开的样子」截下来，再追加后缀 → Alt+Enter 换行
@@ -1179,7 +1203,11 @@ int main(int argc, char* argv[])
             // 出来，只能看图。
             const QString dialogShot = dir.filePath(QStringLiteral("ui_text_dialog.png"));
             const QString editedShot = dir.filePath(QStringLiteral("ui_text_dialog_edit.png"));
-            QTimer::singleShot(250, [dialogShot, editedShot]() {
+            // 这一次双击弹出的是哪种编辑框，决定了后面怎么拼期望值：
+            //   多行框 -> 追加内容 + Alt+Enter 换行 + 第二行
+            //   单行框 -> 只追加内容（单行文字没有换行入口）
+            bool usedMultiLine = false;
+            QTimer::singleShot(250, [&usedMultiLine, dialogShot, editedShot]() {
                 auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
                 if (!modal) return;
 
@@ -1195,16 +1223,29 @@ int main(int argc, char* argv[])
 
                 saveShot(*modal, dialogShot);
 
-                auto* edit = modal->findChild<QPlainTextEdit*>();
-                if (!edit) return;
-
-                edit->setPlainText(edit->toPlainText() + QStringLiteral("-已编辑"));
-                edit->moveCursor(QTextCursor::End);
-                QTest::keyClick(edit, Qt::Key_Return, Qt::AltModifier);   // 换行
-                edit->insertPlainText(QStringLiteral("第二行"));
-                QApplication::processEvents();
-                saveShot(*modal, editedShot);
-                QTest::keyClick(edit, Qt::Key_Return, Qt::NoModifier);    // 确认
+                // 两种文字走两种编辑框（多行文字 = 可换行的 QPlainTextEdit，
+                // 单行文字 = QLineEdit）。按 objectName 取实际弹出的那一个，
+                // 不猜类型——猜错会让模态框一直开着，把测试卡死。
+                if (auto* multi = modal->findChild<QPlainTextEdit*>(
+                        QStringLiteral("textEditDialog.multiLine"))) {
+                    usedMultiLine = true;
+                    multi->setPlainText(multi->toPlainText() + QStringLiteral("-已编辑"));
+                    multi->moveCursor(QTextCursor::End);
+                    QTest::keyClick(multi, Qt::Key_Return, Qt::AltModifier);   // 换行
+                    multi->insertPlainText(QStringLiteral("第二行"));
+                    QApplication::processEvents();
+                    saveShot(*modal, editedShot);
+                    QTest::keyClick(multi, Qt::Key_Return, Qt::NoModifier);    // 确认
+                } else if (auto* single = modal->findChild<QLineEdit*>(
+                               QStringLiteral("textEditDialog.singleLine"))) {
+                    single->setText(single->text() + QStringLiteral("-已编辑"));
+                    single->setCursorPosition(single->text().size());
+                    QApplication::processEvents();
+                    saveShot(*modal, editedShot);
+                    QTest::keyClick(single, Qt::Key_Return, Qt::NoModifier);   // 确认
+                } else {
+                    modal->reject();    // 兜底：不要让模态框把后续测试挂住
+                }
             });
 
             QTest::mouseDClick(canvas, Qt::LeftButton, Qt::NoModifier, screen);
@@ -1215,28 +1256,36 @@ int main(int argc, char* argv[])
                 ++failures;
             } else {
                 const QString before = contentsBefore.value(editTarget);
+                const Entity* edited = doc->entity(editTarget);
+                // 多行文字的段落分隔在模型里是 \P（编辑框里显示成换行），
+                // 单行文字直接就是 \n——期望值按类型各拼一次。
+                const QString newline =
+                    (edited && edited->type() == EntityType::MText)
+                        ? QStringLiteral("\\P")
+                        : QStringLiteral("\n");
+                // 单行框没有换行入口，期望值也就没有"第二行"那一半
                 const QString expected =
-                    before + QStringLiteral("-已编辑\n第二行");
-                const auto* edited =
-                    static_cast<const TextEntity*>(doc->entity(editTarget));
-                const QString after = edited->content();
+                    usedMultiLine
+                        ? before + QStringLiteral("-已编辑") + newline
+                              + QStringLiteral("第二行")
+                        : before + QStringLiteral("-已编辑");
+                const QString after = edited ? textContent(edited) : QString();
 
                 if (after == expected) {
                     out() << QStringLiteral("  双击编辑链路：命中文字 #%1，"
                                             "原文 %2 行 → 编辑后 %3 行")
                                  .arg(editTarget)
-                                 .arg(before.count(QLatin1Char('\n')) + 1)
-                                 .arg(edited->lineCount())
+                                 .arg(before.count(newline.at(0)) + 1)
+                                 .arg(edited ? textLineCount(edited) : 0)
                           << Qt::endl;
 
                     // 撤销应还原原文，重做应再次生效
                     doc->undoStack()->undo();
-                    const bool undoOk =
-                        static_cast<const TextEntity*>(doc->entity(editTarget))->content() == before;
+                    const Entity* undone = doc->entity(editTarget);
+                    const bool undoOk = undone && textContent(undone) == before;
                     doc->undoStack()->redo();
-                    const bool redoOk =
-                        static_cast<const TextEntity*>(doc->entity(editTarget))->content()
-                            == expected;
+                    const Entity* redone = doc->entity(editTarget);
+                    const bool redoOk = redone && textContent(redone) == expected;
                     out() << QStringLiteral("  撤销/重做: %1 / %2")
                                  .arg(undoOk ? QStringLiteral("通过")
                                              : QStringLiteral("失败"),
@@ -1262,6 +1311,116 @@ int main(int argc, char* argv[])
             }
             doc->selection().clear();
             QObject::disconnect(tools, &ToolManager::textEditRequested, nullptr, nullptr);
+        }
+
+        // ---- 快照 4b：新建文字 —— 单行 / 多行工具各弹各的编辑框 ----------------
+        //
+        // 「工具栏上点的是哪一种文字」的端到端验证：
+        //   · 单行文字（TEXT）  -> 单行输入框（没有换行入口）
+        //   · 多行文字（MTEXT） -> 多行编辑框（Alt+Enter 换行）
+        // 两种工具各跑一遍，并在画布上确认落下来的图元类型与内容对得上。
+        if (canvas->document()) {
+            Document* toolDoc = canvas->document();
+            // 画布右下角的空白处：激活的是文字工具，点在哪只决定插入点
+            const QPoint spot(canvas->width() * 3 / 4, canvas->height() * 3 / 4);
+
+            struct NewTextCase {
+                const char* command;
+                bool        expectMultiLine;    ///< 应当弹出多行编辑框
+                bool        expectMText;        ///< 应当落成多行文字图元
+                QString     typed;              ///< 在编辑框里输入的内容（'\n' = 换行）
+            };
+            const NewTextCase cases[] = {
+                { "TEXT", false, false, QStringLiteral("单行样文字") },
+                { "MTEXT", true, true, QStringLiteral("多行第一段\n多行第二段") },
+            };
+
+            for (const NewTextCase& one : cases) {
+                const QString command = QString::fromLatin1(one.command);
+                bool sawMultiLine = false;
+                bool sawSingleLine = false;
+                const QString typed = one.typed;
+
+                // 预约应答：模态框弹出后按 objectName 认出是哪一种编辑框，
+                // 输入内容再回车确认。
+                QTimer::singleShot(200, [&sawMultiLine, &sawSingleLine, typed]() {
+                    auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                    if (!modal) return;
+                    if (auto* multi = modal->findChild<QPlainTextEdit*>(
+                            QStringLiteral("textEditDialog.multiLine"))) {
+                        sawMultiLine = true;
+                        multi->setPlainText(typed);
+                        QTest::keyClick(multi, Qt::Key_Return, Qt::NoModifier);   // 确认
+                        return;
+                    }
+                    if (auto* single = modal->findChild<QLineEdit*>(
+                            QStringLiteral("textEditDialog.singleLine"))) {
+                        sawSingleLine = true;
+                        // 单行框装不下换行：只取第一行（工具也不该产生多行内容）
+                        single->setText(typed.section(QLatin1Char('\n'), 0, 0));
+                        QTest::keyClick(single, Qt::Key_Return, Qt::NoModifier);
+                        return;
+                    }
+                    modal->reject();
+                });
+
+                std::vector<EntityId> before;
+                for (EntityId id : toolDoc->drawOrder()) before.push_back(id);
+
+                if (!tools->execute(command)) {
+                    out() << QStringLiteral("  命令 %1 未注册，新建文字验证跳过。").arg(command)
+                          << Qt::endl;
+                    ++failures;
+                    continue;
+                }
+                QTest::mouseClick(canvas, Qt::LeftButton, Qt::NoModifier, spot);
+                settle(application, 200);
+
+                EntityId createdId = kInvalidEntityId;
+                for (EntityId id : toolDoc->drawOrder()) {
+                    if (std::find(before.begin(), before.end(), id) == before.end()) {
+                        createdId = id;
+                        break;
+                    }
+                }
+                const Entity* created = toolDoc->entity(createdId);
+
+                const bool typeOk = created != nullptr
+                                    && (one.expectMText
+                                            ? created->type() == EntityType::MText
+                                            : created->type() == EntityType::Text);
+                const QString actual = created ? textContent(created) : QString();
+                // 多行文字在模型里用 \P 作段落分隔，编辑框里输入的是换行
+                const QString expected = one.expectMText
+                                             ? QString(typed).replace(QLatin1Char('\n'),
+                                                                      QStringLiteral("\\P"))
+                                             : typed;
+                const bool contentOk = (actual == expected);
+                const bool dialogOk = one.expectMultiLine ? (sawMultiLine && !sawSingleLine)
+                                                          : (sawSingleLine && !sawMultiLine);
+
+                out() << QStringLiteral("  新建%1：编辑框 %2 / 图元类型 %3 / 内容 %4")
+                             .arg(one.expectMText ? QStringLiteral("多行文字")
+                                                  : QStringLiteral("单行文字"),
+                                  dialogOk ? (sawMultiLine ? QStringLiteral("多行框")
+                                                           : QStringLiteral("单行框"))
+                                           : QStringLiteral("不符"),
+                                  typeOk ? (one.expectMText ? QStringLiteral("MTEXT")
+                                                            : QStringLiteral("TEXT"))
+                                         : QStringLiteral("不符"),
+                                  contentOk ? QStringLiteral("一致")
+                                            : QStringLiteral("不一致"))
+                      << Qt::endl;
+                if (!typeOk || !contentOk || !dialogOk) {
+                    out() << QStringLiteral("    期望 %1，实际 %2")
+                                 .arg(expected, actual)
+                          << Qt::endl;
+                    ++failures;
+                }
+
+                // 撤掉刚建的文字，别让它影响后面的快照（特性面板会挑到它）
+                if (createdId != kInvalidEntityId) toolDoc->undoStack()->undo();
+            }
         }
 
         // ---- 快照 5：特性面板的「文字」组（字高 / 旋转 / 对齐）------------------
@@ -1296,10 +1455,17 @@ int main(int argc, char* argv[])
                 ++failures;
             } else {
                 // 选一条文字：面板应显示它的字高与旋转，并露出「文字」组
+                // 优先挑单行文字（面板上还有 72/73 对齐两行可验）；
+                // 全图都是多行文字时退回 MTEXT——它同样有字高/旋转/字体三行，
+                // 另有附着点与参考栏宽两行（下面按类型分别驱动）。
                 const EntityId target = [propertyDoc]() -> EntityId {
                     for (EntityId id : propertyDoc->drawOrder()) {
                         const Entity* e = propertyDoc->entity(id);
                         if (e && e->type() == EntityType::Text) return id;
+                    }
+                    for (EntityId id : propertyDoc->drawOrder()) {
+                        const Entity* e = propertyDoc->entity(id);
+                        if (e && e->type() == EntityType::MText) return id;
                     }
                     return kInvalidEntityId;
                 }();
@@ -1310,13 +1476,33 @@ int main(int argc, char* argv[])
                     propertyDoc->selection().setIds({ target });
                     settle(application, 120);
 
-                    const auto* before =
-                        static_cast<const TextEntity*>(propertyDoc->entity(target));
-                    const double originalHeight = before->height();
-                    const double originalRotation = before->rotation();
-                    const TextEntity::HAlign originalHAlign = before->hAlign();
-                    const TextEntity::VAlign originalVAlign = before->vAlign();
-                    const QString originalFont = before->fontStyle();
+                    const Entity* beforeEntity = propertyDoc->entity(target);
+                    const bool targetIsMText = beforeEntity->type() == EntityType::MText;
+                    const double originalHeight =
+                        targetIsMText ? static_cast<const MTextEntity*>(beforeEntity)->height()
+                                      : static_cast<const TextEntity*>(beforeEntity)->height();
+                    const double originalRotation =
+                        targetIsMText ? static_cast<const MTextEntity*>(beforeEntity)->rotation()
+                                      : static_cast<const TextEntity*>(beforeEntity)->rotation();
+                    const TextEntity::HAlign originalHAlign =
+                        targetIsMText ? TextEntity::HAlign::Left
+                                      : static_cast<const TextEntity*>(beforeEntity)->hAlign();
+                    const TextEntity::VAlign originalVAlign =
+                        targetIsMText ? TextEntity::VAlign::Baseline
+                                      : static_cast<const TextEntity*>(beforeEntity)->vAlign();
+                    const MTextEntity::Attachment originalAttachment =
+                        targetIsMText
+                            ? static_cast<const MTextEntity*>(beforeEntity)->attachment()
+                            : MTextEntity::Attachment::TopLeft;
+                    const double originalWidth =
+                        targetIsMText
+                            ? static_cast<const MTextEntity*>(beforeEntity)->referenceWidth()
+                            : 0.0;
+                    const QString originalFont = targetIsMText
+                                                     ? static_cast<const MTextEntity*>(beforeEntity)
+                                                           ->fontStyle()
+                                                     : static_cast<const TextEntity*>(beforeEntity)
+                                                           ->fontStyle();
                     const int records = propertyDoc->undoStack()->index();
 
                     if (!textGroup->isVisible()) {
@@ -1346,41 +1532,92 @@ int main(int argc, char* argv[])
                             : QString();
                     const bool fontChanges = targetFont != originalFont;
 
-                    // 逐项驱动：字高、旋转、水平对齐、垂直对齐、字体
+                    // 多行文字独有：附着点与参考栏宽（单行文字的面板上这两行是隐藏的）
+                    auto* attachBox = panel->findChild<QComboBox*>(
+                        QStringLiteral("propertyPanel.mtextAttachment"));
+                    auto* widthBox = panel->findChild<QDoubleSpinBox*>(
+                        QStringLiteral("propertyPanel.mtextWidth"));
+                    const MTextEntity::Attachment targetAttachment =
+                        originalAttachment == MTextEntity::Attachment::MiddleRight
+                            ? MTextEntity::Attachment::TopLeft
+                            : MTextEntity::Attachment::MiddleRight;
+                    const double targetWidth = std::abs(originalWidth - 8.0) > 1e-6 ? 8.0 : 12.0;
+                    const bool drivesMTextRows = targetIsMText && attachBox && widthBox;
+
+                    // 逐项驱动：字高、旋转、（单行）水平/垂直对齐、（多行）附着点/栏宽、字体
                     heightBox->setValue(targetHeight);
                     rotationBox->setValue(targetRotationDeg);          // 面板给的是度
-                    hAlignBox->setCurrentIndex(
-                        hAlignBox->findData(static_cast<int>(targetHAlign)));
-                    vAlignBox->setCurrentIndex(
-                        vAlignBox->findData(static_cast<int>(targetVAlign)));
+                    if (!targetIsMText) {
+                        hAlignBox->setCurrentIndex(
+                            hAlignBox->findData(static_cast<int>(targetHAlign)));
+                        vAlignBox->setCurrentIndex(
+                            vAlignBox->findData(static_cast<int>(targetVAlign)));
+                    } else if (drivesMTextRows) {
+                        attachBox->setCurrentIndex(
+                            attachBox->findData(static_cast<int>(targetAttachment)));
+                        widthBox->setValue(targetWidth);
+                    }
                     if (fontChanges) {
                         fontBox->setCurrentIndex(fontBox->findData(targetFont));
                     }
                     settle(application, 120);
 
-                    const auto* after =
-                        static_cast<const TextEntity*>(propertyDoc->entity(target));
-                    const bool heightOk = std::abs(after->height() - targetHeight) < 1e-6;
+                    const Entity* afterEntity = propertyDoc->entity(target);
+                    const bool heightOk =
+                        std::abs((targetIsMText ? static_cast<const MTextEntity*>(afterEntity)->height()
+                                                : static_cast<const TextEntity*>(afterEntity)->height())
+                                 - targetHeight) < 1e-6;
                     const bool rotationOk =
-                        std::abs(after->rotation() - degToRad(targetRotationDeg)) < 1e-6;
-                    const bool hAlignOk = after->hAlign() == targetHAlign;
-                    const bool vAlignOk = after->vAlign() == targetVAlign;
-                    const bool fontOk = !fontChanges || after->fontStyle() == targetFont;
+                        std::abs((targetIsMText
+                                      ? static_cast<const MTextEntity*>(afterEntity)->rotation()
+                                      : static_cast<const TextEntity*>(afterEntity)->rotation())
+                                 - degToRad(targetRotationDeg)) < 1e-6;
+                    const bool hAlignOk =
+                        targetIsMText
+                            || static_cast<const TextEntity*>(afterEntity)->hAlign() == targetHAlign;
+                    const bool vAlignOk =
+                        targetIsMText
+                            || static_cast<const TextEntity*>(afterEntity)->vAlign() == targetVAlign;
+                    const bool attachmentOk =
+                        !drivesMTextRows
+                            || static_cast<const MTextEntity*>(afterEntity)->attachment()
+                                   == targetAttachment;
+                    const bool widthOk =
+                        !drivesMTextRows
+                            || std::abs(static_cast<const MTextEntity*>(afterEntity)->referenceWidth()
+                                        - targetWidth) < 1e-6;
+                    const bool fontOk =
+                        !fontChanges
+                        || (targetIsMText
+                                ? static_cast<const MTextEntity*>(afterEntity)->fontStyle()
+                                : static_cast<const TextEntity*>(afterEntity)->fontStyle())
+                               == targetFont;
+                    const int expectedRecords = (targetIsMText ? (drivesMTextRows ? 4 : 2) : 4)
+                                                + (fontChanges ? 1 : 0);
                     const bool undoOk =
-                        propertyDoc->undoStack()->index() == records + 4 + (fontChanges ? 1 : 0);
+                        propertyDoc->undoStack()->index() == records + expectedRecords;
 
-                    out() << QStringLiteral("  特性面板文字组：字高 %1 / 旋转 %2 / 水平对齐 %3 / "
-                                            "垂直对齐 %4 / 字体 %5 / 撤销记录 %6")
-                                 .arg(heightOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                    out() << QStringLiteral("  特性面板文字组(%1)：字高 %2 / 旋转 %3 / "
+                                            "水平对齐 %4 / 垂直对齐 %5 / 字体 %6 / %7 / "
+                                            "撤销记录 %8")
+                                 .arg(targetIsMText ? QStringLiteral("多行") : QStringLiteral("单行"),
+                                      heightOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       rotationOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       hAlignOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       vAlignOk ? QStringLiteral("通过") : QStringLiteral("失败"),
                                       fontOk ? QStringLiteral("通过") : QStringLiteral("失败"))
-                                 .arg(undoOk ? QStringLiteral("+%1").arg(4 + (fontChanges ? 1 : 0))
+                                 .arg(drivesMTextRows
+                                          ? QStringLiteral("附着点+栏宽 %1 / %2")
+                                                .arg(attachmentOk ? QStringLiteral("通过")
+                                                                  : QStringLiteral("失败"),
+                                                     widthOk ? QStringLiteral("通过")
+                                                             : QStringLiteral("失败"))
+                                          : QStringLiteral("附着点+栏宽 不适用"))
+                                 .arg(undoOk ? QStringLiteral("+%1").arg(expectedRecords)
                                              : QStringLiteral("异常"))
                           << Qt::endl;
                     if (!heightOk || !rotationOk || !hAlignOk || !vAlignOk || !fontOk
-                        || !undoOk) {
+                        || !attachmentOk || !widthOk || !undoOk) {
                         ++failures;
                     }
 
@@ -1388,13 +1625,29 @@ int main(int argc, char* argv[])
                     while (propertyDoc->undoStack()->index() > records) {
                         propertyDoc->undoStack()->undo();
                     }
-                    const auto* restored =
-                        static_cast<const TextEntity*>(propertyDoc->entity(target));
-                    if (std::abs(restored->height() - originalHeight) > 1e-9
-                        || std::abs(restored->rotation() - originalRotation) > 1e-9
-                        || restored->hAlign() != originalHAlign
-                        || restored->vAlign() != originalVAlign
-                        || restored->fontStyle() != originalFont) {
+                    const Entity* restored = propertyDoc->entity(target);
+                    const bool restoredOk =
+                        targetIsMText
+                            ? (std::abs(static_cast<const MTextEntity*>(restored)->height()
+                                        - originalHeight) < 1e-9
+                               && std::abs(static_cast<const MTextEntity*>(restored)->rotation()
+                                           - originalRotation) < 1e-9
+                               && static_cast<const MTextEntity*>(restored)->attachment()
+                                      == originalAttachment
+                               && std::abs(static_cast<const MTextEntity*>(restored)
+                                               ->referenceWidth()
+                                           - originalWidth) < 1e-9
+                               && static_cast<const MTextEntity*>(restored)->fontStyle()
+                                      == originalFont)
+                            : (std::abs(static_cast<const TextEntity*>(restored)->height()
+                                        - originalHeight) < 1e-9
+                               && std::abs(static_cast<const TextEntity*>(restored)->rotation()
+                                           - originalRotation) < 1e-9
+                               && static_cast<const TextEntity*>(restored)->hAlign() == originalHAlign
+                               && static_cast<const TextEntity*>(restored)->vAlign() == originalVAlign
+                               && static_cast<const TextEntity*>(restored)->fontStyle()
+                                      == originalFont);
+                    if (!restoredOk) {
                         out() << QStringLiteral("  撤销后文字属性没有回到原值。") << Qt::endl;
                         ++failures;
                     }
@@ -1403,7 +1656,10 @@ int main(int argc, char* argv[])
                     const EntityId other = [propertyDoc]() -> EntityId {
                         for (EntityId id : propertyDoc->drawOrder()) {
                             const Entity* e = propertyDoc->entity(id);
-                            if (e && e->type() != EntityType::Text) return id;
+                            if (e && e->type() != EntityType::Text
+                                && e->type() != EntityType::MText) {
+                                return id;
+                            }
                         }
                         return kInvalidEntityId;
                     }();
