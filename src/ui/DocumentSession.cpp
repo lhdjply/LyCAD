@@ -16,8 +16,8 @@ DocumentSession::DocumentSession(QObject* parent)
     // 画布持有文档负责「画」，工具管理器持有文档与画布负责「改」，
     // 画布的输入事件统一路由给工具管理器。
     document = new Document(this);
-    // 画布是 QWidget，父对象只能是窗体层级——传入空指针，addTab 把它
-    // 放进标签页容器时会被 QTabWidget 认领，生命周期仍随会话结束
+    // 画布是 QWidget，父对象只能是窗体层级——传入空指针；MainWindow 随后会
+    // 用 addTab 把它放进标签页容器，由容器认领并持有（见析构函数的说明）
     canvas   = new CadCanvas(nullptr);
     canvas->setDocument(document);
 
@@ -32,7 +32,7 @@ DocumentSession::DocumentSession(QObject* parent)
 
 DocumentSession::~DocumentSession()
 {
-    delete canvas;   // 见头文件中的说明：画布不在 Qt 父子链上，手动回收
+
 }
 
 } // namespace lycad

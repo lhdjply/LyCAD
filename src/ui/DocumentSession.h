@@ -24,8 +24,10 @@ class ToolManager;
 class DocumentSession : public QObject {
 public:
     explicit DocumentSession(QObject* parent = nullptr);
-    /// 画布不是本会话的 QObject 子对象（它被标签页容器认领、关闭标签页后
-    /// 处于无父状态），必须在这里显式回收；文档与工具管理器由 Qt 父子机制清理
+    /// 画布是 QWidget，自始至终由标签页容器（QTabWidget）以父子关系持有并回收；
+    /// 会话只保留一个非拥有指针，不参与画布的生命周期管理——早期版本在这里
+    /// delete 画布，与容器的回收撞成双重释放（关闭程序必崩，见 .cpp 的说明）。
+    /// 文档与工具管理器是本会话的 QObject 子对象，由 Qt 父子机制清理。
     ~DocumentSession() override;
 
     Document*    document = nullptr;   ///< 几何模型（会话私有）

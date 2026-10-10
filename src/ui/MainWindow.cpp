@@ -1157,7 +1157,17 @@ void MainWindow::closeSession(int index, bool confirmSave)
     if (confirmSave && !maybeSaveSession(session)) return;
 
     m_sessions.removeAt(index);
-    m_tabs->removeTab(index);   // 只摘页面，不删除控件；会话由父对象统一回收
+    m_tabs->removeTab(index);   // 只摘页面，不删除控件
+
+    // 画布自始至终由标签页容器持有（QWidget 父子关系）：removeTab 只摘掉标签，
+    // 页面仍挂在容器内部，必须在这里显式回收，否则它会一直以隐藏页面留在容器里。
+    // 这是关闭标签页时回收画布的唯一一处——DocumentSession 不再负责画布，
+    // 退出程序时则由容器统一销毁（两处各管一条路，不会重复回收）。
+    if (session->canvas) {
+        delete session->canvas;
+        session->canvas = nullptr;
+    }
+
     if (session == m_session) m_session = nullptr;   // 强制下面的重挂到新活动页
     session->deleteLater();
 
