@@ -185,8 +185,16 @@ bool dwgReader18::readMetaData() {
     DRW_DBG("\napp maintenance version= "); DRW_DBGH(fileBuf->getRawChar8());
     duint16 cp = fileBuf->getRawShort16();
     DRW_DBG("\ncodepage= "); DRW_DBG(cp);
-    if (cp == 30)
+    if (cp == 29 || cp == 30)
         decoder.setCodePage("ANSI_1252", false);
+    else if (cp == 38)
+        decoder.setCodePage("ANSI_932", false);
+    else if (cp == 39)
+        decoder.setCodePage("ANSI_936", false);
+    else if (cp == 40)
+        decoder.setCodePage("ANSI_949", false);
+    else if (cp == 41)
+        decoder.setCodePage("ANSI_950", false);
     DRW_DBG("\n3 0x00 bytes(seems 0x00, appDwgV & appMaintV) = "); DRW_DBGH(fileBuf->getRawChar8()); DRW_DBG(", ");
     DRW_DBGH(fileBuf->getRawChar8()); DRW_DBG(", "); DRW_DBGH(fileBuf->getRawChar8());
     securityFlags = fileBuf->getRawLong32();

@@ -331,10 +331,12 @@ void buildSample(Document& document)
     document.endBatchLoad();
 }
 
-int writeOne(const Document& document, const QString& path, const QString& version)
+int writeOne(const Document& document, const QString& path, const QString& version,
+             const QString& dwgVersion = QString())
 {
     WriteOptions options;
     options.version = version;
+    if (!dwgVersion.isEmpty()) options.dwgVersion = dwgVersion;   // 写 DWG 时的目标版本
 
     const IoResult result = CadFile::save(path, document, options);
 
@@ -462,7 +464,13 @@ int main(int argc, char* argv[])
         // 不能直接调 writeDxfWithLibDxfRw——否则 .dwg 里装的是 DXF 文本，
         // 再打开时会被文件头签名检查拦下（提示"不具备 DWG 的文件头签名"）。
         WriteOptions options;
-        options.version = version;
+        if (arguments.at(3).endsWith(QStringLiteral(".dwg"), Qt::CaseInsensitive)) {
+            // DWG 的写出版本由 dwgVersion 决定（与 DXF 的 version 各管一路）
+            options.dwgVersion = (version.compare(QStringLiteral("AC1015"), Qt::CaseInsensitive) == 0)
+                                     ? QStringLiteral("AC1015") : QStringLiteral("AC1018");
+        } else {
+            options.version = version;
+        }
         const IoResult written = CadFile::save(arguments.at(3), document, options);
         out() << QStringLiteral("转换 %1 → %2 (%3)：图元 %4，%5")
                      .arg(arguments.at(2), arguments.at(3), version)
@@ -530,12 +538,14 @@ int main(int argc, char* argv[])
                                                  .arg(QLatin1String(target.year)),
                              QString::fromLatin1(target.version));
     }
-    // DWG：走内置 dwgW 原生写出（目标版本恒为 R2000），与 DXF 同内容，
-    // 供「同一张图两种格式」的交叉比对。只出 R2000 一份——
-    // DWG 的写出版本不随 DXF 的版本矩阵变化，重复 6 份没有意义。
+    // DWG：走内置 dwgW 原生写出，与 DXF 同内容，供「同一张图两种格式」的
+    // 交叉比对。R2000 / R2004 各一份（写出版本由 WriteOptions::dwgVersion 决定）。
     failures += writeOne(document,
                          dirOf(kTargets[0]) + QStringLiteral("/lycad_sample_2000.dwg"),
-                         QStringLiteral("AC1015"));
+                         QStringLiteral("AC1015"), QStringLiteral("AC1015"));
+    failures += writeOne(document,
+                         dirOf(kTargets[1]) + QStringLiteral("/lycad_sample_2004.dwg"),
+                         QStringLiteral("AC1018"), QStringLiteral("AC1018"));
 
     if (failures == 0) {
         out() << QStringLiteral("完成。") << Qt::endl;

@@ -123,9 +123,10 @@ QStringList DwgCodec::writeExtensions() const
 
 QString DwgCodec::writeFilter() const
 {
-    // 写出版本恒为 AC1015（见 write），过滤器名里点明，
-    // 与「另存为」列表中逐版本的 DXF 条目保持同一套说法。
-    return QStringLiteral("AutoCAD 2000 DWG 文件 (*.dwg)");
+    // 写出版本由 WriteOptions::dwgVersion 决定（当前默认 AC1015 / AutoCAD 2000）。
+    // 与「另存为」里逐版本的 DWG 条目保持同一套说法，这里给出默认档的名字。
+    return QStringLiteral("%1 DWG 文件 (*.dwg)")
+        .arg(WriteOptions::dwgVersionShortName(WriteOptions::defaultDwgVersion()));
 }
 
 bool DwgCodec::probe(QIODevice& device) const
@@ -144,7 +145,8 @@ QString DwgCodec::capabilityNote() const
 {
     return QStringLiteral(
         "DWG 读取：内置 libdxfrw 原生解析，支持 R14 ~ 2018（AC1012 ~ AC1032）。\n"
-        "DWG 写出：内置 dwgW 原生写出 R2000（AC1015）。\n"
+        "DWG 写出：内置 dwgW 原生写出，默认 R2004（AC1018，分页 + LZ77 容器）；"
+        "另存为时可选 R2000（AC1015，线性容器）。两者均已随工程测试闭环。\n"
         "表格（ACAD_TABLE）：R2000 ~ 2018 读取均可从实体本体还原行列结构、"
         "单元格文字、合并与对齐（个别异常文件退回 *Tnn 几何块反推）；\n"
         "写出时几何完整保留且单元格文字随原生表格实体写出，AutoCAD 可直接"
@@ -187,11 +189,19 @@ IoResult DwgCodec::read(const QString& path, Document& document) const
 IoResult DwgCodec::write(const QString& path, const Document& document,
                          const WriteOptions& options) const
 {
-    // 内置 dwgW 原生写出，目标版本固定 AC1015（AutoCAD 2000/R2000）：
-    // 兼容面最广，AutoCAD 2000 及以上的版本都能直接打开。
+    // 目标版本由 WriteOptions::dwgVersion 决定（默认 AC1018 / AutoCAD 2004）：
+    //   · AC1018 —— R2004 分页容器（0x100 文件头 + LZ77 分页 + 段/页映射）；
+    //   · AC1015 —— R2000 线性容器，兼容面最广。
+    // 非法取值在适配层回退到 AC1015。
+    const bool ac1018 =
+        options.dwgVersion.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0;
+
     IoResult result = writeDwgWithLibDxfRw(path, document, options);
     if (result.ok) {
-        result.addWarning(QStringLiteral("已由内置 dwgW 原生写出（AutoCAD 2000/R2000 格式）"));
+        result.addWarning(ac1018
+            ? QStringLiteral("已由内置 dwgW 原生写出（AutoCAD 2004/R2004 格式）")
+            : QStringLiteral("已由内置 dwgW 原生写出（AutoCAD 2000/R2000 格式）"));
+
     }
     return result;
 }

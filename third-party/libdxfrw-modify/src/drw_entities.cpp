@@ -1184,9 +1184,13 @@ bool DRW_Table::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     bool hasAttrib = buf->getBit();
     DRW_DBG("   has Attrib: "); DRW_DBG(hasAttrib);
 
-    // 2004+ 有属性个数
+    // 2004+ 的「所拥有对象数」只在 has_attribs 为真时存在——它与 INSERT 是
+    // 同一个字段（DRW_Insert::parseDwg 同为 `if (hasAttrib && version > AC1015)`），
+    // 语义是「本实体拥有的 ATTRIB/SEQEND 个数」。
+    // 表格的 has_attribs 恒为 false，AutoCAD 不写该字段；此前的无条件读取会让
+    // 数据流错位 3 位，把 num_cols / num_rows 读成垃圾值。
     dint32 numOwned = 0;
-    if (version > DRW::AC1015) {
+    if (hasAttrib && version > DRW::AC1015) {
         numOwned = buf->getBitLong();
         DRW_DBG(", numOwned: "); DRW_DBG(numOwned);
     }
@@ -2014,7 +2018,7 @@ bool DRW_Attdef::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     }
     if (!parseDwgTextData(version, buf, sBuf, bs)) return false;
 
-    // 属性专属尾部。顺序依 libredwg dwg.spec 的 ATTDEF（R2000 分支，非 DXF 侧）：
+    // 属性专属尾部
     //   标签 T → 字段长度 BS → 标志 RC → 提示 T
     // 这里有个陷阱：**标志是 RC（1 字节），不是 BS**，而且它前面还有一个字段长度。
     // 少了这两步，句柄流会整体错位、buf->isGood() 为假。实测一张 AutoCAD 2000
@@ -2135,7 +2139,6 @@ bool DRW_DimArc::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     }
 
     // 弧长标注在 DWG 里是**类对象**（CLASSES 段里登记 ARC_DIMENSION），字段序
-    // 依 libredwg dwg2.spec 的 ARC_DIMENSION（非 DXF 分支）：
     //   定义点 3BD → 界线 1 3BD → 界线 2 3BD → 弧心 3BD → is_partial 位
     //   → 起参数 BD → 止参数 BD → has_leader 位 → 引线 1 3BD → 引线 2 3BD
     // 注意定义点（DXF 10 组码）在 DWG 里是放在子类段里的，与其它标注同构。
@@ -3271,8 +3274,7 @@ bool DRW_Dimension::parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer *sB
         duint8 dimVersion = buf->getRawChar8();
         DRW_DBG("\ndimVersion: "); DRW_DBG(dimVersion);
     }
-    // 标注的拉伸方向在 R13-R15 均为普通 3BD（LibreDWG 对真实 AutoCAD 文件的
-    // 解码已验证），没有公共实体数据那种「默认标志位」，也没有附加未知位。
+    // 标注的拉伸方向在 R13-R15 均为普通 3BD，没有公共实体数据那种「默认标志位」，也没有附加未知位。
     extPoint = buf->get3BitDouble();
     DRW_DBG("\nextPoint: "); DRW_DBGPT(extPoint.x, extPoint.y, extPoint.z);
     textPoint.x = buf->getRawDouble();

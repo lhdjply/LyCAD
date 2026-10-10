@@ -78,6 +78,39 @@ QStringList WriteOptions::availableDxfVersions()
 }
 
 // -----------------------------------------------------------------------------
+//  DWG 写出版本
+//
+//  与 DXF 分开成一路：DWG 的容器格式随版本变化（R2000 线性 / R2004 分页 +
+//  LZ77），写出版本因此必须显式选择，不能跟着 DXF 的 version 走。
+//  按版本从低到高排列，界面据此生成「另存为」的逐版本条目。
+// -----------------------------------------------------------------------------
+QStringList WriteOptions::availableDwgVersions()
+{
+    return { QStringLiteral("AC1015"), QStringLiteral("AC1018") };
+}
+
+QString WriteOptions::defaultDwgVersion()
+{
+    // AC1018（AutoCAD 2004 / R2004）：分页 + LZ77 容器，节载荷的 R2004 差异
+    // 已补齐，用工程自带的读取端（dwgreader18）可完整往返（tests/test_dwg_codec）。
+    return QStringLiteral("AC1018");
+}
+
+QString WriteOptions::dwgVersionShortName(const QString& version)
+{
+    if (version.compare(QStringLiteral("AC1015"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("AutoCAD 2000");
+    if (version.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("AutoCAD 2004");
+    return version;
+}
+
+bool WriteOptions::isWritableDwgVersion(const QString& version)
+{
+    return availableDwgVersions().contains(version, Qt::CaseInsensitive);
+}
+
+// -----------------------------------------------------------------------------
 //  IoResult
 // -----------------------------------------------------------------------------
 IoResult IoResult::success(int entityCount)

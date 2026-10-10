@@ -9,7 +9,7 @@
 **                                                                           **
 **  语义与读取端 dwgbuffer.cpp 的同名读取函数逐位对偶，字段顺序以读取端       **
 **  解析代码（drw_header.cpp / drw_entities.cpp / drw_objects.cpp /           **
-**  dwgreader.cpp）为准，并对照 libredwg 的 bits.c / encode.c 交叉验证。      **
+**  dwgreader.cpp）为准。      **
 **                                                                           **
 **  关键格式事实（实测 sample_2000.dwg 验证，勿凭记忆改动）：                 **
 **    · 对象记录 = [MS size][BS oType][RL bitsize][数据+句柄流][补位][RS CRC]**
@@ -106,7 +106,7 @@ public:
     }
     /// 3BD / 2RD / 2DD
     void write3BD(double x, double y, double z) { writeBD(x); writeBD(y); writeBD(z); }
-    /// 2BD：两个完整 BD（libredwg 的 FIELD_2BD / FIELD_2BD_1）
+    /// 2BD：两个完整 BD
     void write2BD(double x, double y) { writeBD(x); writeBD(y); }
     void write2RD(double x, double y) { writeRD(x); writeRD(y); }
 
@@ -230,7 +230,7 @@ private:
     std::size_t m_bitPos = 0;
 };
 
-/// CRC16 表（与 dwgbuffer.cpp / libredwg bit_calc_CRC 一致）
+/// CRC16 表
 std::uint16_t dwgCalcCrc16(std::uint16_t seed, const std::uint8_t* data, std::size_t len);
 
 /// 节哨兵（16 字节）。kind 取值见 dwgwriter.cpp。

@@ -26,11 +26,17 @@
 class dwgReader;
 class dwgW;
 
-// 版本写出实现（定义于 intern/dwgwriter15.cpp，声明见 intern/dwgwriter15.h）。
-// dwgW::write() 在这里做版本分派；新增版本时在此追加对应的 dwgWriterNN。
+// 各版本**文件容器**的入口（定义见 intern/dwgwriterNN.cpp，声明权威在各自的
+// intern/dwgwriterNN.h）。dwgW::write() 按目标版本分派到这里，与读取端 dwgR
+// 按版本创建 dwgReader15/18/… 的做法一致。
+// 节载荷（header/classes/对象流）由 dwgW::buildSections() 统一构建后交给容器摆放。
 namespace dwgWriter15 {
 bool supports(DRW::Version ver) noexcept;
-bool write(dwgW& writer, DRW_Interface* iface);
+bool write(dwgW& writer, DRW_Interface* iface);   // AC1015 / R2000：线性节容器
+}
+namespace dwgWriter18 {
+bool supports(DRW::Version ver) noexcept;
+bool write(dwgW& writer, DRW_Interface* iface);   // AC1018 / R2004：分页 + LZ77 容器
 }
 
 class dwgR {
@@ -62,22 +68,23 @@ private:
 //------------------------------------------------------------------------------
 //  dwgW：DWG 原生写出器（libdxfrw 的 DWG 写出半边）。
 //
-//  实现位置
-//    · 本头文件只声明接口；**全部实现位于 intern/dwgwriter15.cpp**，
-//      与读取端的命名对称（15 = DWG 内部版本号 = AC1015 = AutoCAD 2000，
-//      对应 intern/dwgreader15.cpp）。
+//  实现位置（与读取端 dwgR 完全对称：对外类在本层，版本实现单独成文件）
+//    · **主体实现**（Private、各 writeXxx 回调、节构建 buildSections）全部位于
+//      src/libdwgrw.cpp —— 与 dwgR 同置一处。
+//    · 各版本的**文件容器**单独成文件，只负责把节载荷摆进文件、写哨兵与 CRC：
+//        intern/dwgwriter15.cpp = AC1015 / R2000（线性节）
+//        intern/dwgwriter18.cpp = AC1018 / R2004（分页 + LZ77）
+//      版本分派在 libdwgrw.cpp::dwgW::write() 中完成。
 //    · intern/dwgwriter.h/.cpp 是**与版本无关的位级原语层**
-//      （dwgBitWriter / CRC16 / 哨兵），由各版本写出器共用。
+//      （dwgBitWriter / CRC16 / 哨兵），由各版本容器共用。
 //
 //  设计要点
 //    · 对外 API 与 dxfRW 的写出侧同构（writeLine / writeLayer / writeBlock…），
 //      上游适配器（LibDxfRwAdapter 的 Exporter）无需修改即可在两者之间切换。
-//    · 目标版本目前仅 AC1015。
+//    · 目标版本目前为 AC1015 与 AC1018。
 //    · 句柄由实现统一分配；表记录/块/实体间的引用（图层、线型、文字样式、
 //      匿名块）按名字解析为句柄。
 //    · 文件结构（版本头、节定位、header/classes/对象映射节、哨兵与 CRC）
-//      依据读取端 dwgreader15/dwgreader.cpp 的解析契约实现，并对照
-//      libredwg encode.c 与实测样例文件（sample_2000.dwg）交叉验证。
 //------------------------------------------------------------------------------
 class DRW_Header;
 class DRW_LType;
@@ -162,18 +169,55 @@ public:
     bool writeSeqEnd(DRW_Entity* ent);
     bool writeMText(DRW_MText* ent);
 
+    // ---- 与容器无关的节载荷（供各版本文件容器复用）---------------------------
+    /// 一条待写出的对象记录（自 oType 起、句柄流止，含补位；不含 MS 尺寸与 CRC）。
+    struct ObjectRecord {
+        std::uint32_t handle = 0;
+        std::vector<std::uint8_t> body;
+        std::uint32_t offset = 0;               ///< MS 起始文件偏移（容器装配期填写）
+    };
+
+    /// 与容器无关的节载荷。
+    /// 各版本容器的差别只在「节如何摆进文件」：AC1015 是哨兵界定的线性节，
+    /// AC1018 是分页 + LZ77；节的**内容**（header 变量位流、classes 位流、
+    /// 对象流、句柄流）完全一致，故集中由 buildSections() 构建一次。
+    struct SectionData {
+        std::vector<std::uint8_t> headerData;    ///< header 变量位流（不含哨兵 / RL 尺寸）
+        std::vector<std::uint8_t> classesData;   ///< classes 位流（不含哨兵 / RL 尺寸 / CRC）
+        std::uint16_t codepageId = 0;            ///< $DWGCODEPAGE 对应的代码页标识
+        std::uint16_t maxClassNum = 0;           ///< 最大类号（= 499 + 自定义类数）
+        std::vector<ObjectRecord> objects;       ///< 对象表（prev/next 链已回填）
+        std::uint32_t nextHandle = 0;            ///< HANDSEED（下一个空闲句柄）
+        std::string   fileName;                  ///< 输出文件名
+        /// ---- AC18 元数据段所需的杂项（AC15 容器不使用）----
+        std::uint16_t measurement = 1;           ///< $MEASUREMENT（AcDb:Template：0=英制 1=公制）
+        std::uint32_t tdDay = 0;                 ///< 当前时间的 Julian 日（TDCREATE/TDUPDATE）
+        std::uint32_t tdMsec = 0;                ///< 当日毫秒
+        /// ---- 容器装配所需的附加信息（文件头 / AuxHeader / 第二头部引用）----
+        std::vector<std::uint8_t> thumbnail;     ///< 预览区原始字节（不含 BEGIN/END 哨兵）
+        std::uint32_t ltypeCtrl = 0, layerCtrl = 0, styleCtrl = 0, vportCtrl = 0;
+        std::uint32_t dimstyleCtrl = 0, appidCtrl = 0, blockCtrl = 0, viewCtrl = 0, ucsCtrl = 0;
+        std::uint32_t vpEntHeaderCtrl = 0;       ///< 视口实体头控制（R2000 必需）
+        std::uint32_t nod = 0;                   ///< 根字典 NOD
+        std::uint32_t dictGroup = 0;             ///< ACAD_GROUP
+        std::uint32_t dictMline = 0;             ///< ACAD_MLINESTYLE
+    };
+
+    /// 收集并编码全部节数据：调用 iface 的各 writeXxx 回调、分配句柄、把对象
+    /// 写进内部对象表，并把容器装配所需的元信息一并导出到 out。成功返回 true。
+    /// ver 决定 header 变量的版本形态（AC1015 与 AC1018 有两处差异）。
+    /// 这是各版本容器共用的入口，不属于 dwgW 的常规对外使用面。
+    bool buildSections(DRW_Interface* iface, DRW::Version dwgVer, SectionData& out);
+
 private:
     dwgW(const dwgW& other) = delete;
     dwgW& operator=(const dwgW& other) = delete;
 
 public:
-    /// 实现细节（intern/dwgwriter15.cpp 内的辅助函数需要直接引用）
+    /// 实现细节（src/libdwgrw.cpp 内的辅助函数需要直接引用）
     struct Private;
 
 private:
-    /// 版本写出实现需要访问内部状态（d）
-    friend bool dwgWriter15::write(dwgW& writer, DRW_Interface* iface);
-
     Private* d;
 };
 

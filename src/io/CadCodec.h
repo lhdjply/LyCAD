@@ -34,8 +34,13 @@ struct WriteOptions {
     /// 目标格式版本。DXF 支持 R2000 ~ 2018，取值见 availableDxfVersions()
     ///（R12 只读不写，不在清单里）。
     /// 默认 AC1032（2018）：现代 CAD 都能打开，实体集完整，文本按 UTF-8 存放，
-    /// 中文不再受代码页限制。DWG 的写出版本固定为 R2000，不受此项影响。
+    /// 中文不再受代码页限制。
     QString version = QStringLiteral("AC1032");
+
+    /// DWG 目标版本。支持 AC1018（AutoCAD 2004 / R2004，默认）与
+    /// AC1015（AutoCAD 2000 / R2000），取值见 availableDwgVersions()。
+    /// 与 version（DXF 目标版本）各管一路：写 DXF 看 version，写 DWG 看本项。
+    QString dwgVersion = QStringLiteral("AC1018");
 
     /// 输出可直接阅读的缩进版本（体积略增，便于人工排查）
     bool prettyPrint = false;
@@ -50,6 +55,19 @@ struct WriteOptions {
     /// 可写出的 DXF 目标版本代号，按版本从低到高排列。
     /// 这是版本清单的唯一来源：界面、版本归一化、写出端都取自这里。
     static QStringList availableDxfVersions();
+
+    /// 可写出的 DWG 目标版本代号，按版本从低到高排列
+    ///（AC1015 = AutoCAD 2000，AC1018 = AutoCAD 2004）。
+    static QStringList availableDwgVersions();
+
+    /// DWG 的默认写出版本
+    static QString defaultDwgVersion();
+
+    /// DWG 版本代号的展示短名（如 "AutoCAD 2004"）
+    static QString dwgVersionShortName(const QString& version);
+
+    /// DWG 版本代号是否可写出
+    static bool isWritableDwgVersion(const QString& version);
 };
 
 // -----------------------------------------------------------------------------

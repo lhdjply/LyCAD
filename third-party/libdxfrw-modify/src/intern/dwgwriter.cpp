@@ -80,7 +80,6 @@ enum SentinelKind {
 
 void dwgSentinelBytes(int kind, bool begin, std::uint8_t out[16])
 {
-    // 与 libredwg src/common.c dwg_sentinel() 相同的字节表。
     // 注：header 数据节使用 VARIABLE 组（BEGIN/END 互补）；
     //     classes 节使用 CLASS 组；缩略图使用 THUMBNAIL 组。
     static const std::uint8_t kSentinels[][16] = {

@@ -224,7 +224,7 @@ void MainWindow::createMenus()
 
     QAction* saveAsAction = fileMenu->addAction(QStringLiteral("另存为(&A)…"));
     saveAsAction->setShortcut(QKeySequence::SaveAs);
-    saveAsAction->setToolTip(QStringLiteral("选择格式与路径另存；存为 DXF 时可在此时挑选目标版本"));
+    saveAsAction->setToolTip(QStringLiteral("选择格式与路径另存；存为 DXF / DWG 时可在此时挑选目标版本"));
     connect(saveAsAction, &QAction::triggered, this, [this] { saveDocumentAs(); });
 
     // 「导出」只剩 PDF 一种去向：打印对话框里另有一条 PDF 通路（见 printDocument），
@@ -1519,28 +1519,50 @@ bool MainWindow::saveDocumentAs()
     // 与这里选中的是哪一条，必须是同一件事。
     WriteOptions options;
     QStringList filters;
-    QHash<QString, QString> versionOfFilter;      // 过滤器原文 -> 目标版本代号
-    QString defaultFilter;
+    QHash<QString, QString> versionOfFilter;      // 过滤器原文 -> DXF 目标版本代号
+    QHash<QString, QString> dwgVersionOfFilter;   // 过滤器原文 -> DWG 目标版本代号
+    QString defaultDxfFilter;
+    QString defaultDwgFilter;
     for (const QString& version : WriteOptions::availableDxfVersions()) {
         const QString filter = QStringLiteral("%1 DXF 文件 (*.dxf)")
                                    .arg(WriteOptions::versionShortName(version));
         filters << filter;
         versionOfFilter.insert(filter, version);
-        if (version.compare(options.version, Qt::CaseInsensitive) == 0) defaultFilter = filter;
+        if (version.compare(options.version, Qt::CaseInsensitive) == 0) defaultDxfFilter = filter;
+    }
+    // DWG 同样一档一条：DWG 的容器格式随版本变化（R2000 线性 / R2004 分页），
+    // 因此写出版本要能在这里直接选。默认档取自 WriteOptions::defaultDwgVersion()。
+    for (const QString& version : WriteOptions::availableDwgVersions()) {
+        const QString filter = QStringLiteral("%1 DWG 文件 (*.dwg)")
+                                   .arg(WriteOptions::dwgVersionShortName(version));
+        filters << filter;
+        dwgVersionOfFilter.insert(filter, version);
+        if (version.compare(options.dwgVersion, Qt::CaseInsensitive) == 0) defaultDwgFilter = filter;
     }
 
-    // 其余可写格式（目前是 DWG）与「所有文件」仍由注册表给出——
+    // 其余可写格式与「所有文件」仍由注册表给出——
     // 格式的中文名归编解码器所有，界面不重复一份。
-    // DXF 那条用逐版本条目替代掉，否则列表里会出现两个都能存 .dxf 的项。
+    // DXF / DWG 两条用逐版本条目替代掉，否则列表里会出现重复且无版本信息的项。
     for (const QString& filter : CodecRegistry::instance().exportFilters()) {
-        if (!filter.contains(QStringLiteral("(*.dxf)"))) filters << filter;
+        if (!filter.contains(QStringLiteral("(*.dxf)"))
+            && !filter.contains(QStringLiteral("(*.dwg)"))) {
+            filters << filter;
+        }
     }
 
     const QString suggested = m_document->filePath().isEmpty()
         ? QDir(m_lastDirectory).filePath(QStringLiteral("drawing.dxf"))
         : m_document->filePath();
 
-    QString selectedFilter = defaultFilter.isEmpty() ? filters.first() : defaultFilter;
+    // 默认选中的档：按当前文件的扩展名走——已是 .dwg 就默认 DWG 一档，
+    // 否则维持 DXF 的默认版本。
+    const QString suggestedSuffix = QFileInfo(suggested).suffix().toLower();
+    QString defaultFilter = (suggestedSuffix == QLatin1String("dwg") && !defaultDwgFilter.isEmpty())
+        ? defaultDwgFilter
+        : defaultDxfFilter;
+    if (defaultFilter.isEmpty()) defaultFilter = filters.first();
+
+    QString selectedFilter = defaultFilter;
     const QString path = QFileDialog::getSaveFileName(
         this, QStringLiteral("保存图形文件"), suggested,
         filters.join(QStringLiteral(";;")), &selectedFilter);
@@ -1555,12 +1577,15 @@ bool MainWindow::saveDocumentAs()
         finalPath += QLatin1Char('.') + suffix;
     }
 
-    // 目标版本只在写 DXF 时才有意义——DWG 的写出版本固定 R2000。
+    // 目标版本按实际扩展名归属：写 DXF 用 version，写 DWG 用 dwgVersion。
     // 扩展名以实际路径为准：选了「AutoCAD 2004 DXF 文件」却把名字写成 .dwg 时，
-    // 该走 DWG 写出，版本参数不该影响它。
+    // 该走 DWG 写出，此时用 DWG 的默认版本。
     if (suffix == QLatin1String("dxf")) {
         const QString version = versionOfFilter.value(selectedFilter);
         if (!version.isEmpty()) options.version = version;
+    } else if (suffix == QLatin1String("dwg")) {
+        const QString version = dwgVersionOfFilter.value(selectedFilter);
+        options.dwgVersion = version.isEmpty() ? WriteOptions::defaultDwgVersion() : version;
     }
 
     return writeToPath(finalPath, options);

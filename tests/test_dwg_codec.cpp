@@ -15,6 +15,7 @@
 #include <QTemporaryDir>
 
 #include "core/CircleEntity.h"
+#include "core/HatchEntity.h"
 #include "core/Document.h"
 #include "core/LineEntity.h"
 #include "core/MTextEntity.h"
@@ -35,7 +36,10 @@ private slots:
 
     void versionSignatureTable();
     void probeRecognizesDwgOnly();
+    void dwgWriteVersionIsSelectable();
     void nativeReadWriteRoundTrip();
+    void dwgR2000ReadWriteRoundTrip();
+    void hatchSurvivesDwgRoundTrip();
     void textStyleMetricsAndMiddleAlignSurviveDwgRoundTrip();
     void mtextKeepsItsOwnAnchorAndLayoutOnDwgRoundTrip();
     void realSampleMtextSurvivesRoundTrip();
@@ -130,6 +134,34 @@ void TestDwgCodec::probeRecognizesDwgOnly()
     }
 }
 
+void TestDwgCodec::dwgWriteVersionIsSelectable()
+{
+    // 「另存为」的文件类型列表就是版本选择器：DWG 的档位由 WriteOptions 给出，
+    // 默认档必须在清单内（界面据此选中默认项），且所选档位要真正落到文件签名上。
+    const QStringList versions = WriteOptions::availableDwgVersions();
+    QVERIFY(versions.contains(QStringLiteral("AC1015")));
+    QVERIFY(versions.contains(QStringLiteral("AC1018")));
+    QVERIFY(versions.contains(WriteOptions::defaultDwgVersion()));
+    QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1018")));
+    QVERIFY(!WriteOptions::isWritableDwgVersion(QStringLiteral("AC1032")));
+
+    Document document;
+    document.beginBatchLoad();
+    document.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 0.0), Point2D(1.0, 1.0)));
+    document.endBatchLoad();
+
+    // 选 AC1018 时文件头签名必须是 AC1018（版本参数不得被忽略）
+    const QString path = m_dir.filePath(QStringLiteral("v2004.dwg"));
+    WriteOptions options;
+    options.dwgVersion = QStringLiteral("AC1018");
+    const IoResult result = CadFile::save(path, document, options);
+    QVERIFY2(result.ok, qPrintable(result.error));
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.read(6), QByteArray("AC1018"));
+}
+
 void TestDwgCodec::nativeReadWriteRoundTrip()
 {
     Document document;
@@ -150,7 +182,7 @@ void TestDwgCodec::nativeReadWriteRoundTrip()
     QFile file(dwgPath);
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray content = file.readAll();
-    QCOMPARE(content.left(6), QByteArray("AC1015"));
+    QCOMPARE(content.left(6), QByteArray("AC1018"));   // 默认写出版本 AC1018/R2004
     QVERIFY2(!content.contains("ENTITIES"), "DWG 应是二进制格式，而不是 DXF 文本");
 
     // 走出原生写出时应在提示中说明，便于用户追溯
@@ -166,6 +198,78 @@ void TestDwgCodec::nativeReadWriteRoundTrip()
     const Entity* first = loaded.entity(loaded.drawOrder().at(0));
     QCOMPARE(first->type(), EntityType::Line);
     QVERIFY(std::abs(first->length() - 50.0) < 1e-9);       // 3-4-5 直角三角形
+}
+
+void TestDwgCodec::dwgR2000ReadWriteRoundTrip()
+{
+    // R2000（AC1015）是另一条写出路径：节载荷与 R2004 共用，但容器是线性节，
+    // 且对象层**没有** 2004+ 的那些差异（颜色 CMC、xDictFlag 位、块记录实体表…）。
+    // 必须单独往返：共用代码里任何一处按版本判断写错，都会让这一档整体错位。
+    // （实测：R2004 省略 XDicObj 空句柄的改动一度没加版本判断，R2000 输出因此
+    // 少写一个句柄，外部 CAD 全部打不开，而 R2004 一切正常。）
+    Document document;
+    document.beginBatchLoad();
+    document.layers().ensure(QStringLiteral("测试层")).setColorIndex(2);
+    document.addEntity(std::make_unique<LineEntity>(Point2D(0.0, 0.0), Point2D(30.0, 40.0)));
+    document.addEntity(std::make_unique<CircleEntity>(Point2D(5.0, 5.0), 2.5));
+    document.endBatchLoad();
+
+    const QString path = m_dir.filePath(QStringLiteral("roundtrip2000.dwg"));
+    WriteOptions options;
+    options.dwgVersion = QStringLiteral("AC1015");
+    const IoResult writeResult = CadFile::save(path, document, options);
+    QVERIFY2(writeResult.ok, qPrintable(writeResult.error));
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.read(6), QByteArray("AC1015"));           // 档位要真正落到签名上
+
+    Document loaded;
+    const IoResult readResult = CadFile::load(path, loaded);
+    QVERIFY2(readResult.ok, qPrintable(readResult.error));
+    QCOMPARE(loaded.entityCount(), std::size_t(2));
+    QCOMPARE(loaded.layers().count(), std::size_t(2));      // 0 层 + 测试层
+
+    // 图层的线型是**句柄引用**解析出来的：表格记录句柄流少一个/错一位，
+    // 线型名就会解析成空或错值——这条断言正是用来抓句柄流错位的。
+    const Layer* layer = loaded.layers().find(QStringLiteral("测试层"));
+    QVERIFY(layer != nullptr);
+    QCOMPARE(layer->linetype(), QStringLiteral("CONTINUOUS"));
+
+    const Entity* first = loaded.entity(loaded.drawOrder().at(0));
+    QCOMPARE(first->type(), EntityType::Line);
+    QVERIFY(std::abs(first->length() - 50.0) < 1e-9);
+}
+
+void TestDwgCodec::hatchSurvivesDwgRoundTrip()
+{
+    // R2004 的 HATCH 数据段开头比 R2000 **多一整块渐变填充字段**（is_gradient /
+    // reserved / 角度 / 偏移 / 单色 / 色调 / 颜色数 / 名称）。漏写时读取端把我们
+    // 的高程当成 is_gradient，其后 num_colors 与种子点数解析成天文数字——自家
+    // 读取端直接死循环（此前 AC1015 正常、AC1018 全部读不回，含填充的图纸在
+    // 外部 CAD 同样无法打开）。
+    Document document;
+    document.beginBatchLoad();
+    document.layers().ensure(QStringLiteral("轮廓"));
+    auto hatch = std::make_unique<HatchEntity>(
+        std::vector<Point2D>{ Point2D(0.0, 0.0), Point2D(10.0, 0.0),
+                              Point2D(10.0, 10.0), Point2D(0.0, 10.0) },
+        QStringLiteral("ANSI31"), 2.0, 0.0);
+    hatch->setLayerName(QStringLiteral("轮廓"));
+    document.addEntity(std::move(hatch));
+    document.endBatchLoad();
+
+    const QString path = m_dir.filePath(QStringLiteral("hatch.dwg"));
+    const IoResult writeResult = CadFile::save(path, document, WriteOptions{});
+    QVERIFY2(writeResult.ok, qPrintable(writeResult.error));
+
+    Document loaded;
+    const IoResult readResult = CadFile::load(path, loaded);
+    QVERIFY2(readResult.ok, qPrintable(readResult.error));
+    QCOMPARE(loaded.entityCount(), std::size_t(1));
+    QCOMPARE(loaded.entity(loaded.drawOrder().at(0))->type(), EntityType::Hatch);
+    const auto& back = static_cast<const HatchEntity&>(*loaded.entity(loaded.drawOrder().at(0)));
+    QCOMPARE(back.patternName(), QStringLiteral("ANSI31"));
 }
 
 void TestDwgCodec::textStyleMetricsAndMiddleAlignSurviveDwgRoundTrip()

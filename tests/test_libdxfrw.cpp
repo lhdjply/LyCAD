@@ -1246,8 +1246,7 @@ void TestLibDxfRw::linesAndPolylinesRoundTripThroughNativeDwg()
 //  （没有「默认标志位」），其后依次是 2RD 文字中点、BD 高程、RC flag1、……
 //  写出端若套用公共实体数据的 BE 编码，位流从第一个字段就错位，AutoCAD 系
 //  软件（实测 GstarCAD）会把全部标注的定义点解成垃圾值，图形缩成一团挤在
-//  原点。此约定已用 LibreDWG 对照真实 AutoCAD 文件逐字段钉死，这里做写-读
-//  往返防止回退。
+//  原点。
 // -----------------------------------------------------------------------------
 void TestLibDxfRw::dimensionsRoundTripThroughNativeDwg()
 {

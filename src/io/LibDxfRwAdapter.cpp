@@ -1654,7 +1654,7 @@ void Builder::attachPendingAttribs()
 // -----------------------------------------------------------------------------
 //! DWG/R2000 兜底：取一个还没被别的表格认领的表格几何块。
 //!
-//! R2000 的 ACAD_TABLE 本体是一段不透明的二进制数据（libredwg 也标为 unhandled），
+//! R2000 的 ACAD_TABLE 本体是一段不透明的二进制数据，
 //! 块头句柄解不出来。但文件结构保证：每张表恰有一个 *Tnn 几何块，且该块的
 //! BLKREFS 反应器直指表格句柄。两个集合各取未被认领的一个即可配对。
 const Builder::BlockDef* Builder::takeUnclaimedTableGeometry()
@@ -1681,7 +1681,6 @@ void Builder::finishTables()
         std::unique_ptr<TableEntity> table = buildTableFromNative(ref);
 
         // 本体结构有效但 cells 数组为空：DWG 的 cells 编码尚未完全逆向
-        // （LyCAD 写出端与经 libredwg 解析的真实 AutoCAD 文件都读出 0 计数），
         // 而完整的单元格文字烘在 *Tnn 匿名几何块里。此时结构仍以本体为准，
         // 再从几何块把文字按格归位补回来——不算降级，行列尺寸、合并、图层
         // 全部保持本体值，也不触发「按几何块反推」警告。
@@ -3675,9 +3674,14 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
 IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
                               const WriteOptions& options)
 {
-    Q_UNUSED(options.version);              // DWG 写出固定 AC1015，不随选项变化
+    // 目标版本由 WriteOptions::dwgVersion 决定：AC1018（AutoCAD 2004 / R2004）
+    // 走分页 + LZ77 容器（intern/dwgwriter18.cpp），AC1015（AutoCAD 2000 /
+    // R2000）走线性容器（intern/dwgwriter15.cpp）。非法取值回退到 AC1015。
+    const bool wantAc1018 =
+        options.dwgVersion.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0;
+    const DRW::Version target = wantAc1018 ? DRW::AC1018 : DRW::AC1015;
 
-    ExporterBase<dwgW> exporter(document, DRW::AC1015);
+    ExporterBase<dwgW> exporter(document, target);
     exporter.prescanBlocks();
     exporter.prescanDimensionBlocks();
     exporter.prescanTableBlocks();
@@ -3686,9 +3690,12 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
     dwgW writer(native.constData());
     exporter.setDxfRw(&writer);
 
-    const bool ok = writer.write(&exporter, DRW::AC1015);
+    const bool ok = writer.write(&exporter, target);
     if (!ok) {
-        return IoResult::failure(QStringLiteral("DWG 写出失败（libdxfrw dwgW，R2000）。"));
+        return IoResult::failure(
+            QStringLiteral("DWG 写出失败（libdxfrw dwgW，%1）。")
+                .arg(wantAc1018 ? QStringLiteral("AC1018/R2004")
+                                : QStringLiteral("AC1015/R2000")));
     }
 
     return IoResult::success(document.entityCount());
