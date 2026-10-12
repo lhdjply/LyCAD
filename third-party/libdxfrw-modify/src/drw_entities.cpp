@@ -1520,6 +1520,15 @@ bool DRW_Table::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     } else {
         // ---- R2010+：完整 TABLECONTENT（AcDbLinkedTableData） -------------
         // 单元格内容里的文字/合并区按参考实现逐字段读出。
+        //
+        // ★ 句柄流的公共段必须先走完。R2010 分支此前**漏调** advanceCommonHandles()，
+        //   于是实体公共句柄（属主 / 图层）与 block_header 从未被消费：
+        //     · layer 取不到 → 读回后图层恒为 0（实测「原 明细表，读 0」）；
+        //     · 句柄游标整体前移两个句柄 → 其后的未知句柄、单元格样式句柄、
+        //       表样式句柄全部读到错位的位置。
+        //   扁平分支（R2000~R2007）一直是调用的，R2010 漏了。
+        advanceCommonHandles();
+
         buf->getRawChar8();                       // 未知字节
         hbuf.getHandle();                         // 未知句柄
         buf->getBitLong();                        // 未知长整数
@@ -1864,6 +1873,16 @@ bool DRW_LWPolyline::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     if (flags & 1)
         extPoint = buf->getExtrusion(false);
     vertexnum = buf->getBitLong();
+    // 防护：顶点数不可能超过「本对象剩余位数」（每个顶点至少占 1 位）。
+    // 对象解析一旦错位，这里会读出一个天文数字（实测 33554432），随后
+    // 顶点分配 + 顶点表打印会变成事实上的死循环、把日志撑到 GB 级。
+    // 宁可判该对象解析失败，也不要拖垮整个读取流程。
+    if (vertexnum < 0
+        || static_cast<duint32>(vertexnum) > static_cast<duint32>(buf->numRemainingBytes()) * 8u) {
+        DRW_DBG("\nLWPolyline: implausible vertex count "); DRW_DBG(vertexnum);
+        DRW_DBG(" (> remaining bits), object rejected\n");
+        return false;
+    }
     vertlist.reserve(vertexnum);
     unsigned int bulgesnum = 0;
     if (flags & 16)

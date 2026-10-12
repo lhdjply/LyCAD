@@ -84,6 +84,17 @@ void putU64At(std::vector<std::uint8_t>& v, std::size_t off, std::uint64_t x)
 {
     for (int i = 0; i < 8; ++i) v[off + i] = static_cast<std::uint8_t>((x >> (8 * i)) & 0xFF);
 }
+/// UMC：无符号模长字符（7 位一组，除末组外高位置 0x80）。
+/// 对偶于 dwgBuffer::getUModularChar / dwgBitWriter::writeUMC。
+/// R2010+ 的对象记录在 MS 尺寸后用它写「句柄流位数」。
+void putUMC(std::vector<std::uint8_t>& v, std::uint32_t u)
+{
+    std::uint8_t g[6];
+    int n = 0;
+    do { g[n++] = static_cast<std::uint8_t>(u & 0x7Fu); u >>= 7; } while (u && n < 6);
+    for (int i = 0; i < n; ++i)
+        v.push_back(i < n - 1 ? static_cast<std::uint8_t>(g[i] | 0x80u) : g[i]);
+}
 void appendSentinel(std::vector<std::uint8_t>& v, int kind, bool begin)
 {
     std::uint8_t s[16];
@@ -377,9 +388,10 @@ std::vector<std::uint8_t> buildObjFreeSpacePayload(std::uint32_t handleCount,
 /// 0x0005/0x0893 常量对，TDCREATE/TDUPDATE/HANDSEED 与保存计数。
 std::vector<std::uint8_t> buildAuxHeaderPayload(std::uint32_t tdDay,
                                                 std::uint32_t tdMsec,
-                                                std::uint32_t handSeed)
+                                                std::uint32_t handSeed,
+                                                std::uint16_t internalVer)
 {
-    constexpr std::uint16_t kInternalVer = 25;   // AC1018 的内部版本号
+    const std::uint16_t kInternalVer = internalVer;
     constexpr std::uint32_t kNumSaves = 1;       // 保存次数（新建即 1）
     std::vector<std::uint8_t> d;
     d.push_back(0xFF); d.push_back(0x77); d.push_back(0x01);
@@ -664,8 +676,23 @@ bool supports(DRW::Version ver) noexcept
 
 bool write(dwgW& writer, DRW_Interface* iface)
 {
+    return writeAs(writer, iface, DRW::AC1018);
+}
+
+bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver)
+{
+    // R2010（AC1024）与 R2004（AC1018）的文件容器**同属一族**：0x80 处的加密
+    // 文件头（"AcFssFcAJMB"）、页映射 / 段映射、分页数据都一致。libredwg 的
+    // decode.c 也是把 R2010 交给 decode_R2004（注释写着 "for 2004 and 2010+"），
+    // 而 R2007 走的是另一套 decode_R2007。所以这里只需按版本取标识与常量。
+    const bool r2010 = (ver > DRW::AC1018);
+    const char* const versionStr = r2010 ? "AC1024" : "AC1018";
+    // 内部版本号：与 libredwg 版本表的 dwg_version 一致（R2004 = 0x19 = 25、
+    // R2010 = 0x1d = 29）。R2004 沿用本实现既有的 25，R2010 取权威值 29。
+    const std::uint16_t internalVer = r2010 ? 29 : 25;
+
     dwgW::SectionData sd;
-    if (!writer.buildSections(iface, DRW::AC1018, sd))
+    if (!writer.buildSections(iface, ver, sd))
         return false;
 
     // ---- 1. 组节载荷 ------------------------------------------------------------
@@ -691,7 +718,19 @@ bool write(dwgW& writer, DRW_Interface* iface)
         // 按 RL 切片再解析的读取端（ODA 内核 / 浩辰）会把最后一条类记录截断，
         // 越界后结束哨兵位置整体偏移，进而判定文件损坏。
         std::vector<std::uint8_t> classBody;
-        {
+        if (r2010) {
+            // R2007+ 的 Classes 节前导由 buildSections 一并编码在 sd.classesData 里：
+            //   [RL hsize][RL bitsize][BS maxClassNum][RC][RC][B][类记录][字符串区][RS][B]
+            // 容器只需在它前面再补一个 RL size。次序为
+            //   size → hsize → bitsize → BS → RC → RC → B → 类记录
+            // —— 读取端（dwgReader18::readDwgClasses 的 2010+/2007+ 分支）与
+            // libredwg（decode.c 的 read_2004_section_classes）都是这个次序。
+            // 若照 AC1018 那样在这里再补一遍 [BS][RC][RC][B]，次序会变成
+            //   size → BS → RC → RC → B → hsize → bitsize
+            // 读取端于是把 bitsize 当成 maxClassNum、把类记录当 bitsize，类表整体
+            // 错位（实测直接 BAD_READ_CLASSES）。
+            classBody = sd.classesData;
+        } else {
             dwgBitWriter w;
             w.writeBS(static_cast<dint16>(sd.maxClassNum));
             w.writeRC(0);
@@ -711,7 +750,15 @@ bool write(dwgW& writer, DRW_Interface* iface)
         classesPayload.insert(classesPayload.end(), kSectionTrailerZeros, 0x00);
     }
 
-    // OBJECTS：对象记录序列（MS 尺寸 + 体 + CRC16），偏移相对本段起点
+    // OBJECTS：对象记录序列，偏移相对本段起点。
+    //   R2004（AC1018）：[MS 尺寸][对象体][CRC16]
+    //   R2010（AC1024）：[MS 尺寸][UMC 句柄流位数][对象体][CRC16]
+    //                     —— 读取端在 MS 之后还要读一个 UMC（dwgreader.cpp 的
+    //                     `if (version > DRW::AC1021) bs = dbuf->getUModularChar();`，
+    //                     libredwg 同：`obj->handlestream_size = bit_read_UMC()`），
+    //                     少了这 1~4 字节，对象类型/内容整体前移一位字节，
+    //                     表控制对象会被读成随机的 oType（实测 "Not LineType
+    //                     control object, found oType 12545 instead 0x38"）。
     std::vector<std::uint8_t> objectsPayload;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> objectEntries;   // (句柄, 段内偏移)
     for (const dwgW::ObjectRecord& o : sd.objects) {
@@ -724,6 +771,7 @@ bool write(dwgW& writer, DRW_Interface* iface)
         } else {
             putU16(objectsPayload, static_cast<std::uint16_t>(bodySize));
         }
+        if (r2010) putUMC(objectsPayload, o.handleBits);
         objectsPayload.insert(objectsPayload.end(), o.body.begin(), o.body.end());
         const std::uint16_t crc = dwgCalcCrc16(0xC0C1,
             objectsPayload.data() + offset, objectsPayload.size() - offset);
@@ -821,7 +869,7 @@ bool write(dwgW& writer, DRW_Interface* iface)
     addSection(1,  "AcDb:Template",     buildTemplatePayload(sd.measurement));
     addSection(7,  "AcDb:Handles",      std::move(handlesPayload));
     addSection(9,  "AcDb:Classes",      std::move(classesPayload));
-    addSection(10, "AcDb:AuxHeader",    buildAuxHeaderPayload(sd.tdDay, sd.tdMsec, sd.nextHandle));
+    addSection(10, "AcDb:AuxHeader",    buildAuxHeaderPayload(sd.tdDay, sd.tdMsec, sd.nextHandle, internalVer));
     addSection(6,  "AcDb:Header",       std::move(headerPayload));
 
     // ---- 1.5 为预览容器定址并重建其载荷 ------------------------------------------
@@ -970,14 +1018,17 @@ bool write(dwgW& writer, DRW_Interface* iface)
     {
         std::vector<std::uint8_t> meta;
         meta.reserve(kFileHeaderSize - kInnerHeaderSize);
-        meta.insert(meta.end(), reinterpret_cast<const std::uint8_t*>("AC1018"),
-                    reinterpret_cast<const std::uint8_t*>("AC1018") + 6);
+        meta.insert(meta.end(), reinterpret_cast<const std::uint8_t*>(versionStr),
+                    reinterpret_cast<const std::uint8_t*>(versionStr) + 6);
         for (int i = 0; i < 5; ++i) meta.push_back(0x00);
-        meta.push_back(0x00);                       // maintenance version
+        // 维护版本（0x0B）与写出版本（0x11/0x12）。AC1018 沿用本实现既有取值；
+        // AC1024 取 libredwg 版本表的权威值（maint_rel_version / dwg_version
+        // = 0x6d / 0x1d），该表同时被 libredwg 的 header.spec 用来解读文件头。
+        meta.push_back(r2010 ? 0x6d : 0x00);        // maintenance version
         meta.push_back(0x03);                       // byte 0x0C
         putU32(meta, previewAddr);                  // 预览图数据地址（页头后 0x20）
-        meta.push_back(0x21);                       // app dwg version
-        meta.push_back(0x00);                       // app maintenance version
+        meta.push_back(r2010 ? 0x1d : 0x21);        // app dwg version
+        meta.push_back(r2010 ? 0x1d : 0x00);        // app maintenance version
         putU16(meta, sd.codepageId);                // codepage
         for (int i = 0; i < 3; ++i) meta.push_back(0x00);
         putU32(meta, 0);                            // security flags

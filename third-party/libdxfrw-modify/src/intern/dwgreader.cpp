@@ -737,6 +737,16 @@ bool dwgReader::readDwgBlocks(DRW_Interface& intfa, dwgBuffer *dbuf){
         DRW_DBG("\nFinding Block, handle= "); DRW_DBGH(bkr->block); DRW_DBG("\n");
         mit = ObjectMap.find(bkr->block);
         if (mit==ObjectMap.end()) {
+            if (bkr->block == 0) {
+                // 未实体化的空块：真实 R2010 文件里 *Paper_Space 的 BLOCK 句柄
+                // 就是 0 —— 图纸空间布局块从未创建（浩辰写出的文件实测如此，
+                // libredwg 转 DXF 也只给出 *Model_Space / *Paper_Space0 两个 BLOCK）。
+                // 这种记录本身合法，跳过它即可，**不能**判成整文件失败：
+                // 一判失败，后面所有块与其图元全部读不出来（实测本文件的
+                // *Model_Space 内容也随之丢失，整份图纸打不开）。
+                DRW_DBG("\nEmpty block record (BLOCK handle is null), skipped\n");
+                continue;
+            }
             DRW_DBG("\nWARNING: block entity not found\n");
             ret = false;
             continue;
@@ -818,6 +828,11 @@ bool dwgReader::readDwgBlocks(DRW_Interface& intfa, dwgBuffer *dbuf){
         //end block entity, really needed to parse a dummy entity??
         mit = ObjectMap.find(bkr->endBlock);
         if (mit==ObjectMap.end()) {
+            if (bkr->endBlock == 0) {
+                // 同上：空块的 ENDBLK 同样可能为空句柄（布局块未创建）
+                DRW_DBG("\nEmpty block record (ENDBLK handle is null), skipped\n");
+                continue;
+            }
             DRW_DBG("\nWARNING: end block entity not found\n");
             ret = false;
             continue;

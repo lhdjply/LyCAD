@@ -500,9 +500,9 @@ int main(int argc, char* argv[])
         WriteOptions options;
         if (arguments.at(3).endsWith(QStringLiteral(".dwg"), Qt::CaseInsensitive)) {
             // DWG 的写出版本由 dwgVersion 决定（与 DXF 的 version 各管一路）：
-            // 显式给出可写 DWG 版本时按它写，否则退回默认（AC1021）。
+            // 显式给出可写 DWG 版本时按它写，否则退回默认（AC1024）。
             options.dwgVersion = (hasVersion && WriteOptions::isWritableDwgVersion(version))
-                                     ? version : QStringLiteral("AC1021");
+                                     ? version : QStringLiteral("AC1024");
         } else {
             options.version = version;
         }
@@ -536,7 +536,7 @@ int main(int argc, char* argv[])
         { "2000", "AC1015", "AC1015" },   // AutoCAD 2000 / R2000
         { "2004", "AC1018", "AC1018" },   // AutoCAD 2004 / R2004
         { "2007", "AC1021", "AC1021" },   // AutoCAD 2007 / R2007
-        { "2010", "AC1024", nullptr },    // AutoCAD 2010（写出器暂不支持）
+        { "2010", "AC1024", "AC1024" },   // AutoCAD 2010 / R2010（与 R2004 同族容器）
         { "2013", "AC1027", nullptr },    // AutoCAD 2013（写出器暂不支持）
         { "2018", "AC1032", nullptr },    // AutoCAD 2018（写出器暂不支持）
     };

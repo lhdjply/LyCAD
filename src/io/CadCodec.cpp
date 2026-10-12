@@ -86,16 +86,17 @@ QStringList WriteOptions::availableDxfVersions()
 // -----------------------------------------------------------------------------
 QStringList WriteOptions::availableDwgVersions()
 {
-    return { QStringLiteral("AC1015"), QStringLiteral("AC1018"), QStringLiteral("AC1021") };
+    return { QStringLiteral("AC1015"), QStringLiteral("AC1018"), QStringLiteral("AC1021"),
+             QStringLiteral("AC1024") };
 }
 
 QString WriteOptions::defaultDwgVersion()
 {
-    // AC1021（AutoCAD 2007 / R2007）：RS 纠错 + AC21 压缩的分页容器，文本按
-    // UTF-16 存放；用工程自带的读取端（dwgreader21）可完整往返
-    // （tests/test_dwg_codec：AC1021 缺省往返 + 版本可选性）。
+    // AC1024（AutoCAD 2010 / R2010）：与 R2004 同族容器（0x80 加密文件头 +
+    // 页/段映射 + 分页），版本常量取 libredwg 版本表权威值（0x0B=0x6d /
+    // 0x11=0x1d）。较之 AC1021 更贴近现代 CAD 的默认保存版本。
     // 必须与 WriteOptions::dwgVersion 的初值保持一致。
-    return QStringLiteral("AC1021");
+    return QStringLiteral("AC1024");
 }
 
 QString WriteOptions::dwgVersionShortName(const QString& version)
@@ -106,6 +107,8 @@ QString WriteOptions::dwgVersionShortName(const QString& version)
         return QStringLiteral("AutoCAD 2004");
     if (version.compare(QStringLiteral("AC1021"), Qt::CaseInsensitive) == 0)
         return QStringLiteral("AutoCAD 2007");
+    if (version.compare(QStringLiteral("AC1024"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("AutoCAD 2010");
     return version;
 }
 

@@ -36,6 +36,7 @@
 #include "intern/dwgwriter15.h"
 #include "intern/dwgwriter18.h"
 #include "intern/dwgwriter21.h"
+#include "intern/dwgwriter24.h"
 
 #define FIRSTHANDLE 48
 
@@ -358,6 +359,11 @@ bool dwgW::write(DRW_Interface* iface, DRW::Version ver)
     if (dwgWriter21::supports(ver))
         return dwgWriter21::write(*this, iface);
 
+    // AC1024（R2010）：容器与 AC1021 完全相同，复用其摆放代码
+    // （intern/dwgwriter24.cpp）。
+    if (dwgWriter24::supports(ver))
+        return dwgWriter24::write(*this, iface);
+
     return false;                       // 暂不支持的目标版本
 }
 
@@ -458,6 +464,7 @@ struct dwgW::Private
         std::uint32_t offset = 0;         // MS 起始文件偏移（装配期填写）
         std::size_t prevBit = 0;          // prev_entity 数值部分在 body 内的位偏移（0=无）
         std::size_t nextBit = 0;          // next_entity 数值部分在 body 内的位偏移（0=无）
+        std::uint32_t handleBits = 0;     // 句柄流位数（R2010+ 记录头要用，见 ObjectRecord）
     };
 
     /// 对象体构造：oType + bitsize 占位 + 数据 + 句柄流 + 回填 bitsize
@@ -470,6 +477,11 @@ struct dwgW::Private
     /// 字符串内容由 writeT 按 codec 版本自动分流进 w 的字符串流（见
     /// dwgBitWriter::writeT / writeUCS），本处只负责摆放。
     struct ObjBuilder {
+        /// 所属 Private。用来取目标版本：R2010+（AC1024）的对象头用**紧凑 otype
+        /// 编码**且**不写 RL 尺寸字段**（读取端 DRW_Entity::parseDwg 的
+        /// `version > DRW::AC1021` 分支用 `objSize = ms*8 - bs` 反推）。
+        Private* owner = nullptr;
+        explicit ObjBuilder(Private& o) : owner(&o) {}
         dwgBitWriter w;
         std::size_t rlPos = 0;
         std::size_t handleStart = 0;
@@ -482,11 +494,39 @@ struct dwgW::Private
         /// 「找不到」并在句柄循环里空转。
         bool trailingFlagWritten = false;
 
+        /// 目标版本是否为 R2010+（对象头改用紧凑编码）。
+        bool compactObjType() const noexcept
+        {
+            return owner != nullptr && owner->version > DRW::AC1021;
+        }
+
+        /// R2010+ 的对象类型号：2 位索引 + 变长（dwgBuffer::getObjType 的
+        /// `version > DRW::AC1021` 分支之对偶）。
+        void writeObjType24(std::uint16_t ot)
+        {
+            if (ot >= 0x01F0u && ot <= 0x02EFu) {
+                w.writeBB(1);
+                w.writeRC(static_cast<std::uint8_t>(ot - 0x01F0u));
+            } else if (ot < 0x100u) {
+                w.writeBB(0);
+                w.writeRC(static_cast<std::uint8_t>(ot));
+            } else {
+                w.writeBB(2);
+                w.writeRS(ot);
+            }
+        }
+
         void begin(std::uint16_t otype, std::uint32_t handle)
         {
-            w.writeBS(otype);
-            rlPos = w.bitPosition();
-            w.writeRL(0);
+            if (compactObjType()) {
+                // R2010+：紧凑 otype，且**没有** RL 尺寸占位（finish 也不回填）。
+                writeObjType24(otype);
+                rlPos = 0;
+            } else {
+                w.writeBS(otype);
+                rlPos = w.bitPosition();
+                w.writeRL(0);
+            }
             w.writeHandle(0, handle);
         }
         void beginHandles() { handleStart = w.bitPosition(); }
@@ -556,9 +596,18 @@ struct dwgW::Private
             }
             w.padToByte();
             const std::size_t endBit = w.bitPosition();
-            w.setBitPosition(rlPos);
-            w.writeRL(static_cast<std::uint32_t>(newHandleStart));
-            w.setBitPosition(endBit);
+            // R2010+ 的对象头里**没有** RL 尺寸字段（读取端用 `bs` 反推：
+            //   bitsize = size*8 - handlestream_size，
+            // 见 libredwg dwg_decode_add_object），因此没有占位可回填；
+            // 但要把「句柄流位数」交给容器写进记录头的那条 UMC。
+            // 句柄流位于对象体末尾，故其位数 = 补齐后的总体位数 − 句柄流起点。
+            if (owner != nullptr)
+                owner->lastHandleBits = static_cast<std::uint32_t>(endBit - newHandleStart);
+            if (!compactObjType()) {
+                w.setBitPosition(rlPos);
+                w.writeRL(static_cast<std::uint32_t>(newHandleStart));
+                w.setBitPosition(endBit);
+            }
             return w.takeData();
         }
     };
@@ -588,6 +637,9 @@ struct dwgW::Private
     DRW_TextCodec codec;
     std::uint32_t nextHandle = 0x30;
     std::vector<Obj> objects;
+    /// ObjBuilder::finish() 算出的「句柄流位数」暂存位，由紧随其后的 pushObject
+    /// 取走存入 Obj（R2010+ 的对象记录头要用它，见 ObjectRecord::handleBits）。
+    std::uint32_t lastHandleBits = 0;
 
     /// 预览图字节（[RL 图像字节数][图像字节…]，不含 BEGIN/END 哨兵）；
     /// 为空时写规范空缩略图（表示"本文件不含预览"）。
@@ -721,6 +773,7 @@ struct dwgW::Private
         o.body = std::move(body);
         o.prevBit = prevBit;
         o.nextBit = nextBit;
+        o.handleBits = lastHandleBits;
         objects.push_back(std::move(o));
         encodedHandles.insert(handle);
     }
@@ -863,6 +916,17 @@ struct dwgW::Private
             b.w.writeBB(0);             // materialFlag
             b.w.writeRC(0);             // shadowFlag
         }
+        // R2010+：材质/阴影之后还有 3 个**视觉样式**标志位（读取端
+        // DRW_Entity::parseDwg 的 `version > DRW::AC1021`
+        // 分支：2 位 full/face + 1 位 edge；libredwg common_entity_data.spec
+        // 的 `SINCE (R_2010b)` 为 has_full/face/edge_visualstyle 三个 B）。
+        // **漏写会让其后全部实体字段整体前移 3 位**：invisibleFlag 与线宽读错，
+        // 实体特有字段（LWPOLYLINE 的顶点数等）读到天文数字——顶点循环随即
+        // 变成事实上的死循环（实测 vertex num 读成 33554432，日志暴涨到 GB 级）。
+        if (version > DRW::AC1021) {
+            b.w.writeBB(0);             // has_full_visualstyle + has_face_visualstyle
+            b.w.writeB(false);          // has_edge_visualstyle
+        }
         b.w.writeBS(e.visible ? 0 : 1);
         b.w.writeRC(static_cast<std::uint8_t>(DRW_LW_Conv::lineWidth2dwgInt(e.lWeight)));
     }
@@ -878,6 +942,13 @@ struct dwgW::Private
     /// 厚度/挤出（R2000 风格的可省略编码）
     void writeDimensionCommon(ObjBuilder& b, DRW_Dimension& ent)
     {
+        // R2010+：标注数据最前面是一个 RC「class_version」（读取端
+        // DRW_Dimension::parseDwg 的 `version > DRW::AC1021` 先 getRawChar8；
+        // libredwg dwg.spec 的 COMMON_ENTITY_DIMENSION：
+        //   `SINCE (R_2010b) FIELD_RC (class_version, 280); /* 0=r2010 */`）。
+        // 写 0（= R2010）。漏写 1 字节会让其后全部标注字段前移一个字节，
+        // 标注类型/测量值读成垃圾并判对象失败（实测 "Entity type 22 has failed"）。
+        if (version > DRW::AC1021) b.w.writeRC(0);   // class_version = 0（R2010）
         // 拉伸方向这里是普通 3BD，没有公共实体数据那种「默认标志位」
         const DRW_Coord ext = ent.getExtrusion();
         b.w.write3BD(ext.x, ext.y, ext.z);
@@ -1034,7 +1105,7 @@ struct dwgW::Private
         Blk& blk = current ? *current : mspace;
         const std::uint32_t owner = ownerOverride != 0 ? ownerOverride : blk.record;
         const int entmode = entmodeFor(owner);
-        ObjBuilder b;
+        ObjBuilder b(*this);
         writeEntityCommon(b, otype, e, handle, entmode);
         fill(b);
         writeEntityHandles(b, owner, e.layer, entmode);
@@ -1102,7 +1173,7 @@ void encodeControl(Private& d, std::uint16_t otype, std::uint32_t handle, CtrlKi
                    const std::vector<std::uint32_t>& entries,
                    std::uint32_t argA = 0, std::uint32_t argB = 0)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, otype, handle);
     if (kind == CtrlKind::Bs || kind == CtrlKind::LType || kind == CtrlKind::Dimstyle)
         b.w.writeBS(static_cast<dint16>(entries.size()));
@@ -1135,7 +1206,7 @@ void encodeControl(Private& d, std::uint16_t otype, std::uint32_t handle, CtrlKi
 
 void encodeLType(Private& d, const DRW_LType& ent, std::uint32_t handle)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kLType, handle);
     b.w.writeT(ent.name, d.codec);
     writeXrefTableFlags(b.w, d.version);
@@ -1176,7 +1247,7 @@ void encodeLType(Private& d, const DRW_LType& ent, std::uint32_t handle)
 
 void encodeLayer(Private& d, const DRW_Layer& ent, std::uint32_t handle)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kLayer, handle);
     b.w.writeT(ent.name, d.codec);
     writeXrefTableFlags(b.w, d.version);
@@ -1303,7 +1374,7 @@ void encodeStyle(Private& d, const DRW_Textstyle& ent, std::uint32_t handle)
         }
     }
 
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kStyle, handle, eed.empty() ? nullptr : &eed);
     b.w.writeT(ent.name, d.codec);
     writeXrefTableFlags(b.w, d.version);
@@ -1324,7 +1395,7 @@ void encodeStyle(Private& d, const DRW_Textstyle& ent, std::uint32_t handle)
 
 void encodeVport(Private& d, const DRW_Vport& ent, std::uint32_t handle)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kVport, handle);
     b.w.writeT(ent.name, d.codec);
     writeXrefTableFlags(b.w, d.version);
@@ -1409,7 +1480,7 @@ void encodeVport(Private& d, const DRW_Vport& ent, std::uint32_t handle)
 ///     2007+ 再补 DIMLTYPE / DIMLTEX1 / DIMLTEX2。
 void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     const Private::DimStyleData& v = d.dimData;
     d.writeTableCommon(b, kDimstyle, handle);
     b.w.writeT(ent.name, d.codec);
@@ -1468,9 +1539,21 @@ void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
     b.w.writeB(v.upt != 0);
     b.w.writeBS(static_cast<dint16>(v.atfit));
     // 2007+：DIMATFIT 之后是 DIMFXLON（读取端 drw_header.cpp:2142-2145）。
-    // 其后的 DIMTXTDIRECTION / DIMALTMZF / DIMMZF 属 2010+，AC1021 不得写。
     if (d.version > DRW::AC1018)
         b.w.writeB(false);              // DIMFXLON
+    // R2010+：DIMFXLON 与 DIMLWD 之间还有 5 个字段（libredwg dwg.spec:4419-4429
+    // 的 `IF_FREE_OR_SINCE (R_2010b)`：
+    //   B DIMTXTDIRECTION / BD DIMALTMZF / T DIMALTMZS / BD DIMMZF / T DIMMZS）。
+    // 两个 T 走独立字符串流（writeT 自动分流），故主数据流里只多出 1 位 + 2 个 BD。
+    // 漏写会让 DIMSTYLE 记录自该处起整体错位，严格解析器（浩辰 / libredwg）
+    // 在 AUDIT 时判该记录损坏。
+    if (d.version > DRW::AC1021) {
+        b.w.writeB(false);                      // DIMTXTDIRECTION
+        b.w.writeBD(0.0);                       // DIMALTMZF
+        b.w.writeT(std::string(), d.codec);     // DIMALTMZS（字符串流）
+        b.w.writeBD(0.0);                       // DIMMZF
+        b.w.writeT(std::string(), d.codec);     // DIMMZS（字符串流）
+    }
     b.w.writeBS(static_cast<dint16>(v.lwd));
     b.w.writeBS(static_cast<dint16>(v.lwe));
     b.w.writeB(false);                  // flag0
@@ -1494,7 +1577,7 @@ void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
 
 void encodeAppId(Private& d, const DRW_AppId& ent, std::uint32_t handle)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kAppId, handle);
     b.w.writeT(ent.name, d.codec);
     writeXrefTableFlags(b.w, d.version);
@@ -1541,7 +1624,7 @@ void writeDictItems(Private::ObjBuilder& b, const std::vector<DictEntry>& entrie
 void encodeDictionary(Private& d, std::uint32_t handle, std::uint32_t owner,
                       const std::vector<DictEntry>& entries)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kDictionary, handle);
     writeDictHead(d, b, entries);
     b.beginHandles();
@@ -1555,7 +1638,7 @@ void encodeDictionary(Private& d, std::uint32_t handle, std::uint32_t owner,
 void encodeDictionaryWdf(Private& d, std::uint32_t handle, std::uint32_t owner,
                          const std::vector<DictEntry>& entries, std::uint32_t defaultId)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kClassDictWdf, handle);
     writeDictHead(d, b, entries);
     b.beginHandles();
@@ -1569,7 +1652,7 @@ void encodeDictionaryWdf(Private& d, std::uint32_t handle, std::uint32_t owner,
 /// PLACEHOLDER（类 501）：仅公共数据，无自有字段
 void encodePlaceholder(Private& d, std::uint32_t handle, std::uint32_t owner)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kClassPlaceholder, handle);
     b.beginHandles();
     b.w.writeHandle(kHcSoftPtr, owner);
@@ -1582,7 +1665,7 @@ void encodePlaceholder(Private& d, std::uint32_t handle, std::uint32_t owner)
 void encodeMlineStyle(Private& d, std::uint32_t handle, std::uint32_t ownerDict,
                       const std::string& name)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeNamedHeadStart(b, kMlineStyle, handle);
     b.w.writeT(name, d.codec);                          // name（2）
     b.w.writeT(std::string(), d.codec);                 // description（0）
@@ -1607,7 +1690,7 @@ void encodeMlineStyle(Private& d, std::uint32_t handle, std::uint32_t ownerDict,
 void encodeDictVar(Private& d, std::uint32_t handle, std::uint32_t ownerDict,
                    const std::string& value)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeNamedHeadStart(b, kClassDictVar, handle);
     b.w.writeRC(0);                                     // schema（280）
     b.w.writeT(value, d.codec);                         // strvalue（1）
@@ -1621,7 +1704,7 @@ void encodeDictVar(Private& d, std::uint32_t handle, std::uint32_t ownerDict,
 /// ACDBHEADERROUNDTRIPXREC 条目。
 void encodeXrecord(Private& d, std::uint32_t handle, std::uint32_t ownerDict)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeNamedHeadStart(b, kXrecord, handle);
     b.w.writeBL(0);                                     // xdata_size
     b.w.writeBS(1);                                     // cloning（280）
@@ -1636,7 +1719,7 @@ void encodeXrecord(Private& d, std::uint32_t handle, std::uint32_t ownerDict)
 void encodeLayout(Private& d, std::uint32_t handle, std::uint32_t owner,
                   std::uint32_t blockHeader, const std::string& name)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kClassLayout, handle);
     // ---- 打印设置（内联） ----
     b.w.writeT(std::string(), d.codec);                     // printer_cfg_file
@@ -1712,7 +1795,7 @@ void encodeLayout(Private& d, std::uint32_t handle, std::uint32_t owner,
 /// BLOCK / ENDBLK 实体
 void encodeBlockEntity(Private& d, Private::Blk& blk, bool isEnd)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     DRW_Point attrs;                    // 仅借具体实体类型携带公共属性
     attrs.layer = "0";
     attrs.color = 0;                    // ByBlock
@@ -1734,7 +1817,7 @@ void encodeBlockEntity(Private& d, Private::Blk& blk, bool isEnd)
 
 void encodeBlockRecord(Private& d, Private::Blk& blk)
 {
-    Private::ObjBuilder b;
+    Private::ObjBuilder b(d);
     d.writeTableCommon(b, kBlockHeader, blk.record);
     b.w.writeT(blk.name, d.codec);
     writeXrefTableFlags(b.w, d.version);
@@ -2742,7 +2825,129 @@ bool dwgW::writeTable(DRW_Table* ent)
         //   3 位：严格读取端（浩辰 / ODA）把 num_cols / num_rows 读成天文数字，
         //   随后按该数字循环建格，表现为打开图纸长时间卡死。
 
-        // ---- AcDbTable 段 ----
+        // ============ 分岔：R2010 起改用 AcDbLinkedTableData(TABLECONTENT) ============
+        // R2000~R2007 是「扁平行列网格」；R2010 起整个内容换成 LinkedTableData——
+        // 列/行各带样式与自定义数据、每格是「若干内容 + 样式 + 几何」的容器。
+        // 字段序与读取端 DRW_Table::parseDwg 的 `version >= AC1024` 分支逐字段对偶，
+        // 并已与参考实现（.cache/opencadcodec：write_table 的 r2010 分支、
+        // write_table_content、write_table_cell_r2010）交叉核对。
+        // 若仍按扁平格式写出，读取端会把它当 TABLECONTENT 解，行列与文字全丢
+        //（实测：往返后图层读成 0、内容为空）。
+        if (d->version >= DRW::AC1024) {
+            // ---- 内容之前的「表头」三件套 ----
+            // 注意：其中的「未知句柄」**不能**在这里写。fill() 阶段调用 writeHandle
+            // 会落进**数据流**（句柄段起点由 writeEntityHandles → beginHandles 才确定，
+            // 那已经是 fill() 之后），而读取端是从**句柄流**读它
+            //（drw_entities.cpp 的 `hbuf.getHandle()`）。位置错了会让数据流凭空多出
+            // 8 位：读取端把紧随其后的 BL 当成「码 01 + RC」多读 8 位，恰好又与那
+            // 8 位抵消，数值看起来对、实则整体错位 —— 一旦表格内容变化就会崩塌。
+            // 故该句柄统一在下面的 extraHandles 里按次序写出。
+            b.w.writeRC(0);                     // 未知字节
+            b.w.writeBL(0);                     // 未知长整数
+            b.w.writeB(true);                   // 未知位：R2010 的默认值是 **true**
+            // 参考实现明示：这一位在 R2013+ 换成了 BL，而 R2010 的「位」默认必须
+            // 为真，写 0 会被严格读取端判为新表非法。
+
+            // ---- 无样式编码（本实现不携带单元格/内容样式模型）----
+            // 无样式：cellStyle = [BL 样式类型=0][BS data_flags=0]，
+            // 读取端的 readCellStyle 在 dataFlags==0 时立即返回。
+            auto writeCellStyle = [&]() {
+                b.w.writeBL(0);                 // 样式类型
+                b.w.writeBS(0);                 // data_flags = 0 → 无样式体
+            };
+            // 内容格式（readContentFormat 的对偶）
+            auto writeContentFormat = [&](int alignment) {
+                b.w.writeBL(0);                         // 替代标志
+                b.w.writeBL(0);                         // 属性标志
+                b.w.writeBL(0);                         // 值数据类型
+                b.w.writeBL(0);                         // 值单位类型
+                b.w.writeT(std::string(), d->codec);    // 值格式串
+                b.w.writeBD(0.0);                       // 旋转
+                b.w.writeBD(1.0);                       // 缩放
+                b.w.writeBL(alignment);                 // 对齐 1..9
+                d->writeColor(b.w, 256);                // 内容颜色（CMC，ByLayer）
+                b.w.writeHandle(kHcAbsolute, 0);        // 文字样式（走句柄流）
+                b.w.writeBD(0.18);                      // 文字高
+            };
+            // 单元格（write_table_cell_r2010 的对偶）
+            auto writeCell = [&](int r, int c) {
+                const auto cit = byCell.find(std::make_pair(r, c));
+                const std::string text =
+                    (cit != byCell.end()) ? cit->second->text : std::string();
+                b.w.writeBL(0);                         // state
+                b.w.writeT(std::string(), d->codec);    // 提示
+                b.w.writeBL(0);                         // custom data
+                b.w.writeBL(0);                         // 自定义项数 = 0
+                b.w.writeBL(0);                         // has_linked_data = 0
+                b.w.writeBL(1);                         // 内容数 = 1
+                b.w.writeBL(1);                         // ct = 1（值）
+                writeTableCellValue(b.w, text, d->codec);// AcDbCellValue（空格写空值）
+                b.w.writeBL(0);                         // 属性数 = 0
+                b.w.writeBS(0);                         // has_format = 0
+                writeCellStyle();                       // 单元格样式（无）
+                b.w.writeBL(0);                         // style id
+                b.w.writeBL(0);                         // has_geometry = 0
+            };
+
+            // ---- AcDbLinkedTableData ----
+            // 表名/描述写空：表的身份由 *Tnn 块记录承载，匿名表的
+            // AcDbLinkedTableData.name 在真实文件里就是空的（读取端也只读不取）。
+            b.w.writeT(std::string(), d->codec);        // 表名
+            b.w.writeT(std::string(), d->codec);        // 描述
+
+            b.w.writeBL(numCols);
+            for (int c = 0; c < numCols; ++c) {
+                b.w.writeT(std::string(), d->codec);    // 列名
+                b.w.writeBL(0);                         // custom data
+                b.w.writeBL(0);                         // 自定义项数 = 0
+                writeCellStyle();                       // 列样式（无）
+                b.w.writeBL(0);                         // style id
+                const double cw = (c < static_cast<int>(ent->colWidths.size()))
+                                      ? ent->colWidths[static_cast<std::size_t>(c)]
+                                      : 63.5;
+                b.w.writeBD(cw);                        // 列宽
+            }
+
+            b.w.writeBL(numRows);
+            for (int r = 0; r < numRows; ++r) {
+                b.w.writeBL(numCols);                   // 本行单元格数
+                for (int c = 0; c < numCols; ++c) writeCell(r, c);
+                b.w.writeBL(0);                         // custom data
+                b.w.writeBL(0);                         // 自定义项数 = 0
+                writeCellStyle();                       // 行样式（无）
+                // style id：1=标题行 / 2=表头行 / 3=数据行。本实现的行模型
+                // 没有「标题/表头」语义（表格样式里也未必定义了那两种行样式），
+                // 一律按数据行写出，避免读回后被套上标题/表头的格式。
+                b.w.writeBL(3);                         // style id = 3（数据行）
+                const double rh = (r < static_cast<int>(ent->rowHeights.size()))
+                                      ? ent->rowHeights[static_cast<std::size_t>(r)]
+                                      : 9.0;
+                b.w.writeBD(rh);                        // 行高
+            }
+
+            b.w.writeBL(0);                             // 字段句柄数 = 0
+            writeCellStyle();                           // 基样式（无）
+
+            b.w.writeBL(static_cast<dint32>(ent->merges.size()));
+            for (const DRW_Table::Merge& mv : ent->merges) {
+                const int bottom = mv.row + std::max(1, mv.rowSpan) - 1;
+                const int right = mv.col + std::max(1, mv.colSpan) - 1;
+                b.w.writeBL(mv.row);                    // top
+                b.w.writeBL(mv.col);                    // left
+                b.w.writeBL(bottom);                    // bottom
+                b.w.writeBL(right);                     // right
+            }
+
+            b.w.writeHandle(kHcAbsolute, styleH);       // 表样式（句柄流，内容末尾）
+
+            // ---- 内容之后的尾段 ----
+            b.w.writeBS(0);                             // 未知短整型
+            b.w.write3BD(1.0, 0.0, 0.0);                // 水平方向
+            b.w.writeBL(0);                             // 无断裂数据
+            b.w.writeBL(0);                             // 无断裂区间
+        } else {
+
+        // ---- AcDbTable 段（R2000 ~ R2007 扁平格式） ----
         b.w.writeBS(static_cast<dint16>(22));      // flag_for_table_value（实测值）
         b.w.write3BD(1.0, 0.0, 0.0);               // horiz_direction
         b.w.writeBL(numCols);
@@ -2799,10 +3004,19 @@ bool dwgW::writeTable(DRW_Table* ent)
         b.w.writeB(false);
         b.w.writeB(false);
         b.w.writeB(false);
+
+        }   // end else（R2000 ~ R2007 扁平格式）
     }, [&](Private::ObjBuilder& b) {
         // 句柄顺序与读取端一致：
-        //   block_header(H5) → tablestyle(H342) → 每格一个空值句柄（行优先）
+        //   2000~2007：block_header(H5) → tablestyle(H342) → 每格一个空值句柄（行优先）
+        //   2010+    ：block_header(H5) → 未知句柄 → tablestyle（挂在内容末尾）
+        //              —— 单元格的值在 R2010 是**内联**的，不再占句柄。
         b.w.writeHandle(kHcAbsolute, blockH);
+        if (d->version >= DRW::AC1024) {
+            b.w.writeHandle(kHcAbsolute, 0);          // 内容开头的未知句柄
+            b.w.writeHandle(kHcAbsolute, styleH);     // 表样式（内容末尾）
+            return;
+        }
         b.w.writeHandle(kHcAbsolute, styleH);
         for (int i = 0; i < numRows * numCols; ++i)
             b.w.writeHandle(kHcAbsolute, 0);
@@ -3025,8 +3239,16 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     // 其余句柄全在句柄流）。字符串区由 writeT 自动分流（见 dwgBitWriter::writeT）。
     dwgBitWriter hdlStream;                     // 句柄流（仅 2007+ 使用）
     std::size_t bitSizeSlot = 0;
+    // R2010（AC1024，且 maint_version > 3）在 size 与 bitsize 之间还有一个
+    // **bitsize_hi**(RL)。读取端 drw_header.cpp:1776-1782 会按
+    // `version > AC1021 && mv > 3` 读它并把句柄流基点从 160 挪到 192；
+    // 漏写这 4 字节会让 hBbuf 整体前移 32 位，读出的表控制句柄全是垃圾
+    // （症状：LineType/Layer/Style… 全部 "control not found"）。
+    // 取值与 libredwg 一致：占位置 0（encode.c 只回填 bitsize，bitsize_hi 恒 0）。
+    const bool hasHSize = (ver > DRW::AC1021);
     if (ver > DRW::AC1018) {
-        bitSizeSlot = w.bitPosition();           // w 的起点即 RL bitSize
+        if (hasHSize) w.writeRL(0);              // bitsize_hi 占位
+        bitSizeSlot = w.bitPosition();           // 此后即 RL bitsize
         w.writeRL(0);                            // 占位，末尾回填
         w.setHandleSink(&hdlStream);
     }
@@ -3194,6 +3416,14 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     // 2028-2031 行），缺一个位就错位整个句柄流。
     w.writeT(std::string(), d.codec);                   // DIMPOST
     w.writeT(std::string(), d.codec);                   // DIMAPOST
+    // R2010+：字符串流里紧跟 DIMAPOST 还有两个标注后缀串（读取端
+    // drw_header.cpp:2364-2367；libredwg header_variables.spec 的
+    // `SINCE (R_2010b) { FIELD_T (DIMALTMZS, 1); FIELD_T (DIMMZS, 1); }`）。
+    // 漏写会让其后全部字符串（HYPERLINKBASE…PROJECTNAME）整体前移。
+    if (ver > DRW::AC1021) {
+        w.writeT(std::string(), d.codec);               // DIMALTMZS
+        w.writeT(std::string(), d.codec);               // DIMMZS
+    }
 
     // ---- 标注变量（第一组）------------------------------------------------------
     // 默认值与 DimStyleData（即 LyCAD 标注引擎布局）保持一致，两处必须同步：
@@ -3265,10 +3495,20 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     w.writeBS(0);                                       // DIMALTTZ
     w.writeB(false);                                    // DIMUPT
     w.writeBS(3);                                       // DIMATFIT
-    // 2007+：DIMFXLON（读取端 2143-2145）。注意其后的 DIMTXTDIRECTION/
-    // DIMALTMZF/DIMMZF 是 `version > AC1021`（2010+），AC1021 不得写。
+    // 2007+：DIMFXLON（读取端 2143-2145）。
     if (ver > DRW::AC1018)
         w.writeB(false);                                // DIMFXLON
+    // R2010+：DIMFXLON 之后还有三个字段（读取端 drw_header.cpp:2146-2150 的
+    // `version > AC1021` 分支；libredwg header_variables.spec 的
+    // `SINCE (R_2010b)`：`B DIMTXTDIRECTION / BD DIMALTMZF / BD DIMMZF`）。
+    // **漏写这 3 个字段会让其后整个变量流前移**，读取端从此把后续每个字段都
+    // 读错位——libredwg 会在文件头变量区报一串 CMC/TU/BD 越界（实测 9~10 条），
+    // 浩辰的 AUDIT 也因此判「需修复」。取值与浩辰/AutoCAD 一致：全为 0。
+    if (ver > DRW::AC1021) {
+        w.writeB(false);                                // DIMTXTDIRECTION
+        w.writeBD(0.0);                                 // DIMALTMZF
+        w.writeBD(0.0);                                 // DIMMZF
+    }
 
     w.writeHandle(kHcAbsolute, d.styleHandle(hdrStr(hdr, "$DIMTXSTY", "Standard")));
     w.writeHandle(kHcAbsolute, 0);                      // DIMLDRBLK
@@ -3430,16 +3670,19 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
         } else {
             w.writeB(false);
         }
-        // bitSize = **句柄流起点**（相对 w 起点，即节内 160 位处）：
+        // bitSize = **句柄流起点**（相对 bitSize 字段，即节内 160 位处）：
         // 读取端 drw_header.cpp:1792-1794 直接 setPosition((160+bitSize)>>3) 定位
         // hBbuf，并把 (160+bitSize)-1 当字符串区标志位、(160+bitSize)-17 当 u16
         // 位数——写成句柄流【末尾】会让 hBbuf 定位到句柄流之后，读出一串垃圾
         //（症状：所有 CONTROL 句柄错、控制对象全部 not found）。
+        // R2010 有 bitsize_hi 时基点再 +32（读取端的 `endBitPos += 32`），
+        // 故此处要把 handleStartBit 里属于 bitsize_hi 的那 32 位扣掉，才是 bitsize。
         const std::size_t handleStartBit = w.bitPosition();
         w.appendBitsFrom(hdlStream);                    // 句柄流紧随其后
         const std::size_t endBit = w.bitPosition();
         w.setBitPosition(bitSizeSlot);
-        w.writeRL(static_cast<std::uint32_t>(handleStartBit));  // bitSize = 句柄流起点
+        w.writeRL(static_cast<std::uint32_t>(
+            hasHSize ? (handleStartBit - 32u) : handleStartBit));
         w.setBitPosition(endBit);
     }
 }
@@ -3506,9 +3749,15 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
     // 文本编码：$DWGCODEPAGE 决定（默认简中 ANSI_936），文件头记录对应 id
     std::uint16_t codepageId = kCodepageId936;
     {
-        // 文本编码：AC1021 起为 UTF-16，故版本串必须是 AC1021 —— 它同时决定
-        // writeT 是否走独立字符串流（见 dwgBitWriter::writeT）。
-        std::string verStr = (dwgVer == DRW::AC1021) ? "AC1021"
+        // 文本编码：AC1021 起为 UTF-16，版本串决定 codec 的档位，而 codec 的档位
+        // 又决定 writeT 是否把文本分流到**独立字符串流**（见 dwgBitWriter::writeT）。
+        // 必须逐版本给出真名：AC1024 若落到 "AC1015"，codec 会退回代码页模式，
+        // 文本内联进主数据流、字符串流为空，2007+ 的字符串区随即缺失
+        // （实测：Classes 节 endbit 写成 0，读取端算出天文数字的 strDataSize，
+        //  类名全丢 → BAD_READ_CLASSES）。DRW_TextCodec::setVersion 对
+        // AC1021/AC1024/AC1027/AC1032 一视同仁，都归到 UTF-16 档。
+        std::string verStr = (dwgVer == DRW::AC1024) ? "AC1024"
+                          : (dwgVer == DRW::AC1021) ? "AC1021"
                           : (dwgVer == DRW::AC1018) ? "AC1018" : "AC1015";
         d->codec.setVersion(&verStr, false);
     }
@@ -3676,12 +3925,35 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
                 body.writeB(false);
             }
             dwgBitWriter area;
+            // R2010（maint_version > 3）：size 与 bitsize 之间还有第三个 RL
+            // 「hsize」，值为 bitsize / 8（libredwg encode.c：
+            // `hsize = (BITCODE_RL)(bitsize / 8)`；decode.c 的
+            // `from_version >= R_2010 && maint_version > 3` 分支会读它）。
+            // 漏写会让读取端把 bitsize 当 hsize、把 BS 最大类号当 bitsize，
+            // 类表随即整体错位（实测 BAD_READ_CLASSES）。
+            const bool hasHSize = dwgVer > DRW::AC1021;
+            const std::size_t hsizeSlot = area.bitPosition();
+            if (hasHSize) area.writeRL(0);        // hsize 占位
             const std::size_t slot = area.bitPosition();
-            area.writeRL(0);
+            area.writeRL(0);                      // bitsize 占位
             area.appendBitsFrom(body);
             const std::size_t endBit = area.bitPosition();
+            // bitsize 的语义（libredwg encode.c: encode_classes）：
+            //   bitsize = 32（bitsize 字段自身）+ 该字段之后直到字符串区末位的位数
+            // 也就是「从 bitsize 字段起算的位数」，**不含** 排在它前面的 hsize。
+            // R2010 的 area 里 hsize 在 bitsize 之前，故要减掉那 32 位；AC1021
+            // 没有 hsize，endBit 原值即对。读取端据此算字符串区起点
+            // （libredwg section_string_stream / dwgReader18：strStartPos = bitsize + 191，
+            //  指的是全节最后一位 endbit 的绝对位置），多算 32 位会让 endbit 读成 0、
+            // 字符串区起点落到类记录里。
+            const std::uint32_t bitsize =
+                static_cast<std::uint32_t>(endBit - (hasHSize ? 32u : 0u));
             area.setBitPosition(slot);
-            area.writeRL(static_cast<std::uint32_t>(endBit));
+            area.writeRL(bitsize);
+            if (hasHSize) {
+                area.setBitPosition(hsizeSlot);
+                area.writeRL(bitsize / 8);
+            }
             area.setBitPosition(endBit);
             area.padToByte();
             out.classesData = area.takeData();
@@ -3694,7 +3966,7 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
     // ---- 3. 导出对象表（供各版本容器按自身偏移规则装配）-----------------------------
     out.objects.reserve(d->objects.size());
     for (const dwgW::Private::Obj& o : d->objects)
-        out.objects.push_back(ObjectRecord{ o.handle, o.body });
+        out.objects.push_back(ObjectRecord{ o.handle, o.body, 0, o.handleBits });
     out.nextHandle = d->nextHandle;
     out.fileName = d->fileName;
 

@@ -180,6 +180,11 @@ public:
         std::uint32_t handle = 0;
         std::vector<std::uint8_t> body;
         std::uint32_t offset = 0;               ///< MS 起始文件偏移（容器装配期填写）
+        /// R2010+ 对象记录在 MS 尺寸之后还有一个 UMC「句柄流位数」
+        ///（libredwg: `obj->handlestream_size`，不计入 obj->size），
+        /// 读取端据此用 `obj->bitsize = size*8 - handlestream_size` 找句柄流。
+        /// 2007 及更早为空记录格式（该字段不用）。
+        std::uint32_t handleBits = 0;
     };
 
     /// 与容器无关的节载荷。
