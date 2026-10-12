@@ -143,10 +143,12 @@ void TestDwgCodec::dwgWriteVersionIsSelectable()
     QVERIFY(versions.contains(QStringLiteral("AC1018")));
     QVERIFY(versions.contains(QStringLiteral("AC1021")));
     QVERIFY(versions.contains(QStringLiteral("AC1024")));
+    QVERIFY(versions.contains(QStringLiteral("AC1027")));
     QVERIFY(versions.contains(WriteOptions::defaultDwgVersion()));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1018")));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1021")));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1024")));
+    QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1027")));
     QVERIFY(!WriteOptions::isWritableDwgVersion(QStringLiteral("AC1032")));
 
     Document document;
@@ -198,7 +200,7 @@ void TestDwgCodec::nativeReadWriteRoundTrip()
     QFile file(dwgPath);
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray content = file.readAll();
-    QCOMPARE(content.left(6), QByteArray("AC1024"));   // 默认写出版本 AC1024/R2010
+    QCOMPARE(content.left(6), QByteArray("AC1027"));   // 默认写出版本 AC1027/R2013
     QVERIFY2(!content.contains("ENTITIES"), "DWG 应是二进制格式，而不是 DXF 文本");
 
     // 走出原生写出时应在提示中说明，便于用户追溯

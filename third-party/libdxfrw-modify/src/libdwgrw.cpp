@@ -37,6 +37,7 @@
 #include "intern/dwgwriter18.h"
 #include "intern/dwgwriter21.h"
 #include "intern/dwgwriter24.h"
+#include "intern/dwgwriter27.h"
 
 #define FIRSTHANDLE 48
 
@@ -359,10 +360,17 @@ bool dwgW::write(DRW_Interface* iface, DRW::Version ver)
     if (dwgWriter21::supports(ver))
         return dwgWriter21::write(*this, iface);
 
-    // AC1024（R2010）：容器与 AC1021 完全相同，复用其摆放代码
-    // （intern/dwgwriter24.cpp）。
+    // AC1024（R2010）：容器与 AC1018（R2004）同族（0x80 加密文件头 +
+    // 页/段映射 + 分页），差别只在版本标识与几个版本常量，故复用 dwgWriter18
+    // 的摆放代码（intern/dwgwriter24.cpp）。注意**不是**复用 AC1021。
     if (dwgWriter24::supports(ver))
         return dwgWriter24::write(*this, iface);
+
+    // AC1027（R2013）：容器与 AC1024 同族（libredwg 的 decode.c 对 R_2010b
+    // 及以后一律走 decode_R2004），同样复用 dwgWriter18 的摆放代码
+    // （intern/dwgwriter27.cpp）。
+    if (dwgWriter27::supports(ver))
+        return dwgWriter27::write(*this, iface);
 
     return false;                       // 暂不支持的目标版本
 }
@@ -816,6 +824,11 @@ struct dwgW::Private
         // parseDwg 的 `if (version > DRW::AC1015)`）。漏写会让其后句柄流错 1 位。
         // 写 1 = 无 XDicObj（句柄流不再写空 XDicObj 句柄，与真实文件一致）。
         if (version > DRW::AC1015) b.w.writeB(true);    // xDictFlag=1：无 XDicObj
+        // 2013+：紧接着还有一个「has binary data」位（读取端 DRW_TableEntry::parseDwg
+        // 的 `if (version > DRW::AC1024)`；libredwg common_entity_data.spec 的
+        // `SINCE (R_2013) FIELD_B (has_ds_data, 0)`）。漏写会让其后数据整体错 1 位，
+        // 表记录数读成 0、块记录全部找不到（实测 AC1027 停在 BAD_READ_TABLES）。
+        if (version > DRW::AC1024) b.w.writeB(false);   // has binary data
     }
 
     /// 颜色字段：R2000 是 BS（ACI），R2004 起是 CMC —— BS 索引 + BL RGB + RC 标志
@@ -867,6 +880,10 @@ struct dwgW::Private
         b.w.writeBS(0);                                     // EED 长度（无扩展数据）
         b.w.writeBL(1);                                     // numReactors = 1
         if (version > DRW::AC1015) b.w.writeB(true);        // xDictFlag=1：无 XDicObj（2004+）
+        // 2013+：has_ds_data（libredwg common_object_handle_data.spec 的
+        // `SINCE (R_2013) FIELD_B (has_ds_data, 0)`）。NOD 命名对象（MLINESTYLE /
+        // DICTIONARYVAR / XRECORD）与表项一样要走这一位，否则其后对象字段整体错位。
+        if (version > DRW::AC1024) b.w.writeB(false);       // has_ds_data = 0
     }
     void writeNamedHeadTail(ObjBuilder& b, std::uint32_t ownerDict)
     {
@@ -892,10 +909,14 @@ struct dwgW::Private
         // 写 1 = 无 XDicObj：句柄流里就不再出现那个空 XDicObj 句柄，
         // 与真实 R2004 文件（浩辰）及其它第三方写出器的形态一致。
         if (version > DRW::AC1015) b.w.writeB(true);    // xDictFlag=1：无 XDicObj
-        // nolinks 位只在 R2000- 与 2013+ 存在（读取端
-        // `version > AC1024 || version < AC1018`）；AC1018/AC1021/AC1024 不读它。
-        if (version < DRW::AC1018 || version > DRW::AC1024)
+        // nolinks 位只在 R13~R2002 存在（libredwg common_entity_data.spec 的
+        // `VERSIONS (R_13b1, R_2002)`；读取端 `version < AC1018`）。原先多写的
+        // `|| version > AC1024` 会让 AC1027 多写 1 位，与 has_ds_data 的位置冲突。
+        if (version < DRW::AC1018)
             b.w.writeB(false);          // nolinks = 0：句柄流内含 prev/next 链
+        // 2013+：has_ds_data（libredwg `SINCE (R_2013) FIELD_B (has_ds_data, 0)`）。
+        if (version > DRW::AC1024)
+            b.w.writeB(false);          // has_ds_data = 0（无 ACIS SAB 数据）
         // 颜色：**实体**走读取端 buf->getEnColor(version)，该函数对 AC1018+ 只读一个
         // BS（索引）；只有当 idx 高字节带 0x20（透明度）或 0x80（真彩）标志时才
         // 追加读 RL。即 ACI 颜色只占 2~18 位。
@@ -1266,6 +1287,12 @@ void encodeLayer(Private& d, const DRW_Layer& ent, std::uint32_t handle)
     if (d.version > DRW::AC1018)
         b.w.writeHandle(kHcAbsolute, 0); // material（2007+）
     b.w.writeHandle(kHcAbsolute, d.ltypeHandle(ent.lineType));
+    // 2013+：图层句柄流在 lineType 之后再加一个「视觉样式」句柄
+    //（读取端需对应读掉；libredwg dwg.spec:3464 的 `SINCE (R_2013b)
+    //  FIELD_HANDLE (visualstyle, 5, 348)`）。漏写会让严格解析器（libredwg /
+    //  CAD 内核）在此越界读，其后所有对象判 CRC/尺寸不符。
+    if (d.version > DRW::AC1024)
+        b.w.writeHandle(kHcAbsolute, 0); // visualstyle（2013+，无 = NULL）
     d.pushObject(handle, kLayer, b.finish());
 }
 
@@ -1670,17 +1697,16 @@ void encodeMlineStyle(Private& d, std::uint32_t handle, std::uint32_t ownerDict,
     b.w.writeT(name, d.codec);                          // name（2）
     b.w.writeT(std::string(), d.codec);                 // description（0）
     b.w.writeBS(0);                                     // flag（70）
-    b.w.writeBS(256);                                   // fill_color（CMC.BS 62）= ByLayer
+    // fill_color 是 **CMC**（libredwg dwg.spec:4537 的 `FIELD_CMC (fill_color, 62)`），
+    // 不是纯 BS —— 漏写其后的 BL/RC 会让 start_angle 等字段整体前移，
+    // 严格解析器（libredwg / CAD 内核）随即报 CMC 非法。原先写作 writeBS(256)。
+    d.writeColor(b, 256);                               // fill_color（CMC 62）= ByLayer
     const double halfPi = 1.5707963267948966;
     b.w.writeBD(halfPi);                                // start_angle（51）= 90°
     b.w.writeBD(halfPi);                                // end_angle（52）= 90°
-    b.w.writeRC(2);                                     // num_lines（71）
-    const double offsets[2] = { 0.5, -0.5 };
-    for (int i = 0; i < 2; ++i) {
-        b.w.writeBD(offsets[i]);                        // lines[i].offset（49）
-        b.w.writeBS(256);                               // lines[i].color（CMC.BS 62）
-        b.w.writeBS(32767);                             // lines[i].lt_index（BSd 6）
-    }
+    // num_lines = 0：STANDARD 样式在 AutoCAD / 浩辰里就是无自定线（实测浩辰产物同为 0），
+    // 且 lines[].lt_index 属 R2018 字段，R2013 写出会多出数据。
+    b.w.writeRC(0);                                     // num_lines（71）
     b.beginHandles();
     d.writeNamedHeadTail(b, ownerDict);
     d.pushObject(handle, kMlineStyle, b.finish());
@@ -2111,7 +2137,13 @@ void dwgW::Private::encodePendingDefaults()
 
     encodeControl(*this, kViewControl, viewCtrl, CtrlKind::Bl, {});
     encodeControl(*this, 0x3Eu /*UCS control*/, ucsCtrl, CtrlKind::Bs, {});
-    encodeControl(*this, 0x46 /*视口实体头控制*/, vpEntHeaderCtrl, CtrlKind::Bs, {});
+    // VX_CONTROL（0x46，视口实体头控制）是 **R13~R2000** 的对象
+    //（libredwg header_variables.spec:541-543 的
+    //  `VERSIONS (R_13b1, R_2000) { FIELD_HANDLE (VX_CONTROL_OBJECT, 3, 0); }`，
+    //  dwg.h 亦注 `VX_CONTROL_OBJECT /*!< r11-r2000 code 3 */`）。R2004+ 不写出——
+    //  浩辰 / AutoCAD 的 R2004+ 文件里都没有它，多写会让严格 AUDIT 判出多余对象。
+    if (version <= DRW::AC1015)
+        encodeControl(*this, 0x46 /*视口实体头控制*/, vpEntHeaderCtrl, CtrlKind::Bs, {});
 }
 
 // =============================================================================
@@ -2556,6 +2588,15 @@ bool dwgW::writeSpline(DRW_Spline* ent)
 {
     d->encodeEntity(kSpline, *ent, [&](Private::ObjBuilder& b) {
         b.w.writeBL(1);                 // scenario 1（控制点表示）
+        // R2013+：scenario 之后、degree 之前还有两个 BL —— splineflags 与
+        // knotparam（读取端 DRW_Spline::parseDwg 的 `if (version > DRW::AC1024)`，
+        //  libredwg dwg.spec 的 `SINCE (R_2013b) FIELD_BL (splineflags) /
+        //  FIELD_BL (knotparam)`）。漏写会让 degree 起点前移 2 个 BL，
+        // 控制点数 / 节点数全错。
+        if (d->version > DRW::AC1024) {
+            b.w.writeBL(0);             // splineflags（bit0 = 1 表示 scenario 2）
+            b.w.writeBL(0);             // knotparam
+        }
         b.w.writeBL(static_cast<dint32>(ent->degree));
         b.w.writeB(false);              // 有理
         b.w.writeB((ent->flags & 1) != 0);
@@ -2844,9 +2885,15 @@ bool dwgW::writeTable(DRW_Table* ent)
             // 故该句柄统一在下面的 extraHandles 里按次序写出。
             b.w.writeRC(0);                     // 未知字节
             b.w.writeBL(0);                     // 未知长整数
-            b.w.writeB(true);                   // 未知位：R2010 的默认值是 **true**
-            // 参考实现明示：这一位在 R2013+ 换成了 BL，而 R2010 的「位」默认必须
-            // 为真，写 0 会被严格读取端判为新表非法。
+            // 紧随的未知字段：R2010 是**单个 bit**（默认必须为真，写 0 会被严格
+            // 读取端判为新表非法）；R2013+ 起换成 **BL**
+            //（读取端 drw_entities.cpp 的
+            //  `if (version >= DRW::AC1027) buf->getBitLong(); else buf->getBit();`）。
+            // 类型写错会让其后的表内容整体错位（行列数读成垃圾）。
+            if (d->version >= DRW::AC1027)
+                b.w.writeBL(0);                 // R2013+：BL
+            else
+                b.w.writeB(true);               // R2010：bit，默认真
 
             // ---- 无样式编码（本实现不携带单元格/内容样式模型）----
             // 无样式：cellStyle = [BL 样式类型=0][BS data_flags=0]，
@@ -3252,6 +3299,13 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
         w.writeRL(0);                            // 占位，末尾回填
         w.setHandleSink(&hdlStream);
     }
+    // R2013+：变量流在 RL bitSize 之后还有一个 BLL REQUIREDVERSIONS
+    // （读取端 drw_header.cpp:1797-1800 的 `if (version > DRW::AC1024)`；
+    //  libredwg header_variables.spec 的 `SINCE (R_2013b) FIELD_BLL`）。
+    // 漏写会让其后所有变量整体前移 3 位，变量名与值全错位（症状：$ACADVER /
+    // 图层等读成垃圾，表控制对象随之找不到）。本实现不携带该信息，写 0。
+    if (ver > DRW::AC1024)
+        w.writeBLL(0);                           // REQUIREDVERSIONS
     // 颜色字段：R2000 是 BS（ACI），R2004 起是 CMC —— BS 索引 + BL RGB + RC 标志
     // （读取端 drw_header.cpp 一律走 buf->getCmColor(version)，2004+ 不再是纯 BS；
     //   漏写 BL/RC 会让其后整个句柄流错位，表控制对象全部找不到）。
@@ -3558,12 +3612,19 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     // drw_header.cpp parseDwg 的 `if (version > DRW::AC1015)`）。
     // 本写出器不生成这两个字典，按空句柄写出。
     if (ver > DRW::AC1015) {
-        w.writeHandle(kHcAbsolute, 0);                  // DICT MATERIALS
-        w.writeHandle(kHcAbsolute, 0);                  // DICT COLORS
+        w.writeHandle(kHcAbsolute, d.dictMaterial);     // DICT MATERIALS
+        w.writeHandle(kHcAbsolute, d.dictColor);        // DICT COLORS
     }
     // 2007+：再一个字典句柄（读取端 2234-2237，`version > AC1018`）
     if (ver > DRW::AC1018)
         w.writeHandle(kHcAbsolute, 0);                  // DICT VISUALSTYLE
+    // 2013+：**再一个**未命名字典句柄（libredwg header_variables.spec:577-580 的
+    // `SINCE (R_2013b) FIELD_HANDLE (unknown_20, 5, 0)`，疑为 DICTIONARY_LIGHTLIST）。
+    // 漏写会让其后的**全部头变量整体前移一个句柄**：libredwg 把 FLAGS 的低位当句柄读，
+    // 我方 JSON 里 `unknown_20` 读出 0x44、`CMLSTYLE`/`CMATERIAL` 等后续句柄全错位；
+    // 浩辰的 AUDIT 正是据此判文件损坏（实测：补上后头变量逐项与本对照文件一致）。
+    if (ver > DRW::AC1024)
+        w.writeHandle(kHcAbsolute, 0);                  // DICTIONARY_LIGHTLIST（2013+）
 
     // FLAGS：
     //   低 5 位 = CELWEIGHT 的 DWG 编码（29 = ByLayer）
@@ -3756,7 +3817,8 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
         // （实测：Classes 节 endbit 写成 0，读取端算出天文数字的 strDataSize，
         //  类名全丢 → BAD_READ_CLASSES）。DRW_TextCodec::setVersion 对
         // AC1021/AC1024/AC1027/AC1032 一视同仁，都归到 UTF-16 档。
-        std::string verStr = (dwgVer == DRW::AC1024) ? "AC1024"
+        std::string verStr = (dwgVer == DRW::AC1027) ? "AC1027"
+                          : (dwgVer == DRW::AC1024) ? "AC1024"
                           : (dwgVer == DRW::AC1021) ? "AC1021"
                           : (dwgVer == DRW::AC1018) ? "AC1018" : "AC1015";
         d->codec.setVersion(&verStr, false);

@@ -336,7 +336,7 @@ void TestTable::dwgNativeRoundTrip()
     // 写出的必须是真 DWG 二进制（R2000 版本签名），不是套壳 DXF
     QFile file(m_dir.filePath(QStringLiteral("table_native.dwg")));
     QVERIFY(file.open(QIODevice::ReadOnly));
-    QCOMPARE(file.read(6), QByteArray("AC1024"));   // 默认写出版本 AC1024/R2010
+    QCOMPARE(file.read(6), QByteArray("AC1027"));   // 默认写出版本 AC1027/R2013
 }
 
 // -----------------------------------------------------------------------------

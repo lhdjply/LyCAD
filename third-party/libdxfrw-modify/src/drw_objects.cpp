@@ -702,6 +702,14 @@ bool DRW_Layer::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     lTypeH = buf->getHandle();
     DRW_DBG("line type Handle: "); DRW_DBGHL(lTypeH.code, lTypeH.size, lTypeH.ref);
     DRW_DBG("\n Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n");
+    // 2013+：lineType 之后还有一个「视觉样式」句柄
+    //（libredwg dwg.spec:3464 的 `SINCE (R_2013b) FIELD_HANDLE (visualstyle, 5, 348)`）。
+    // 必须消费掉，否则句柄流游标停在错误位置。本实现不承载视觉样式，读出即丢弃。
+    if (version > DRW::AC1024) {//2013+
+        dwgHandle visualStyleH = buf->getHandle();
+        DRW_DBG(" Visual style Handle: "); DRW_DBGHL(visualStyleH.code, visualStyleH.size, visualStyleH.ref);
+        DRW_DBG("\n Remaining bytes: "); DRW_DBG(buf->numRemainingBytes()); DRW_DBG("\n");
+    }
 //    RS crc;   //RS */
     return buf->isGood();
 }

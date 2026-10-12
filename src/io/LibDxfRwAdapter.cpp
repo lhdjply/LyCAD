@@ -3677,8 +3677,10 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
 {
     // 目标版本由 WriteOptions::dwgVersion 决定：AC1015（R2000）走线性容器
     //（intern/dwgwriter15.cpp）、AC1018（R2004）走分页 + LZ77 容器
-    //（intern/dwgwriter18.cpp）、AC1021（R2007）与 AC1024（R2010）走 RS + 分页容器
-    //（intern/dwgwriter21.cpp / dwgwriter24.cpp，两者容器相同）。非法取值回退到 AC1015。
+    //（intern/dwgwriter18.cpp）、AC1021（R2007）走 RS + 文件头页容器
+    //（intern/dwgwriter21.cpp）、AC1024（R2010）与 AC1027（R2013）同属 R2004 族
+    // 分页容器（intern/dwgwriter24.cpp / dwgwriter27.cpp，均复用 dwgwriter18）。
+    // 非法取值回退到 AC1015。
     DRW::Version target = DRW::AC1015;
     if (options.dwgVersion.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0)
         target = DRW::AC1018;
@@ -3686,6 +3688,8 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
         target = DRW::AC1021;
     else if (options.dwgVersion.compare(QStringLiteral("AC1024"), Qt::CaseInsensitive) == 0)
         target = DRW::AC1024;
+    else if (options.dwgVersion.compare(QStringLiteral("AC1027"), Qt::CaseInsensitive) == 0)
+        target = DRW::AC1027;
 
     ExporterBase<dwgW> exporter(document, target);
     exporter.prescanBlocks();

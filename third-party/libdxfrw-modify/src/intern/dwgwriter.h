@@ -98,6 +98,16 @@ public:
         else if (v > 0 && v < 256) { writeBB(1); writeRC(static_cast<std::uint8_t>(v)); }
         else { writeBB(0); writeRL(static_cast<std::uint32_t>(v)); }
     }
+    /// BLL：先 3 位「字节数」，再按**小端**写该长度的字节
+    ///（dwgBuffer::getBitLongLong 之对偶，R2013+ 头部变量的 REQUIREDVERSIONS 用它）。
+    void writeBLL(std::uint64_t v)
+    {
+        std::uint8_t n = 0;
+        for (std::uint64_t t = v; t != 0; t >>= 8) ++n;
+        write3B(n);
+        for (std::uint8_t i = 0; i < n; ++i)
+            writeRC(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu));
+    }
     /// BD：压缩 double
     void writeBD(double d)
     {

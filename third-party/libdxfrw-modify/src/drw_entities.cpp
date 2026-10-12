@@ -315,12 +315,22 @@ bool DRW_Entity::parseDwg(DRW::Version version, dwgBuffer *buf, dwgBuffer* strBu
         DRW_DBG(" xDictFlag: "); DRW_DBG(xDictFlag); DRW_DBG("\n");
     }
 
-    if (version > DRW::AC1024 || version < DRW::AC1018) {
+    // nolinks（prev/next 链标志）：按 libredwg common_entity_data.spec 的
+    // `VERSIONS (R_13b1, R_2002)` 只在 R13~R2002 存在；R2013+ 起这个位置改为
+    // has_ds_data（见下）。原先的 `version > AC1024` 会让 AC1027 多读 1 位，
+    // 与 libredwg / CAD 内核的字段序列错开。
+    if (version < DRW::AC1018) {
         haveNextLinks = buf->getBit(); //aka nolinks //B
         DRW_DBG(", haveNextLinks (0 yes, 1 prev next): "); DRW_DBG(haveNextLinks); DRW_DBG("\n");
     } else {
         haveNextLinks = 1; //aka nolinks //B
         DRW_DBG(", haveNextLinks (forced): "); DRW_DBG(haveNextLinks); DRW_DBG("\n");
+    }
+    // 2013+：has_ds_data 位（libredwg `SINCE (R_2013) FIELD_B (has_ds_data, 0)`）。
+    // 为真时其后还要跟 ACIS SAB 句柄；本实现不承载 3D 实体数据，读出即丢弃。
+    if (version > DRW::AC1024) {
+        duint8 hasDsData = buf->getBit();
+        DRW_DBG(", has_ds_data: "); DRW_DBG(hasDsData); DRW_DBG("\n");
     }
 //ENC color
     color = buf->getEnColor(version); //BS or CMC //ok for R14 or negate

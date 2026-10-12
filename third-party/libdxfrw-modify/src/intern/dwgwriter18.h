@@ -61,14 +61,16 @@ class DRW_Interface;
 
 namespace dwgWriter18 {
 
-/// 本实现是否支持目标版本。AC1018（AutoCAD 2004）与 AC1024（AutoCAD 2010）
-/// 的**文件容器同属一族**（0x80 加密文件头 + 页映射/段映射 + 分页），
-/// 差别只在版本标识、若干版本常量与对象数据区内部，故共用同一套摆放代码。
+/// 本实现是否支持目标版本。AC1018（AutoCAD 2004）的容器摆放代码，同时作为
+/// AC1024（AutoCAD 2010）与 AC1027（AutoCAD 2013）的**共用实现**——三者的
+/// 文件容器同属一族（0x80 加密文件头 + 页映射/段映射 + 分页），差别只在版本
+/// 标识、若干版本常量与对象数据区内部。AC1024/AC1027 分别经 dwgWriter24 /
+/// dwgWriter27 转交给本模块的 writeAs()。
 /// 注意：AC1021（R2007）用的是**另一套**文件头页容器，不走这里。
 bool supports(DRW::Version ver) noexcept;
 
-/// 写出整个文件（分页容器），版本由 ver 指定（AC1018 / AC1024）。
-/// 前置条件：writer 已构造完毕；iface 非空；ver 已由 supports() 校验通过。
+/// 写出整个文件（分页容器），版本由 ver 指定（AC1018 / AC1024 / AC1027）。
+/// 前置条件：writer 已构造完毕；iface 非空；ver 已由调用方校验通过。
 /// 返回 false 表示写出失败（文件不可写、内部状态不一致等）。
 bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver);
 

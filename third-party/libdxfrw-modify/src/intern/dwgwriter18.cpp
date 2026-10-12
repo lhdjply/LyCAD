@@ -681,15 +681,17 @@ bool write(dwgW& writer, DRW_Interface* iface)
 
 bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver)
 {
-    // R2010（AC1024）与 R2004（AC1018）的文件容器**同属一族**：0x80 处的加密
-    // 文件头（"AcFssFcAJMB"）、页映射 / 段映射、分页数据都一致。libredwg 的
-    // decode.c 也是把 R2010 交给 decode_R2004（注释写着 "for 2004 and 2010+"），
-    // 而 R2007 走的是另一套 decode_R2007。所以这里只需按版本取标识与常量。
-    const bool r2010 = (ver > DRW::AC1018);
-    const char* const versionStr = r2010 ? "AC1024" : "AC1018";
+    // R2010（AC1024）/ R2013（AC1027）与 R2004（AC1018）的文件容器**同属一族**：
+    // 0x80 处的加密文件头（"AcFssFcAJMB"）、页映射 / 段映射、分页数据都一致。
+    // libredwg 的 decode.c 也是把 R2010 及以后交给 decode_R2004（注释写着
+    // "for 2004 and 2010+"），而 R2007 走的是另一套 decode_R2007。
+    // 故这里只需按版本取标识与常量。
+    const bool r2010 = (ver > DRW::AC1018);        // 2010+（含 2013）
+    const bool r2013 = (ver >= DRW::AC1027);       // 2013+
+    const char* const versionStr = r2013 ? "AC1027" : (r2010 ? "AC1024" : "AC1018");
     // 内部版本号：与 libredwg 版本表的 dwg_version 一致（R2004 = 0x19 = 25、
-    // R2010 = 0x1d = 29）。R2004 沿用本实现既有的 25，R2010 取权威值 29。
-    const std::uint16_t internalVer = r2010 ? 29 : 25;
+    // R2010 = 0x1d = 29、R2013 = 0x1f = 31）。R2004 沿用本实现既有的 25。
+    const std::uint16_t internalVer = r2013 ? 31 : (r2010 ? 29 : 25);
 
     dwgW::SectionData sd;
     if (!writer.buildSections(iface, ver, sd))
@@ -1023,12 +1025,13 @@ bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver)
         for (int i = 0; i < 5; ++i) meta.push_back(0x00);
         // 维护版本（0x0B）与写出版本（0x11/0x12）。AC1018 沿用本实现既有取值；
         // AC1024 取 libredwg 版本表的权威值（maint_rel_version / dwg_version
-        // = 0x6d / 0x1d），该表同时被 libredwg 的 header.spec 用来解读文件头。
-        meta.push_back(r2010 ? 0x6d : 0x00);        // maintenance version
+        // = 0x6d / 0x1d）、AC1027 取 0x7d / 0x1f，该表同时被 libredwg 的
+        // header.spec 用来解读文件头。
+        meta.push_back(r2013 ? 0x7d : (r2010 ? 0x6d : 0x00));   // maintenance version
         meta.push_back(0x03);                       // byte 0x0C
         putU32(meta, previewAddr);                  // 预览图数据地址（页头后 0x20）
-        meta.push_back(r2010 ? 0x1d : 0x21);        // app dwg version
-        meta.push_back(r2010 ? 0x1d : 0x00);        // app maintenance version
+        meta.push_back(r2013 ? 0x1f : (r2010 ? 0x1d : 0x21));   // app dwg version
+        meta.push_back(r2013 ? 0x1f : (r2010 ? 0x1d : 0x00));   // app maintenance version
         putU16(meta, sd.codepageId);                // codepage
         for (int i = 0; i < 3; ++i) meta.push_back(0x00);
         putU32(meta, 0);                            // security flags
