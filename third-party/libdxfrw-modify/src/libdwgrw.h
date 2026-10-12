@@ -38,6 +38,10 @@ namespace dwgWriter18 {
 bool supports(DRW::Version ver) noexcept;
 bool write(dwgW& writer, DRW_Interface* iface);   // AC1018 / R2004：分页 + LZ77 容器
 }
+namespace dwgWriter21 {
+bool supports(DRW::Version ver) noexcept;
+bool write(dwgW& writer, DRW_Interface* iface);   // AC1021 / R2007：RS + 分页容器
+}
 
 class dwgR {
 public:
@@ -74,6 +78,7 @@ private:
 //    · 各版本的**文件容器**单独成文件，只负责把节载荷摆进文件、写哨兵与 CRC：
 //        intern/dwgwriter15.cpp = AC1015 / R2000（线性节）
 //        intern/dwgwriter18.cpp = AC1018 / R2004（分页 + LZ77）
+//        intern/dwgwriter21.cpp = AC1021 / R2007（RS 纠错 + AC21 压缩流）
 //      版本分派在 libdwgrw.cpp::dwgW::write() 中完成。
 //    · intern/dwgwriter.h/.cpp 是**与版本无关的位级原语层**
 //      （dwgBitWriter / CRC16 / 哨兵），由各版本容器共用。
@@ -81,7 +86,7 @@ private:
 //  设计要点
 //    · 对外 API 与 dxfRW 的写出侧同构（writeLine / writeLayer / writeBlock…），
 //      上游适配器（LibDxfRwAdapter 的 Exporter）无需修改即可在两者之间切换。
-//    · 目标版本目前为 AC1015 与 AC1018。
+//    · 目标版本目前为 AC1015 / AC1018 / AC1021。
 //    · 句柄由实现统一分配；表记录/块/实体间的引用（图层、线型、文字样式、
 //      匿名块）按名字解析为句柄。
 //    · 文件结构（版本头、节定位、header/classes/对象映射节、哨兵与 CRC）
@@ -182,8 +187,14 @@ public:
     /// AC1018 是分页 + LZ77；节的**内容**（header 变量位流、classes 位流、
     /// 对象流、句柄流）完全一致，故集中由 buildSections() 构建一次。
     struct SectionData {
-        std::vector<std::uint8_t> headerData;    ///< header 变量位流（不含哨兵 / RL 尺寸）
-        std::vector<std::uint8_t> classesData;   ///< classes 位流（不含哨兵 / RL 尺寸 / CRC）
+        /// header 变量位流（不含哨兵 / RL 尺寸）。
+        /// AC1015/AC1018：变量流与内联句柄混在一条流里；
+        /// AC1021：已按 2007 形态装配为 [RL bitSize][变量流][字符串区][u16 位数][标志][句柄流]。
+        std::vector<std::uint8_t> headerData;
+        /// classes 位流（不含哨兵 / RL 尺寸 / CRC）。
+        /// AC1015/AC1018：仅类记录，容器再补前导；
+        /// AC1021：已是完整数据区 [RL bitSize][BS 最大类号][RC][RC][位][类记录][字符串区][u16][标志]。
+        std::vector<std::uint8_t> classesData;
         std::uint16_t codepageId = 0;            ///< $DWGCODEPAGE 对应的代码页标识
         std::uint16_t maxClassNum = 0;           ///< 最大类号（= 499 + 自定义类数）
         std::vector<ObjectRecord> objects;       ///< 对象表（prev/next 链已回填）

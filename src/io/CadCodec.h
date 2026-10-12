@@ -37,10 +37,11 @@ struct WriteOptions {
     /// 中文不再受代码页限制。
     QString version = QStringLiteral("AC1032");
 
-    /// DWG 目标版本。支持 AC1018（AutoCAD 2004 / R2004，默认）与
-    /// AC1015（AutoCAD 2000 / R2000），取值见 availableDwgVersions()。
+    /// DWG 目标版本。支持 AC1018（AutoCAD 2004 / R2004，默认）、
+    /// AC1015（AutoCAD 2000 / R2000）与 AC1021（AutoCAD 2007 / R2007，
+    /// RS 纠错 + 分页容器、文本按 UTF-16 存放），取值见 availableDwgVersions()。
     /// 与 version（DXF 目标版本）各管一路：写 DXF 看 version，写 DWG 看本项。
-    QString dwgVersion = QStringLiteral("AC1018");
+    QString dwgVersion = QStringLiteral("AC1021");
 
     /// 输出可直接阅读的缩进版本（体积略增，便于人工排查）
     bool prettyPrint = false;
@@ -57,7 +58,7 @@ struct WriteOptions {
     static QStringList availableDxfVersions();
 
     /// 可写出的 DWG 目标版本代号，按版本从低到高排列
-    ///（AC1015 = AutoCAD 2000，AC1018 = AutoCAD 2004）。
+    ///（AC1015 = AutoCAD 2000，AC1018 = AutoCAD 2004，AC1021 = AutoCAD 2007）。
     static QStringList availableDwgVersions();
 
     /// DWG 的默认写出版本

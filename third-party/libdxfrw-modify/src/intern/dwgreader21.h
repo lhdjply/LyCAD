@@ -57,6 +57,9 @@ private:
     bool parseSysPage(duint64 sizeCompressed, duint64 sizeUncompressed, duint64 correctionFactor, duint64 offset, duint8 *decompData);
     bool parseDataPage(dwgSectionInfo si, duint8 *dData);
 
+    /// 节解压目标缓冲区尺寸 = 节数据长度（含各页起始偏移上界）+ 字面量拷贝溢出余量。
+    static duint32 sectionBufferSize(const dwgSectionInfo& si);
+
     duint8 *objData;
     duint64 dataSize;
 

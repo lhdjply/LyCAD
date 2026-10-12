@@ -189,19 +189,17 @@ IoResult DwgCodec::read(const QString& path, Document& document) const
 IoResult DwgCodec::write(const QString& path, const Document& document,
                          const WriteOptions& options) const
 {
-    // 目标版本由 WriteOptions::dwgVersion 决定（默认 AC1018 / AutoCAD 2004）：
+    // 目标版本由 WriteOptions::dwgVersion 决定（默认 AC1021 / AutoCAD 2007）：
+    //   · AC1021 —— R2007 容器（RS 纠错 + AC21 压缩 + 段/页映射，文本按 UTF-16）；
     //   · AC1018 —— R2004 分页容器（0x100 文件头 + LZ77 分页 + 段/页映射）；
     //   · AC1015 —— R2000 线性容器，兼容面最广。
     // 非法取值在适配层回退到 AC1015。
-    const bool ac1018 =
-        options.dwgVersion.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0;
-
     IoResult result = writeDwgWithLibDxfRw(path, document, options);
     if (result.ok) {
-        result.addWarning(ac1018
-            ? QStringLiteral("已由内置 dwgW 原生写出（AutoCAD 2004/R2004 格式）")
-            : QStringLiteral("已由内置 dwgW 原生写出（AutoCAD 2000/R2000 格式）"));
-
+        // 提示里带上实际写出的版本——原先只区分 AC1018／其它，写 AC1021 时会显示
+        // 成 AutoCAD 2000/R2000，容易让人误判目标格式。
+        result.addWarning(QStringLiteral("已由内置 dwgW 原生写出（%1）")
+                              .arg(WriteOptions::dwgVersionShortName(options.dwgVersion)));
     }
     return result;
 }

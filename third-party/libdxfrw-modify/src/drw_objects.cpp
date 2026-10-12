@@ -19,6 +19,26 @@
 #include "intern/drw_dbg.h"
 #include "intern/dwgutil.h"
 
+/// 表项公共头里的 xref 标志（与 libdwgrw.cpp::writeXrefTableFlags 严格对称）。
+///
+/// R2007+（AC1021）规格把三段式合并成了**一个 BitShort**：只允许 0（非 xref 相关）
+/// 或 256（0x100，已解析 / 依赖 xref）。2004- 才是 B「referenced」+ BS「xrefindex」
+/// + B「xref dependent」。按 2004- 的写法去读 2007+ 记录会多吃 2 位，整个表项错位。
+static duint16 readXrefTableFlags(dwgBuffer* buf, DRW::Version version, duint16 flags)
+{
+    if (version > DRW::AC1018) {                 // 2007+
+        if (buf->getBitShort() == 0x100) {
+            flags |= 1u << 6;                    // is_xref_resolved
+            flags |= 1u << 4;                    // is_xref_dependent
+        }
+    } else {                                     // 2004-
+        flags |= buf->getBit() << 6;             // referenced
+        /*dint16 xrefindex =*/ buf->getBitShort();
+        flags |= buf->getBit() << 4;             // refx dependent
+    }
+    return flags;
+}
+
 //! Base class for tables entries
 /*!
 *  Base class for tables entries
@@ -506,16 +526,7 @@ bool DRW_LType::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         return ret;
     name = sBuf->getVariableText(version, false);
     DRW_DBG("linetype name: "); DRW_DBG(name.c_str()); DRW_DBG("\n");
-    flags = buf->getBit()<< 6;
-    DRW_DBG("flags: "); DRW_DBG(flags);
-    if (version > DRW::AC1018) {//2007+
-    } else {//2004- //RLZ: verify in 2004, 2010 &2013
-        dint16 xrefindex = buf->getBitShort();
-        DRW_DBG(" xrefindex: "); DRW_DBG(xrefindex);
-    }
-    duint8 xdep = buf->getBit();
-    DRW_DBG(" xdep: "); DRW_DBG(xdep);
-    flags |= xdep<< 4;
+    flags = readXrefTableFlags(buf, version, flags);
     DRW_DBG(" flags: "); DRW_DBG(flags);
     desc = sBuf->getVariableText(version, false);
     DRW_DBG(" desc: "); DRW_DBG(desc.c_str());
@@ -643,12 +654,7 @@ bool DRW_Layer::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     name = sBuf->getVariableText(version, false);
     DRW_DBG("layer name: "); DRW_DBG(name.c_str());
 
-    flags |= buf->getBit()<< 6;//layer have entity
-    if (version < DRW::AC1021) {//2004-
-        DRW_DBG(", xrefindex = "); DRW_DBG(buf->getBitShort()); DRW_DBG("\n");
-        //dint16 xrefindex = buf->getBitShort();
-    }
-    flags |= buf->getBit() << 4;//is refx dependent
+    flags = readXrefTableFlags(buf, version, flags);//layer have entity + xref 标志
     if (version < DRW::AC1015) {//14-
         flags |= buf->getBit(); //layer frozen
         /*flags |=*/ buf->getBit(); //unused, negate the color
@@ -716,13 +722,7 @@ bool DRW_Block_Record::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs
     name = sBuf->getVariableText(version, false);
     DRW_DBG("block record name: "); DRW_DBG(name.c_str()); DRW_DBG("\n");
 
-    flags |= buf->getBit()<< 6;//referenced external reference, block code 70, bit 7 (64)
-    if (version > DRW::AC1018) {//2007+
-    } else {//2004- //RLZ: verify in 2004, 2010 &2013
-        dint16 xrefindex = buf->getBitShort();
-        DRW_DBG(" xrefindex: "); DRW_DBG(xrefindex); DRW_DBG("\n");
-    }
-    flags |= buf->getBit() << 4;//is refx dependent, block code 70, bit 5 (16)
+    flags = readXrefTableFlags(buf, version, flags);//referenced / xref dependent
     flags |= buf->getBit(); //if is anonimous block (*U) block code 70, bit 1 (1)
     flags |= buf->getBit() << 1; //if block contains attdefs, block code 70, bit 2 (2)
     bool blockIsXref = buf->getBit(); //if is a Xref, block code 70, bit 3 (4)
@@ -874,9 +874,7 @@ bool DRW_Textstyle::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         return ret;
     name = sBuf->getVariableText(version, false);
     DRW_DBG("text style name: "); DRW_DBG(name.c_str()); DRW_DBG("\n");
-    flags |= buf->getBit()<< 6;//style are referenced for a entity, style code 70, bit 7 (64)
-    /*dint16 xrefindex =*/ buf->getBitShort();
-    flags |= buf->getBit() << 4; //is refx dependent, style code 70, bit 5 (16)
+    flags = readXrefTableFlags(buf, version, flags);//style referenced / xref dependent
     flags |= buf->getBit() << 2; //vertical text, stile code 70, bit 3 (4)
     flags |= buf->getBit(); //if is a shape file instead of text, style code 70, bit 1 (1)
     height = buf->getBitDouble();
@@ -1036,11 +1034,7 @@ bool DRW_Vport::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         return ret;
     name = sBuf->getVariableText(version, false);
     DRW_DBG("vport name: "); DRW_DBG(name.c_str()); DRW_DBG("\n");
-    flags |= buf->getBit()<< 6;// code 70, bit 7 (64)
-    if (version < DRW::AC1021) { //2004-
-        /*dint16 xrefindex =*/ buf->getBitShort();
-    }
-    flags |= buf->getBit() << 4; //is refx dependent, style code 70, bit 5 (16)
+    flags = readXrefTableFlags(buf, version, flags);
     height = buf->getBitDouble();
     ratio = buf->getBitDouble();
     DRW_DBG("flags: "); DRW_DBG(flags); DRW_DBG(" height: "); DRW_DBG(height);
@@ -1243,9 +1237,7 @@ bool DRW_AppId::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
         return ret;
     name = sBuf->getVariableText(version, false);
     DRW_DBG("appId name: "); DRW_DBG(name.c_str()); DRW_DBG("\n");
-    flags |= buf->getBit()<< 6;// code 70, bit 7 (64)
-    /*dint16 xrefindex =*/ buf->getBitShort();
-    flags |= buf->getBit() << 4; //is refx dependent, style code 70, bit 5 (16)
+    flags = readXrefTableFlags(buf, version, flags);
     duint8 unknown = buf->getRawChar8(); // unknown code 71
     DRW_DBG("unknown code 71: "); DRW_DBG(unknown); DRW_DBG("\n");
     if (version > DRW::AC1018) {//2007+ skip string area

@@ -2741,9 +2741,10 @@ public:
             if (!ttfName.isEmpty()) {
                 record.extData.push_back(new DRW_Variant(1001, std::string("ACAD")));
                 record.extData.push_back(new DRW_Variant(1000, ttfName.toStdString()));
-                if (style->ttfFlags() != 0) {
-                    record.extData.push_back(new DRW_Variant(1071, style->ttfFlags()));
-                }
+                // 1071（字体族标志）恒写出，值为 0 也写：AutoCAD / 浩辰 为 TrueType
+                // 文字样式写入的 EED 就是这个三元组（ACAD / 族名 / 族标志），
+                // 只给 1000 会被严格读取器判为 EED 不完整。
+                record.extData.push_back(new DRW_Variant(1071, style->ttfFlags()));
             }
             m_rw->writeTextstyle(&record);
         };
@@ -3674,12 +3675,15 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
 IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
                               const WriteOptions& options)
 {
-    // 目标版本由 WriteOptions::dwgVersion 决定：AC1018（AutoCAD 2004 / R2004）
-    // 走分页 + LZ77 容器（intern/dwgwriter18.cpp），AC1015（AutoCAD 2000 /
-    // R2000）走线性容器（intern/dwgwriter15.cpp）。非法取值回退到 AC1015。
-    const bool wantAc1018 =
-        options.dwgVersion.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0;
-    const DRW::Version target = wantAc1018 ? DRW::AC1018 : DRW::AC1015;
+    // 目标版本由 WriteOptions::dwgVersion 决定：AC1015（R2000）走线性容器
+    //（intern/dwgwriter15.cpp）、AC1018（R2004）走分页 + LZ77 容器
+    //（intern/dwgwriter18.cpp）、AC1021（R2007）走 RS + 分页容器
+    //（intern/dwgwriter21.cpp）。非法取值回退到 AC1015。
+    DRW::Version target = DRW::AC1015;
+    if (options.dwgVersion.compare(QStringLiteral("AC1018"), Qt::CaseInsensitive) == 0)
+        target = DRW::AC1018;
+    else if (options.dwgVersion.compare(QStringLiteral("AC1021"), Qt::CaseInsensitive) == 0)
+        target = DRW::AC1021;
 
     ExporterBase<dwgW> exporter(document, target);
     exporter.prescanBlocks();
@@ -3694,8 +3698,9 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
     if (!ok) {
         return IoResult::failure(
             QStringLiteral("DWG 写出失败（libdxfrw dwgW，%1）。")
-                .arg(wantAc1018 ? QStringLiteral("AC1018/R2004")
-                                : QStringLiteral("AC1015/R2000")));
+                .arg(target == DRW::AC1021 ? QStringLiteral("AC1021/R2007")
+                     : target == DRW::AC1018 ? QStringLiteral("AC1018/R2004")
+                                             : QStringLiteral("AC1015/R2000")));
     }
 
     return IoResult::success(document.entityCount());

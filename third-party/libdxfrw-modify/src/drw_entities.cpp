@@ -10,7 +10,6 @@
 **  along with this program.  If not, see <http://www.gnu.org/licenses/>.    **
 ******************************************************************************/
 
-#include <cstdlib>
 #include "drw_entities.h"
 #include "intern/dxfreader.h"
 #include "intern/dwgbuffer.h"
@@ -1446,7 +1445,13 @@ bool DRW_Table::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
                     }
 
                     if (ok && version >= DRW::AC1021) {
-                        // 2007+：AcDbCellValue（数据流内联），携带单元格文字
+                        // 2007+：格尾先有一个 cell.flag（BL，通常为 0），其后才是
+                        // 承载文字的 AcDbCellValue。漏读这个 BL 会让**每格少读 2 位**
+                        // （BL 短码），9 格累计错位 18 位，其后的「4 个表级替代 bit」
+                        // 与对象末尾全部对不上 —— 实测对象解析返回 false，进而整份
+                        // 图纸读取失败（BAD_READ_ENTITIES）。参考实现的读取端即
+                        // read_table_cell_data 里 `cell.flag = reader.read_bit_long()`。
+                        buf->getBitLong();                    // cell.flag
                         Cell cell;
                         cell.row = r;
                         cell.col = c;

@@ -112,8 +112,56 @@ void dwgSentinelBytes(int kind, bool begin, std::uint8_t out[16])
 // -----------------------------------------------------------------------------
 void dwgBitWriter::writeT(const std::string& utf8, DRW_TextCodec& codec)
 {
+    // 2007+（AC1021 及以上）：文本改走**独立字符串流**（见头文件说明）。
+    // 判据取自 codec 的版本：DRW_TextCodec::setVersion 把 AC1015/AC1018 归一为
+    // AC1015（同属代码页存放），AC1021 及以上归一为 AC1021——所以这里等于
+    // 「目标版本是否 ≥ 2007」，与读取端 `version > AC1018` 的分支一一对应。
+    if (codec.getVersion() > DRW::AC1018) {
+        ensureStringSink()->writeUCS(utf8);
+        return;
+    }
     const std::string encoded = codec.fromUtf8(utf8);
     writeBS(static_cast<dint16>(encoded.size()));
     for (unsigned char c : encoded)
         writeRC(static_cast<std::uint8_t>(c));
+}
+
+// -----------------------------------------------------------------------------
+//  TU：UTF-16 文本（2007+，读取端 getUCSText / get16bitStr 的对偶）
+// -----------------------------------------------------------------------------
+void dwgBitWriter::writeUCS(const std::string& utf8)
+{
+    // UTF-8 → UTF-16LE 码元。BS 写的是**码元数**：读取端 getUCSText 取 BS 后
+    // 用 get16bitStr(ts, false) 读 2*ts 字节，再按 16 位码元转 UTF-8。写字节数
+    // 会让读取端多读一倍，其后所有字段错位。
+    std::vector<std::uint16_t> units;
+    units.reserve(utf8.size());
+    for (std::size_t i = 0; i < utf8.size();) {
+        const unsigned char c = static_cast<unsigned char>(utf8[i]);
+        std::uint32_t cp = 0;
+        std::size_t len = 1;
+        if (c < 0x80) { cp = c; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; len = 4; }
+        else { cp = 0xFFFD; len = 1; }                     // 非法首字节：替换
+        if (i + len > utf8.size()) { cp = 0xFFFD; len = utf8.size() - i; }
+        for (std::size_t k = 1; k < len; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(utf8[i + k]) & 0x3Fu);
+        i += len;
+
+        if (cp >= 0x10000u) {                              // 需要代理对
+            cp -= 0x10000u;
+            units.push_back(static_cast<std::uint16_t>(0xD800u + (cp >> 10)));
+            units.push_back(static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu)));
+        } else {
+            units.push_back(static_cast<std::uint16_t>(cp));
+        }
+    }
+
+    writeBS(static_cast<dint16>(units.size()));
+    for (std::uint16_t u : units) {
+        writeRC(static_cast<std::uint8_t>(u & 0xFFu));      // UTF-16LE
+        writeRC(static_cast<std::uint8_t>((u >> 8) & 0xFFu));
+    }
 }

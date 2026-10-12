@@ -35,6 +35,7 @@
 #include "intern/dwgreader32.h"
 #include "intern/dwgwriter15.h"
 #include "intern/dwgwriter18.h"
+#include "intern/dwgwriter21.h"
 
 #define FIRSTHANDLE 48
 
@@ -155,6 +156,7 @@ bool dwgR::read(DRW_Interface *interface_, bool ext){
     bool isOk = false;
     applyExt = ext;
     iface = interface_;
+
 
 //testReader();return false;
 
@@ -352,6 +354,10 @@ bool dwgW::write(DRW_Interface* iface, DRW::Version ver)
     if (dwgWriter18::supports(ver))
         return dwgWriter18::write(*this, iface);
 
+    // AC1021（R2007）：RS 纠错 + AC21 压缩流容器（intern/dwgwriter21.cpp）。
+    if (dwgWriter21::supports(ver))
+        return dwgWriter21::write(*this, iface);
+
     return false;                       // 暂不支持的目标版本
 }
 
@@ -455,12 +461,26 @@ struct dwgW::Private
     };
 
     /// 对象体构造：oType + bitsize 占位 + 数据 + 句柄流 + 回填 bitsize
+    ///
+    /// 2007+（AC1021）的对象体多一段**独立字符串区**：读取端（DRW_Entity /
+    /// DRW_TableEntry::parseDwg 的 `version > AC1018` 分支）以 objSize-1 位为
+    /// 「有字符串区」标志，其前 16 位是字符串**位数**，再往前才是字符串内容；
+    /// 句柄流自 objSize 位起。故 2007+ 的装配顺序为
+    ///     [数据][字符串区][u16 字符串位数][1 位标志][句柄流]
+    /// 字符串内容由 writeT 按 codec 版本自动分流进 w 的字符串流（见
+    /// dwgBitWriter::writeT / writeUCS），本处只负责摆放。
     struct ObjBuilder {
         dwgBitWriter w;
         std::size_t rlPos = 0;
         std::size_t handleStart = 0;
         std::size_t prevBit = 0;          // prev_entity 数值位偏移（0=未写）
         std::size_t nextBit = 0;          // next_entity 数值位偏移（0=未写）
+        /// 编码器**自己**已在句柄流之前写出「是否有字符串区」标志位（控制对象
+        /// 即如此：读取端 DRW_ObjControl::parseDwg 显式 `buf->getBit()` 读它，
+        /// 且不按 objSize 跳转）。置位后 finish() 不再补写，否则该处会多出
+        /// 1 位，控制对象列出的条目句柄整体前移，读取端随即把表记录全部判为
+        /// 「找不到」并在句柄循环里空转。
+        bool trailingFlagWritten = false;
 
         void begin(std::uint16_t otype, std::uint32_t handle)
         {
@@ -470,12 +490,74 @@ struct dwgW::Private
             w.writeHandle(0, handle);
         }
         void beginHandles() { handleStart = w.bitPosition(); }
+        /// 声明「标志位已由编码器自行写出」（见 trailingFlagWritten 说明）。
+        void markTrailingFlagWritten() { trailingFlagWritten = true; }
         std::vector<std::uint8_t> finish()
         {
+            std::size_t newHandleStart = handleStart;
+            // 字符串区按字节对齐：读取端把「字符串区总位数」当**原始 16 位**
+            // 读（getRawShort16），该字段必须起始于字节边界，字符串区长度本身
+            // 也须是 8 的倍数，否则读出的文本整体偏移。
+            dwgBitWriter* ss = const_cast<dwgBitWriter*>(w.stringStream());
+            if (ss != nullptr) ss->padToByte();
+            const std::size_t sinkBits = (ss != nullptr) ? ss->bitPosition() : 0;
+            if (sinkBits > 0) {
+                // 句柄流已写进 w：先按位暂存，插完字符串区再补回。
+                // prevBit/nextBit 都落在数据区内（句柄流之前），不受影响。
+                const std::size_t handleEnd = w.bitPosition();
+                std::vector<bool> handles;
+                handles.reserve(handleEnd - handleStart);
+                for (std::size_t i = handleStart; i < handleEnd; ++i)
+                    handles.push_back(w.bitAt(i));
+
+                // 字符串区起点按字节对齐（中间不足一字节的位补 0）：读取端用
+                // (objSize-17) 处的原始 16 位读字符串区长度，该字段必须起始于
+                // 字节边界，且长度本身是 8 的倍数。数据区尾部的这些补位读取端
+                // 不会读到——它读完数据区就 setPosition(objSize) 跳到句柄流。
+                const std::size_t strAreaStart = (handleStart + 7) & ~static_cast<std::size_t>(7);
+                w.setBitPosition(strAreaStart);
+                w.appendBitsFrom(*ss);
+                const std::size_t strBits = sinkBits;
+                // 位数按「原始 16 位」写（读取端 getRawShort16），≥0x8000 时
+                // 高 16 位另起一个字并置低位字的 0x8000 标志（读取端 -33 回退读它）。
+                if (strBits >= 0x8000u) {
+                    w.writeRS(static_cast<std::uint16_t>(strBits >> 15));
+                    w.writeRS(static_cast<std::uint16_t>((strBits & 0x7FFFu) | 0x8000u));
+                } else {
+                    w.writeRS(static_cast<std::uint16_t>(strBits));
+                }
+                w.writeB(true);                        // 有字符串区
+                newHandleStart = strAreaStart + strBits + 16 + 1;
+
+                for (bool bit : handles) w.writeB(bit);
+            } else if (ss != nullptr && !trailingFlagWritten) {
+                // 无字符串区：**仅 2007+** 规格要求紧跟数据区写一个「无字符串区」标志位
+                // （读取端在 objSize-1 位读它，objSize 即句柄流起点；参考实现
+                // merge_three_stream 在无文本时执行 `main.write_bit(false)` 并把
+                // total_bits 记作 main_size_bits + 1）。**漏写这一位会让句柄流整体
+                // 前移 1 位**，读取端便把数据区最后一位当标志位：恰为 1 时会继续
+                // 回退 16 位读出一个天文数字般的字符串区长度，随后整个对象的内容
+                // （含其后的句柄）全部错位。实测 PLACEHOLDER / LAYOUT / 字典等
+                // 无字符串对象首当其冲（libredwg 报 Invalid string stream
+                // data_size ... > bitsize 与 Invalid LAYOUT.num_viewports）。
+                //
+                // 注意：2004 及更早（AC1018-）的对象是「双流」格式，数据区之后
+                // 直接接句柄流，**没有**该标志位；在这里补一位会让所有实体整体
+                // 错位（实测表现为图纸只剩个别图元）。
+                const std::size_t handleEnd = w.bitPosition();
+                std::vector<bool> handles;
+                handles.reserve(handleEnd - handleStart);
+                for (std::size_t i = handleStart; i < handleEnd; ++i)
+                    handles.push_back(w.bitAt(i));
+                w.setBitPosition(handleStart);
+                w.writeB(false);                       // 无字符串区标志（2007+）
+                newHandleStart = handleStart + 1;
+                for (bool bit : handles) w.writeB(bit);
+            }
             w.padToByte();
             const std::size_t endBit = w.bitPosition();
             w.setBitPosition(rlPos);
-            w.writeRL(static_cast<std::uint32_t>(handleStart));
+            w.writeRL(static_cast<std::uint32_t>(newHandleStart));
             w.setBitPosition(endBit);
             return w.takeData();
         }
@@ -651,6 +733,15 @@ struct dwgW::Private
     }
 
     // ---- 公共写入片段 -------------------------------------------------------------
+    /// 2007+ 的对象体是「三段流」（数据 / 字符串 / 句柄）：ObjBuilder::finish 必须
+    /// 知道当前是否 2007+，才能决定要不要补写「无字符串区」标志位；而 ObjBuilder 是
+    /// Private 的嵌套类型、拿不到 version。故在 2007+ 的公共入口显式建立字符串流，
+    /// finish 以它的存在性判定版本（2004 及更早不建立，双流装配保持原样不变）。
+    void prepareStringStream(ObjBuilder& b) const
+    {
+        if (version > DRW::AC1018) b.w.ensureStringSink();
+    }
+
     /// eed 为空时只写 BS 0 终止；否则写「BS 尺寸 + 应用句柄 + 数据」块。
     /// 注意 BS 尺寸只是句柄**之后**的数据长度—— libdxfrw 的读取端
     /// 都是先读句柄、再按尺寸读数据的。应用固定为 ACAD（码 5 硬指针）。
@@ -658,6 +749,7 @@ struct dwgW::Private
                           const std::vector<std::uint8_t>* eed = nullptr)
     {
         b.begin(otype, handle);
+        prepareStringStream(b);
         if (eed && !eed->empty()) {
             b.w.writeBS(static_cast<dint16>(eed->size()));
             b.w.writeHandle(kHcAbsolute, appidAcad);
@@ -718,6 +810,7 @@ struct dwgW::Private
     void writeNamedHeadStart(ObjBuilder& b, std::uint16_t otype, std::uint32_t handle)
     {
         b.begin(otype, handle);
+        prepareStringStream(b);
         b.w.writeBS(0);                                     // EED 长度（无扩展数据）
         b.w.writeBL(1);                                     // numReactors = 1
         if (version > DRW::AC1015) b.w.writeB(true);        // xDictFlag=1：无 XDicObj（2004+）
@@ -737,6 +830,7 @@ struct dwgW::Private
                            std::uint32_t handle, int entmode)
     {
         b.begin(otype, handle);
+        prepareStringStream(b);
         b.w.writeBS(0);                 // EED 长度（无扩展数据）
         b.w.writeB(false);              // preview_exists（无预览）
         b.w.writeBB(static_cast<std::uint8_t>(entmode));
@@ -749,10 +843,26 @@ struct dwgW::Private
         // `version > AC1024 || version < AC1018`）；AC1018/AC1021/AC1024 不读它。
         if (version < DRW::AC1018 || version > DRW::AC1024)
             b.w.writeB(false);          // nolinks = 0：句柄流内含 prev/next 链
+        // 颜色：**实体**走读取端 buf->getEnColor(version)，该函数对 AC1018+ 只读一个
+        // BS（索引）；只有当 idx 高字节带 0x20（透明度）或 0x80（真彩）标志时才
+        // 追加读 RL。即 ACI 颜色只占 2~18 位。
+        // 注意与**表记录/头变量**区分：那两处读取端用 getCmColor（CMC = BS+BL+RC
+        // = 44 位），必须用 writeColor；实体若误用 CMC，每个实体多写 42 位，
+        // 其后字段（ltFlags/plotFlags/materialFlag…）全部错位，实体的
+        // parseDwgEntHandle 随即越界（实测 good=0、ltFlags 读成 3）。
         b.w.writeBS(static_cast<dint16>(e.color));
         b.w.writeBD(e.ltypeScale);
         b.w.writeBB(0);                 // ltFlags：ByLayer
         b.w.writeBB(0);                 // plotFlags
+        // 2007+：材质/阴影标志位（读取端 DRW_Entity::parseDwg 的 `version > AC1018`，
+        // 位置在两个 plotFlags 之后、invisibleFlag 之前）。两者都写 0：读取端只在
+        // materialFlag==3 / shadowFlag==3 时才到句柄流取材质/阴影句柄。
+        // **漏写这 10 位会让其后全部实体字段整体前移**——HATCH 的渐变块首当其冲，
+        // 读取端把错位后的位当 num_colors，读到天文数字后陷入死循环（实测）。
+        if (version > DRW::AC1018) {
+            b.w.writeBB(0);             // materialFlag
+            b.w.writeRC(0);             // shadowFlag
+        }
         b.w.writeBS(e.visible ? 0 : 1);
         b.w.writeRC(static_cast<std::uint8_t>(DRW_LW_Conv::lineWidth2dwgInt(e.lWeight)));
     }
@@ -787,6 +897,15 @@ struct dwgW::Private
         b.w.writeBS(static_cast<dint16>(ent.getTextLineStyle()));  // 行距样式 (72)
         b.w.writeBD(ent.getTextLineFactor());                      // 行距系数 (41)
         b.w.writeBD(ent.getMeasurement());                         // 实测值 (42)
+        // 2007+：实测值与 clone 插入点之间还有 3 个标志位（读取端
+        // DRW_Dimension::parseDwg 的 `if (version > DRW::AC1018)`：unk / flip1 /
+        // flip2）。漏写会让其后全部标注字段前移 3 位，标注特有字段读到越界
+        //（实测 DIMORDINATE 的 isGood() 变假、整张图判为损坏）。
+        if (version > DRW::AC1018) {
+            b.w.writeB(false);             // unk
+            b.w.writeB(false);             // flip1
+            b.w.writeB(false);             // flip2
+        }
         b.w.write2RD(0.0, 0.0);             // clone 插入点 (12)
     }
 
@@ -947,6 +1066,29 @@ using Private = dwgW::Private;
 /// BLOCK 尾部附 model_space/paper_space，LTYPE 尾部附 byblock/bylayer。
 enum class CtrlKind { Bl, Bs, Block, LType, Dimstyle };
 
+/// 表项公共头里的 xref 标志。
+///
+/// **规格在 R2007+（AC1021）把三段式合并成了一个 BitShort**：
+///   · 2004-（AC1015/AC1018）：B「referenced」+ BS「xrefindex」+ B「xref dependent」；
+///   · 2007+（AC1021）        ：BS「is_xref_resolved」——只允许 0（非 xref 相关）
+///                              或 256（0x100，已解析/依赖 xref）。
+/// 读取端见 drw_objects.cpp 各表项 parseDwg 的 `version > DRW::AC1018` 分支，
+/// 参考实现见 .cache/opencadcodec 的 write_xref_table_flags()/read_xref_table_flags()。
+///
+/// 若 2007+ 仍按 2004- 的三段式写，真实 CAD（AutoCAD/浩辰）会把这个位置当 BitShort
+/// 解读：本实现写出的 `00` 前缀正好等于「后随 16 位短整型」，于是记录整体前移 2 字节，
+/// 该表项及其后所有对象全部错位 —— 浩辰随即判「文件损坏」。
+void writeXrefTableFlags(dwgBitWriter& w, DRW::Version ver)
+{
+    if (ver > DRW::AC1018) {        // 2007+
+        w.writeBS(0);
+    } else {                        // 2004-
+        w.writeB(false);            // bit6（referenced）
+        w.writeBS(0);               // xrefindex
+        w.writeB(false);            // bit4（refx dependent）
+    }
+}
+
 /// 控制对象。结构（R2000）：
 ///   num_entries               BL 或 BS（见 CtrlKind）
 ///   [Dimstyle] num_morehandles RC
@@ -968,6 +1110,14 @@ void encodeControl(Private& d, std::uint16_t otype, std::uint32_t handle, CtrlKi
         b.w.writeBL(static_cast<dint32>(entries.size()));
     if (kind == CtrlKind::Dimstyle)
         b.w.writeRC(0);                         // num_morehandles（R2000b 起）
+    // 2007+：控制对象在条目句柄之前多一个「是否有字符串区」位（读取端
+    // DRW_ObjControl::parseDwg 的 `if (version > DRW::AC1018) int stringBit =
+    // buf->getBit();`，intern/dwgreader.cpp:1334）。控制对象本身没有字符串区，
+    // 写 0。漏写这 1 位会让其后全部条目句柄错位，症状是「控制对象找到了、
+    // 但它列出的表记录全 not found」。
+    if (d.version > DRW::AC1018)
+        b.w.writeB(false);                      // string bit = 0（无字符串区）
+    b.markTrailingFlagWritten();                // 该位已写出，finish() 不再补
     b.beginHandles();
     b.w.writeHandle(kHcSoftPtr, 0);             // ownerhandle（控制对象无属主）
     d.writeXdicObj(b);
@@ -988,9 +1138,7 @@ void encodeLType(Private& d, const DRW_LType& ent, std::uint32_t handle)
     Private::ObjBuilder b;
     d.writeTableCommon(b, kLType, handle);
     b.w.writeT(ent.name, d.codec);
-    b.w.writeB(false);
-    b.w.writeBS(0);                     // xrefindex（R2000）
-    b.w.writeB(false);
+    writeXrefTableFlags(b.w, d.version);
     b.w.writeT(ent.desc, d.codec);
     double length = ent.length;
     if (length <= 0.0) {
@@ -1007,9 +1155,12 @@ void encodeLType(Private& d, const DRW_LType& ent, std::uint32_t handle)
         b.w.writeBD(0.0); b.w.writeBD(0.0);
         b.w.writeBS(0);
     }
-    // R2000（<AC1021）线型对象尾部有 256 字节字符串区，读取端无条件读取，
-    // 缺失会导致缓冲区越界、整表解析判失败。
-    for (int i = 0; i < 256; ++i) b.w.writeRC(0);
+    // 尾部字符串区（读取端 drw_objects.cpp:544）：2004- 是固定 256 字节；2007+
+    // 改为「haveStrArea 时 512 字节」，而 haveStrArea 由上面每个 dash 项的 bs2 位
+    //（恒写 0）决定 —— 故 2007+ 一个字节都不写。照旧写 256 字节会让读取端把这些
+    // 字节误当句柄流数据。
+    if (d.version < DRW::AC1021)
+        for (int i = 0; i < 256; ++i) b.w.writeRC(0);
     b.beginHandles();
     for (std::size_t i = 0; i < ent.path.size(); ++i) {
         b.w.writeHandle(kHcAbsolute, 0);
@@ -1028,9 +1179,7 @@ void encodeLayer(Private& d, const DRW_Layer& ent, std::uint32_t handle)
     Private::ObjBuilder b;
     d.writeTableCommon(b, kLayer, handle);
     b.w.writeT(ent.name, d.codec);
-    b.w.writeB(false);
-    b.w.writeBS(0);                     // xrefindex
-    b.w.writeB(false);
+    writeXrefTableFlags(b.w, d.version);
     std::uint16_t flags = 0;
     if (!ent.plotF) flags |= 1u << 4;
     flags |= static_cast<std::uint16_t>(DRW_LW_Conv::lineWidth2dwgInt(ent.lWeight) & 0x1F) << 5;
@@ -1040,8 +1189,43 @@ void encodeLayer(Private& d, const DRW_Layer& ent, std::uint32_t handle)
     d.writeTableHandleTail(b, d.layerCtrl);
     b.w.writeHandle(kHcAbsolute, 0);    // xref
     b.w.writeHandle(kHcAbsolute, 0);    // plot style
+    // 2007+：图层句柄流在 plot style 与 lineType 之间多一个材质句柄
+    //（读取端 drw_objects.cpp:689，`if (version > DRW::AC1018)`）。漏写会让读取端
+    // 把 lineType 句柄当材质、再越界读 lineType。
+    if (d.version > DRW::AC1018)
+        b.w.writeHandle(kHcAbsolute, 0); // material（2007+）
     b.w.writeHandle(kHcAbsolute, d.ltypeHandle(ent.lineType));
     d.pushObject(handle, kLayer, b.finish());
+}
+
+/// UTF-8 → UTF-16LE 码元。用于两处：R2007+ 表记录的扩展数据（EED 字符串）
+/// 与 R2007+ 表格单元格的值（AcDbCellValue）——两者在文件里都是 UTF-16LE 词流。
+std::vector<std::uint16_t> utf8ToUtf16Units(const std::string& utf8)
+{
+    std::vector<std::uint16_t> units;
+    units.reserve(utf8.size());
+    for (std::size_t i = 0; i < utf8.size();) {
+        const unsigned char c = static_cast<unsigned char>(utf8[i]);
+        std::uint32_t cp = 0;
+        std::size_t len = 1;
+        if (c < 0x80) { cp = c; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1Fu; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0Fu; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07u; len = 4; }
+        else { cp = 0xFFFD; len = 1; }
+        if (i + len > utf8.size()) { cp = 0xFFFD; len = utf8.size() - i; }
+        for (std::size_t k = 1; k < len; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(utf8[i + k]) & 0x3Fu);
+        i += len;
+        if (cp >= 0x10000u) {
+            cp -= 0x10000u;
+            units.push_back(static_cast<std::uint16_t>(0xD800u + (cp >> 10)));
+            units.push_back(static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu)));
+        } else {
+            units.push_back(static_cast<std::uint16_t>(cp));
+        }
+    }
+    return units;
 }
 
 void encodeStyle(Private& d, const DRW_Textstyle& ent, std::uint32_t handle)
@@ -1059,15 +1243,33 @@ void encodeStyle(Private& d, const DRW_Textstyle& ent, std::uint32_t handle)
         }
         if (!inAcad) continue;
         switch (v->code()) {
-        case 1000: {    // 字符串：码 0 + RC 长度 + BE16 代码页 + 编码字节
+        case 1000: {    // 字符串
             if (v->type() != DRW_Variant::STRING) break;
-            const std::string encoded = d.codec.fromUtf8(*v->content.s);
-            const std::size_t len = std::min<std::size_t>(encoded.size(), 255);
-            eed.push_back(0x00);
-            eed.push_back(static_cast<std::uint8_t>(len));
-            eed.push_back(static_cast<std::uint8_t>(d.codepageId >> 8));
-            eed.push_back(static_cast<std::uint8_t>(d.codepageId & 0xFF));
-            eed.insert(eed.end(), encoded.begin(), encoded.begin() + static_cast<long>(len));
+            if (d.version > DRW::AC1018) {
+                // 2007+：UTF-16LE 词流，长度字段是**16 位词数**（RS 小端）。
+                // 老代码在这里写 pre-2007 的「RC 长度 + BE16 代码页 + 单字节文本」，
+                // 且用 codec.fromUtf8 取字节 —— 而 DWG 路径的编解码器是
+                // DRW_ConvUTF16，其 fromUtf8 至今是空实现（恒返回空串），于是这里
+                // 写出的是 length=0 的空字符串。两项叠加的结果是 EED 里的字体族名
+                // 丢失（AutoCAD/浩辰 AUDIT 判为数据不完整 → 打开时提示需要修复）。
+                const std::vector<std::uint16_t> units = utf8ToUtf16Units(*v->content.s);
+                const std::size_t n = std::min<std::size_t>(units.size(), 0xFFFFu);
+                eed.push_back(0x00);
+                eed.push_back(static_cast<std::uint8_t>(n & 0xFFu));
+                eed.push_back(static_cast<std::uint8_t>((n >> 8) & 0xFFu));
+                for (std::size_t k = 0; k < n; ++k) {
+                    eed.push_back(static_cast<std::uint8_t>(units[k] & 0xFFu));
+                    eed.push_back(static_cast<std::uint8_t>((units[k] >> 8) & 0xFFu));
+                }
+            } else {        // R13-R2004：码 0 + RC 长度 + BE16 代码页 + 编码字节
+                const std::string encoded = d.codec.fromUtf8(*v->content.s);
+                const std::size_t len = std::min<std::size_t>(encoded.size(), 255);
+                eed.push_back(0x00);
+                eed.push_back(static_cast<std::uint8_t>(len));
+                eed.push_back(static_cast<std::uint8_t>(d.codepageId >> 8));
+                eed.push_back(static_cast<std::uint8_t>(d.codepageId & 0xFF));
+                eed.insert(eed.end(), encoded.begin(), encoded.begin() + static_cast<long>(len));
+            }
             break;
         }
         case 1070: {    // 16 位整数：码 70 + RS
@@ -1104,9 +1306,7 @@ void encodeStyle(Private& d, const DRW_Textstyle& ent, std::uint32_t handle)
     Private::ObjBuilder b;
     d.writeTableCommon(b, kStyle, handle, eed.empty() ? nullptr : &eed);
     b.w.writeT(ent.name, d.codec);
-    b.w.writeB(false);
-    b.w.writeBS(0);                     // xrefindex
-    b.w.writeB(false);
+    writeXrefTableFlags(b.w, d.version);
     b.w.writeB(false);                  // 竖排
     b.w.writeB(false);                  // 形文件
     b.w.writeBD(ent.height);
@@ -1127,9 +1327,7 @@ void encodeVport(Private& d, const DRW_Vport& ent, std::uint32_t handle)
     Private::ObjBuilder b;
     d.writeTableCommon(b, kVport, handle);
     b.w.writeT(ent.name, d.codec);
-    b.w.writeB(false);
-    b.w.writeBS(0);                     // xrefindex
-    b.w.writeB(false);
+    writeXrefTableFlags(b.w, d.version);
     b.w.writeBD(ent.height);
     b.w.writeBD(ent.ratio);
     b.w.write2RD(ent.center.x, ent.center.y);
@@ -1141,6 +1339,15 @@ void encodeVport(Private& d, const DRW_Vport& ent, std::uint32_t handle)
     b.w.writeBD(ent.backClip);
     b.w.writeB(false); b.w.writeB(false); b.w.writeB(false); b.w.writeB(false);
     b.w.writeRC(0);                     // renderMode
+    // 2007+：renderMode 之后多一段默认光照块（读取端 drw_objects.cpp:1071，
+    // `if (version > DRW::AC1018)`）：1 位 + 1 字节类型 + 两个 BD + 环境色 CMC。
+    if (d.version > DRW::AC1018) {
+        b.w.writeB(true);               // use default lights
+        b.w.writeRC(0);                 // default lighting type
+        b.w.writeBD(1.0);               // brightness
+        b.w.writeBD(1.0);               // contrast
+        d.writeColor(b, 256);           // ambient color（CMC，ByLayer）
+    }
     b.w.write2RD(ent.lowerLeft.x, ent.lowerLeft.y);
     b.w.write2RD(ent.UpperRight.x, ent.UpperRight.y);
     b.w.writeB(false);                  // UCSFOLLOW
@@ -1159,38 +1366,76 @@ void encodeVport(Private& d, const DRW_Vport& ent, std::uint32_t handle)
     b.w.write3BD(0.0, 0.0, 0.0);
     b.w.write3BD(1.0, 0.0, 0.0);
     b.w.write3BD(0.0, 1.0, 0.0);
-    b.w.writeBD(0.0);
-    b.w.writeBS(0);
+    b.w.writeBD(0.0);                   // UCS elevation
+    b.w.writeBS(0);                     // UCS orthographic type
+    // 2007+：再补栅格行为两个 BS（读取端 drw_objects.cpp:1112，
+    // `if (version > DRW::AC1018)`）。
+    if (d.version > DRW::AC1018) {
+        b.w.writeBS(0);                 // gridBehavior
+        b.w.writeBS(0);                 // gridMajor
+    }
     b.beginHandles();
     d.writeTableHandleTail(b, d.vportCtrl);
     b.w.writeHandle(kHcAbsolute, 0);    // xref
+    // 2007+：XRef 与 namedUCS 之间还有三个句柄（读取端 DRW_Vport::parseDwg 的
+    // `if (version > DRW::AC1018)`：背景、视觉样式、阳光）。漏写会让其后所有
+    // 句柄不足、读到缓冲末尾，vp->parseDwg 的 isGood() 变假（实测 good=0）。
+    if (d.version > DRW::AC1018) {
+        b.w.writeHandle(kHcAbsolute, 0);    // background（背景）
+        b.w.writeHandle(kHcAbsolute, 0);    // visual style
+        b.w.writeHandle(kHcAbsolute, 0);    // sun
+    }
     b.w.writeHandle(kHcAbsolute, 0);    // named UCS
     b.w.writeHandle(kHcAbsolute, 0);    // base UCS
     d.pushObject(handle, kVport, b.finish());
 }
 
 /// 标注样式表记录：R2000 起记录体内含完整标注参数。libdxfrw 读取端
-/// 只解析名称、其余跳过，不受影响；AutoCAD 等真实 CAD 依赖这些字段。
+/// 只解析名称、其余跳过（`DRW_Dimstyle::parseDwg` 读完 name 就直接按 objSize
+/// 跳到句柄流），因此记录内部的字段错位在自家往返里**完全看不出来**；
+/// AutoCAD / 浩辰等按规格完整解析的宿主会一路读穿这条记录，随即判文件损坏。
+///
+/// 记录布局必须与**表头里的同名标注变量逐字段对齐**（两者共用同一套
+/// DIMxxx 定义），见 writeHeaderVars 的同名段落与读取端 drw_header.cpp
+/// 2067-2185（其中 2007+ 的分支由 `version > DRW::AC1018` 控制）：
+///   · 公共表项头之后是 name(TV) 与 xref 标志位（与其它表项同形，未随版本变化）；
+///   · DIMPOST / DIMAPOST / DIMSCALE…DIMTM；
+///   · 2007+：DIMFXL(BD) / DIMJOGANG(BD) / DIMTFILL(BS) / DIMTFILLCLR(CMC)；
+///   · DIMTOL…DIMSE2（位）、DIMTAD / DIMZIN / DIMAZIN；
+///   · 2007+：DIMARCSYM(BS)；
+///   · DIMTXT…DIMALTRND、DIMCLRD/RE/RT（**2004+ 为 CMC，不是 BS**）；
+///   · DIMADEC…DIMATFIT、2007+ DIMFXLON（位）、DIMLWD / DIMLWE、末尾标志位；
+///   · 句柄流：xref / DIMTXSTY / DIMLDRBLK / DIMBLK / DIMBLK1 / DIMBLK2，
+///     2007+ 再补 DIMLTYPE / DIMLTEX1 / DIMLTEX2。
 void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
 {
     Private::ObjBuilder b;
     const Private::DimStyleData& v = d.dimData;
     d.writeTableCommon(b, kDimstyle, handle);
     b.w.writeT(ent.name, d.codec);
-    b.w.writeB(false);                  // bit6
-    b.w.writeBS(0);                     // xrefindex
-    b.w.writeB(false);                  // bit4
+    writeXrefTableFlags(b.w, d.version);
     b.w.writeT(std::string(), d.codec); // DIMPOST
     b.w.writeT(std::string(), d.codec); // DIMAPOST
     b.w.writeBD(v.scale);  b.w.writeBD(v.asz);  b.w.writeBD(v.exo);
     b.w.writeBD(v.dli);    b.w.writeBD(v.exe);  b.w.writeBD(v.rnd);
     b.w.writeBD(v.dle);    b.w.writeBD(v.tp);   b.w.writeBD(v.tm);
+    // 2007+：DIMTM 与 DIMTOL 之间多 DIMFXL / DIMJOGANG / DIMTFILL /
+    // DIMTFILLCLR（读取端 drw_header.cpp:2072-2078，本文件 writeHeaderVars 同段）。
+    if (d.version > DRW::AC1018) {
+        b.w.writeBD(0.0);               // DIMFXL
+        b.w.writeBD(0.0);               // DIMJOGANG
+        b.w.writeBS(0);                 // DIMTFILL
+        d.writeColor(b, 0);             // DIMTFILLCLR（CMC）
+    }
     b.w.writeB(v.tol != 0); b.w.writeB(v.lim != 0);
     b.w.writeB(v.tih != 0); b.w.writeB(v.toh != 0);
     b.w.writeB(v.se1 != 0); b.w.writeB(v.se2 != 0);
     b.w.writeBS(static_cast<dint16>(v.tad));
     b.w.writeBS(static_cast<dint16>(v.zin));
     b.w.writeBS(static_cast<dint16>(v.azin));
+    // 2007+：DIMAZIN 之后是 DIMARCSYM（读取端 drw_header.cpp:2092-2094）。
+    if (d.version > DRW::AC1018)
+        b.w.writeBS(0);                 // DIMARCSYM
     b.w.writeBD(v.txt);    b.w.writeBD(v.cen);  b.w.writeBD(v.tsz);
     b.w.writeBD(v.altf);   b.w.writeBD(v.lfac); b.w.writeBD(v.tvp);
     b.w.writeBD(v.tfac);   b.w.writeBD(v.gap);  b.w.writeBD(v.altrnd);
@@ -1198,9 +1443,12 @@ void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
     b.w.writeBS(static_cast<dint16>(v.altd));
     b.w.writeB(v.tofl != 0); b.w.writeB(v.sah != 0);
     b.w.writeB(v.tix != 0);  b.w.writeB(v.soxd != 0);
-    b.w.writeBS(static_cast<dint16>(v.clrd));
-    b.w.writeBS(static_cast<dint16>(v.clre));
-    b.w.writeBS(static_cast<dint16>(v.clrt));
+    // 三个标注颜色：读取端一律走 getCmColor(version)（<AC1018 为 BS、
+    // 2004+ 为 BS+BL+RC 的 CMC）。与 LAYER 记录一样改用 writeColor，
+    // 否则 2004+ 每条记录少 42 位。
+    d.writeColor(b, v.clrd);            // DIMCLRD
+    d.writeColor(b, v.clre);            // DIMCLRE
+    d.writeColor(b, v.clrt);            // DIMCLRT
     b.w.writeBS(static_cast<dint16>(v.adec));
     b.w.writeBS(static_cast<dint16>(v.dec));
     b.w.writeBS(static_cast<dint16>(v.tdec));
@@ -1219,6 +1467,10 @@ void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
     b.w.writeBS(static_cast<dint16>(v.alttz));
     b.w.writeB(v.upt != 0);
     b.w.writeBS(static_cast<dint16>(v.atfit));
+    // 2007+：DIMATFIT 之后是 DIMFXLON（读取端 drw_header.cpp:2142-2145）。
+    // 其后的 DIMTXTDIRECTION / DIMALTMZF / DIMMZF 属 2010+，AC1021 不得写。
+    if (d.version > DRW::AC1018)
+        b.w.writeB(false);              // DIMFXLON
     b.w.writeBS(static_cast<dint16>(v.lwd));
     b.w.writeBS(static_cast<dint16>(v.lwe));
     b.w.writeB(false);                  // flag0
@@ -1230,6 +1482,13 @@ void encodeDimstyle(Private& d, const DRW_Dimstyle& ent, std::uint32_t handle)
     b.w.writeHandle(kHcAbsolute, 0);    // DIMBLK
     b.w.writeHandle(kHcAbsolute, 0);    // DIMBLK1
     b.w.writeHandle(kHcAbsolute, 0);    // DIMBLK2
+    // 2007+：DIMBLK2 之后还有三个线型句柄（读取端 drw_header.cpp:2163-2174）
+    // —— 漏写会让记录句柄流比规格少 3 条，严格读取器越界。
+    if (d.version > DRW::AC1018) {
+        b.w.writeHandle(kHcAbsolute, 0);    // DIMLTYPE
+        b.w.writeHandle(kHcAbsolute, 0);    // DIMLTEX1
+        b.w.writeHandle(kHcAbsolute, 0);    // DIMLTEX2
+    }
     d.pushObject(handle, kDimstyle, b.finish());
 }
 
@@ -1238,9 +1497,7 @@ void encodeAppId(Private& d, const DRW_AppId& ent, std::uint32_t handle)
     Private::ObjBuilder b;
     d.writeTableCommon(b, kAppId, handle);
     b.w.writeT(ent.name, d.codec);
-    b.w.writeB(false);
-    b.w.writeBS(0);                     // xrefindex
-    b.w.writeB(false);
+    writeXrefTableFlags(b.w, d.version);
     b.w.writeRC(0);
     b.beginHandles();
     d.writeTableHandleTail(b, d.appidCtrl);
@@ -1398,13 +1655,28 @@ void encodeLayout(Private& d, std::uint32_t handle, std::uint32_t owner,
     b.w.writeBS(0);                                         // plot_type
     b.w.write2BD(0.0, 0.0);                                 // plot_window_ll
     b.w.write2BD(0.0, 0.0);                                 // plot_window_ur
-    b.w.writeT(std::string(), d.codec);                     // plotview_name
+    // plotview_name(T)：按规范仅 **R2002 及更早**（libredwg dwg.spec 的
+    // `UNTIL (R_2002) FIELD_T (plotview_name)`）。R2004 起该字段改为句柄
+    // plotsettings.plotview（见下方句柄流）。AC1018 若在此多写一个空串，
+    // 主流会多出 2 位，其后 paper_units/drawing_units/… 与布局本体整体移位，
+    // 严格读取器随即报 bit_read_* 越界与 num_viewports 荒谬值。
+    // AC1021 即便多写也只落在**独立字符串区**里（主流不受影响），故此前只在
+    // AC1018 上暴露。
+    if (d.version <= DRW::AC1015)
+        b.w.writeT(std::string(), d.codec);                 // plotview_name（仅 2002-）
     b.w.writeBD(1.0);                                       // paper_units
     b.w.writeBD(78.4365);                                   // drawing_units
     b.w.writeT(std::string(), d.codec);                     // stylesheet
     b.w.writeBS(0);                                         // std_scale_type
     b.w.writeBD(0.0127492);                                 // std_scale_factor
     b.w.write2BD(0.0, 0.0);                                 // paper_image_origin
+    // R2004（AC1018）起打印设置尾部多三项 shadeplot 参数（规范 SINCE R_2004a）。
+    // 漏写会让其后整段（布局本体 + 句柄流）前移，读取端随之全部错位。
+    if (d.version > DRW::AC1015) {
+        b.w.writeBS(0);                                     // shadeplot_type
+        b.w.writeBS(0);                                     // shadeplot_reslevel
+        b.w.writeBS(0);                                     // shadeplot_customdpi
+    }
     // ---- 布局本体 ----
     b.w.writeT(name, d.codec);                              // layout_name
     b.w.writeBS(0);                                         // tab_order
@@ -1419,9 +1691,15 @@ void encodeLayout(Private& d, std::uint32_t handle, std::uint32_t owner,
     b.w.writeBS(0);                                         // UCSORTHOVIEW
     b.w.write3BD(0.0, 0.0, 0.0);                            // EXTMIN
     b.w.write3BD(0.0, 0.0, 0.0);                            // EXTMAX
+    // R2004+：布局本体末尾多一个视图口数（规范 SINCE R_2004a）。
+    if (d.version > DRW::AC1015) b.w.writeBL(0);            // num_viewports
     b.beginHandles();
     b.w.writeHandle(kHcSoftPtr, owner);                     // ownerhandle = ACAD_LAYOUT 字典
     d.writeXdicObj(b);
+    // 与上面 plotview_name 对应：R2004+ 的 plotview 是句柄（按规范顺序排在实体本体
+    // 句柄之前）；R2007+（AC1021）再补一个 shadeplot 句柄（SINCE R_2007a）。
+    if (d.version > DRW::AC1015) b.w.writeHandle(kHcSoftPtr, 0);   // plotsettings.plotview
+    if (d.version > DRW::AC1018) b.w.writeHandle(kHcSoftPtr, 0);   // plotsettings.shadeplot
     b.w.writeHandle(kHcSoftPtr, blockHeader);               // block_header（H 330）
     b.w.writeHandle(kHcSoftPtr, 0);                         // active_viewport（H 331）
     b.w.writeHandle(kHcAbsolute, 0);                        // base_ucs（H 346）
@@ -1459,9 +1737,7 @@ void encodeBlockRecord(Private& d, Private::Blk& blk)
     Private::ObjBuilder b;
     d.writeTableCommon(b, kBlockHeader, blk.record);
     b.w.writeT(blk.name, d.codec);
-    b.w.writeB(false);
-    b.w.writeBS(0);                     // xrefindex
-    b.w.writeB(false);
+    writeXrefTableFlags(b.w, d.version);
     b.w.writeB(blk.name.size() > 1 && blk.name[0] == '*'); // 匿名块
     b.w.writeB(false);                  // 含 ATTDEF
     b.w.writeB(false);                  // Xref
@@ -1476,6 +1752,14 @@ void encodeBlockRecord(Private& d, Private::Blk& blk)
     b.w.writeRC(0);                     // 插入计数终止（读取端按 0 截止）
     b.w.writeT(std::string(), d.codec); // 块说明
     b.w.writeBL(0);                     // 预览数据
+    // 2007+：预览数据之后还有三个字段（读取端 DRW_Block_Record::parseDwg 的
+    // `if (version > DRW::AC1018)`）：插入单位 BS、可否分解位 B、块缩放 RC。
+    // 漏写会让其后 setPosition(objSize) 之前的游标错位，块记录 isGood() 变假。
+    if (d.version > DRW::AC1018) {
+        b.w.writeBS(0);                 // insUnits
+        b.w.writeB(false);              // canExplode
+        b.w.writeRC(0);                 // bkScaling
+    }
     b.beginHandles();
     d.writeTableHandleTail(b, d.blockCtrl);
     b.w.writeHandle(kHcAbsolute, 0);            // Null handle
@@ -2313,6 +2597,46 @@ bool dwgW::writeArcDimension(DRW_DimArc* ent)
     return true;
 }
 
+// UTF-8 → UTF-16LE 码元（定义见文件前部，与 EED 字符串写出共用）。
+
+/// AC1021（R2007+）表格单元格的「值」（AcDbCellValue）。
+///
+/// R2007 起单元格文字**不再内联**在数据流里（内联只到 R2004），而是由本结构
+/// 承载 —— 读取端 `read_table_cell_data` 的 R2007+ 分支注释即
+/// "unknown then the cell value (holds the text for R2007 files)"。
+///
+/// 布局（与读取端 read_cad_value_with_schema 逐字段对应）：
+///     flags        BL    0
+///     code         BL    4 = kString（有文字）/ 0 = kUnknown（空格）
+///     —— code==4：BL 字节数（UTF-16 + 双字节 NUL）→ UTF-16LE 字节 + 0x0000
+///        code==0：BL 数值体（kUnknown 与 kLong 共用同一体，读端 `0 | 1 =>`）
+///     unit_type    BL    0（无单位）
+///     format       TV    空（走字符串流）
+///     formatted    TV    空（unit != 12 时存在）
+///
+/// 漏写这一段时，浩辰按 R2007+ 读格尾的 flag/值，会把原本内联的文字字节当
+/// 结构字段解析 —— 表格网格仍能显示，但**单元格文字丢失**（双击文字即消失）。
+void writeTableCellValue(dwgBitWriter& w, const std::string& utf8, DRW_TextCodec& codec)
+{
+    w.writeBL(0);                              // flags
+    if (utf8.empty()) {
+        w.writeBL(0);                          // code = kUnknown
+        w.writeBL(0);                          // 数值体（code 0|1 共用）
+    } else {
+        w.writeBL(4);                          // code = kString
+        const std::vector<std::uint16_t> units = utf8ToUtf16Units(utf8);
+        w.writeBL(static_cast<dint32>(units.size() * 2 + 2));   // 含末尾 NUL
+        for (std::uint16_t u : units) {
+            w.writeRC(static_cast<std::uint8_t>(u & 0xFFu));    // UTF-16LE
+            w.writeRC(static_cast<std::uint8_t>((u >> 8) & 0xFFu));
+        }
+        w.writeRC(0); w.writeRC(0);            // 末尾 UTF-16 NUL
+    }
+    w.writeBL(0);                              // unit_type_code = 0
+    w.writeT(std::string(), codec);            // format
+    w.writeT(std::string(), codec);            // formatted_value（unit != 12）
+}
+
 // 表格（ACAD_TABLE）——DWG 里的类对象，对象头写的是类号 kClassTable。
 //
 // 字段序 100% 依据对 example.dwg（对象 278 / handle 4F2 / 类号 528）的实测解码
@@ -2455,9 +2779,18 @@ bool dwgW::writeTable(DRW_Table* ent)
                 b.w.writeBL(colSpan);              // 跨列数
                 b.w.writeBL(rowSpan);              // 跨行数
                 b.w.writeBD(0.0);                  // 旋转
-                if (hasText)
+                // 单元格文字：只有 R2004 及更早**内联**在数据流里。R2007+ 的
+                // 文字改由格尾的 cad value 承载（见下），此处不得再写 —— 多写
+                // 会让浩辰把文字字节当结构字段解析，文字随即丢失。
+                if (hasText && d->version <= DRW::AC1018)
                     b.w.writeT(cit->second->text, d->codec);   // TV：内联文字
                 b.w.writeB(false);                 // 无单元格样式替代
+                // R2007+：每格（含空格）追加 [cell.flag BL] + cad value
+                if (d->version > DRW::AC1018) {
+                    b.w.writeBL(0);                // cell.flag
+                    writeTableCellValue(b.w, hasText ? cit->second->text : std::string(),
+                                        d->codec);
+                }
             }
         }
 
@@ -2496,6 +2829,12 @@ bool dwgW::writeMText(DRW_MText* ent)
         const double rad = ent->angle * kDegToRad;
         b.w.write3BD(std::cos(rad), std::sin(rad), 0.0);
         b.w.writeBD(ent->widthscale);   // 矩形宽度（0 = 不折行）
+        // 2007+：矩形宽度与字高之间还有一个 BD（读取端 DRW_MText::parseDwg 的
+        // `if (version > DRW::AC1018)`，上游标注 @todo、读取后丢弃）。漏写会让
+        // 其后全部字段（附着点 71、栏宽 41、行距…）前移一个 BD —— 症状是多行文字
+        // 的附着点在往返后丢失。
+        if (d->version > DRW::AC1018)
+            b.w.writeBD(0.0);           // 未公开字段（矩形高度），读取端忽略
         b.w.writeBD(ent->height);
         dint16 attachment = static_cast<dint16>(ent->textgen);
         if (attachment < 1) attachment = 1;
@@ -2676,6 +3015,21 @@ constexpr double kDegToRad2 = 0.017453292519943295;
 void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
                      DRW::Version ver)
 {
+    // ---- 2007+（AC1021）的流分离 ------------------------------------------
+    // 读取端（drw_header.cpp:1789-1795）在 2007+ 用**两个独立游标**读本段：
+    //   · 变量流 buf —— 自节内第 20 字节起（[16 字节哨兵][RL size] 之后）；
+    //   · 句柄流 hBbuf —— 定位到节内 `160 + bitSize` 位，bitSize 是本段第一个 RL。
+    // 故 2007+ 必须写成
+    //     [RL bitSize][变量位流][字符串区][u16 字符串位数][1 位标志][句柄流]
+    // 其中变量流里只留 HANDSEED 一个句柄（读取端用 buf->getHandle() 读它，
+    // 其余句柄全在句柄流）。字符串区由 writeT 自动分流（见 dwgBitWriter::writeT）。
+    dwgBitWriter hdlStream;                     // 句柄流（仅 2007+ 使用）
+    std::size_t bitSizeSlot = 0;
+    if (ver > DRW::AC1018) {
+        bitSizeSlot = w.bitPosition();           // w 的起点即 RL bitSize
+        w.writeRL(0);                            // 占位，末尾回填
+        w.setHandleSink(&hdlStream);
+    }
     // 颜色字段：R2000 是 BS（ACI），R2004 起是 CMC —— BS 索引 + BL RGB + RC 标志
     // （读取端 drw_header.cpp 一律走 buf->getCmColor(version)，2004+ 不再是纯 BS；
     //   漏写 BL/RC 会让其后整个句柄流错位，表控制对象全部找不到）。
@@ -2787,10 +3141,16 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     // HANDSEED 在规格中是 FIELD_DATAHANDLE（header_variables.spec:299），
     // 句柄码必须为 0——它存的是"下一个空闲句柄值"，并不存在对应对象。
     // 若误写成码 5（软指针），严格读取器会把它当对象引用解析失败，判文件损坏。
-    w.writeHandle(kHcData, d.nextHandle);               // HANDSEED（数据句柄，码 0）
+    w.writeMainHandle(kHcData, d.nextHandle);           // HANDSEED：2007+ 仍留在数据流
     w.writeHandle(kHcAbsolute, d.layerHandle(hdrStr(hdr, "$CLAYER", "0")));
     w.writeHandle(kHcAbsolute, d.styleHandle(hdrStr(hdr, "$TEXTSTYLE", "Standard")));
     w.writeHandle(kHcAbsolute, d.ltypeHandle(hdrStr(hdr, "$CELTYPE", "ByLayer")));
+    // 2007+：CELTYPE 与 DIMSTYLE 之间多一个 CMATERIAL 句柄（读取端
+    // drw_header.cpp:1971，`if (version > DRW::AC1018)`）。**漏写会让其后
+    // 所有句柄（含 14 个 CONTROL）整体前移一个**，症状是控制对象全部
+    // "control not found"、整张图打不开。
+    if (ver > DRW::AC1018)
+        w.writeHandle(kHcAbsolute, 0);                  // CMATERIAL（2007+，无材质）
     w.writeHandle(kHcAbsolute, d.dimstyleHandle(hdrStr(hdr, "$DIMSTYLE", "Standard")));
     w.writeHandle(kHcAbsolute, 0);                      // CMLSTYLE（无多线样式）
 
@@ -2847,6 +3207,15 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     w.writeBD(0.0);                                     // DIMDLE
     w.writeBD(0.0);                                     // DIMTP
     w.writeBD(0.0);                                     // DIMTM
+    // 2007+：读取端 drw_header.cpp:2075-2079（`version > AC1018`）在 DIMTM 与
+    // DIMTOL 之间读 DIMFXL/DIMJOGANG/DIMTFILL/DIMTFILLCLR；漏写会让其后全部
+    // 标注变量与句柄流整体错位。
+    if (ver > DRW::AC1018) {
+        w.writeBD(0.0);                                 // DIMFXL
+        w.writeBD(0.0);                                 // DIMJOGANG
+        w.writeBS(0);                                   // DIMTFILL
+        d.writeColor(w, 0);                             // DIMTFILLCLR（CMC）
+    }
     w.writeB(false);                                    // DIMTOL
     w.writeB(false);                                    // DIMLIM
     w.writeB(false);                                    // DIMTIH
@@ -2856,6 +3225,8 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     w.writeBS(1);                                       // DIMTAD
     w.writeBS(0);                                       // DIMZIN
     w.writeBS(0);                                       // DIMAZIN
+    if (ver > DRW::AC1018)
+        w.writeBS(0);                                   // DIMARCSYM（2007+，读取端 2093）
     w.writeBD(hdrDouble(hdr, "$DIMTXT", 3.5));
     w.writeBD(hdrDouble(hdr, "$DIMCEN", 2.5));
     w.writeBD(0.0);                                     // DIMTSZ
@@ -2894,12 +3265,22 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     w.writeBS(0);                                       // DIMALTTZ
     w.writeB(false);                                    // DIMUPT
     w.writeBS(3);                                       // DIMATFIT
+    // 2007+：DIMFXLON（读取端 2143-2145）。注意其后的 DIMTXTDIRECTION/
+    // DIMALTMZF/DIMMZF 是 `version > AC1021`（2010+），AC1021 不得写。
+    if (ver > DRW::AC1018)
+        w.writeB(false);                                // DIMFXLON
 
     w.writeHandle(kHcAbsolute, d.styleHandle(hdrStr(hdr, "$DIMTXSTY", "Standard")));
     w.writeHandle(kHcAbsolute, 0);                      // DIMLDRBLK
     w.writeHandle(kHcAbsolute, 0);                      // DIMBLK
     w.writeHandle(kHcAbsolute, 0);                      // DIMBLK1
     w.writeHandle(kHcAbsolute, 0);                      // DIMBLK2
+    // 2007+：3 个线型句柄（读取端 2163-2170，在 DIMBLK2 与 DIMLWD 之间）
+    if (ver > DRW::AC1018) {
+        w.writeHandle(kHcAbsolute, 0);                  // DIMLTYPE
+        w.writeHandle(kHcAbsolute, 0);                  // DIMLTEX1
+        w.writeHandle(kHcAbsolute, 0);                  // DIMLTEX2
+    }
     w.writeBS(31);                                      // DIMLWD（默认）
     w.writeBS(31);                                      // DIMLWE（默认）
 
@@ -2940,6 +3321,9 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
         w.writeHandle(kHcAbsolute, 0);                  // DICT MATERIALS
         w.writeHandle(kHcAbsolute, 0);                  // DICT COLORS
     }
+    // 2007+：再一个字典句柄（读取端 2234-2237，`version > AC1018`）
+    if (ver > DRW::AC1018)
+        w.writeHandle(kHcAbsolute, 0);                  // DICT VISUALSTYLE
 
     // FLAGS：
     //   低 5 位 = CELWEIGHT 的 DWG 编码（29 = ByLayer）
@@ -2980,12 +3364,90 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     w.writeHandle(kHcAbsolute, d.ltypeByBlock);
     w.writeHandle(kHcAbsolute, d.ltypeContinuous);
 
+    // ---- 2007+ 变量块（读取端 drw_header.cpp:2281-2319）----------------------
+    // 整块位于 LTYPE CONTINUOUS 句柄之后、R14+ 的 4 个 BS 之前；其中
+    // INTERFEREOBJVS/INTERFEREVPVS/DRAGVS 是句柄（走句柄流），INTERFERECOLOR 是
+    // CMC。漏写这一整块会让其后 4 个 BS 与控制对象句柄流整体错位。
+    if (ver > DRW::AC1018) {
+        w.writeB(false);                                // CAMERADISPLAY
+        w.writeBL(0); w.writeBL(0);                     // 未知长整型 ×2
+        w.writeBD(0.0);                                 // 未知 double
+        w.writeBD(1.0);                                 // STEPSPERSEC
+        w.writeBD(1.0);                                 // STEPSIZE
+        w.writeBD(0.5);                                 // 3DDWFPREC
+        w.writeBD(50.0);                                // LENSLENGTH
+        w.writeBD(0.0);                                 // CAMERAHEIGHT
+        w.writeRC(0);                                   // SOLIDHIST
+        w.writeRC(0);                                   // SHOWHIST
+        w.writeBD(0.0);                                 // PSOLWIDTH
+        w.writeBD(0.0);                                 // PSOLHEIGHT
+        w.writeBD(0.0);                                 // LOFTANG1
+        w.writeBD(0.0);                                 // LOFTANG2
+        w.writeBD(0.0);                                 // LOFTMAG1
+        w.writeBD(0.0);                                 // LOFTMAG2
+        w.writeBS(0);                                   // LOFTPARAM
+        w.writeRC(0);                                   // LOFTNORMALS
+        w.writeBD(0.0);                                 // LATITUDE
+        w.writeBD(0.0);                                 // LONGITUDE
+        w.writeBD(0.0);                                 // NORTHDIRECTION
+        w.writeBL(0);                                   // TIMEZONE
+        w.writeRC(0);                                   // LIGHTGLYPHDISPLAY
+        w.writeRC(0);                                   // TILEMODELIGHTSYNCH
+        w.writeRC(0);                                   // DWFFRAME
+        w.writeRC(0);                                   // DGNFRAME
+        w.writeB(false);                                // 未知位
+        d.writeColor(w, 256);                           // INTERFERECOLOR（CMC，ByLayer）
+        w.writeHandle(kHcAbsolute, 0);                  // INTERFEREOBJVS
+        w.writeHandle(kHcAbsolute, 0);                  // INTERFEREVPVS
+        w.writeHandle(kHcAbsolute, 0);                  // DRAGVS
+        w.writeRC(0);                                   // CSHADOW
+        w.writeBD(0.0);                                 // 未知 double 2
+    }
+
     for (int i = 0; i < 4; ++i) w.writeBS(0);           // R14+ 未知短整型
+
+    // ---- 2007+：字符串区 + 句柄流 ------------------------------------------
+    // 布局：[变量位流][字符串区][u16 位数][1 位标志][句柄流]；
+    // 读取端 2334-2352 用 `endBitPos-1` 的标志位与前 16 位的位数反推字符串起点。
+    if (ver > DRW::AC1018) {
+        w.setHandleSink(nullptr);                       // 句柄流已写完
+        // 变量流与字符串区都按字节对齐：读取端用 (160+bitSize)-17 处的
+        // **原始 16 位**读字符串区长度，该字段必须落在字节边界（getRawShort16
+        // 在非对齐时按另一套大端逻辑解读，字符串起点会整体偏移）。
+        w.padToByte();
+        dwgBitWriter* hss = const_cast<dwgBitWriter*>(w.stringStream());
+        if (hss != nullptr) hss->padToByte();
+        const std::size_t strBits = (hss != nullptr) ? hss->bitPosition() : 0;
+        if (strBits > 0) {
+            w.appendBitsFrom(*hss);
+            if (strBits >= 0x8000u) {                   // 位数按原始 16 位写（getRawShort16）
+                w.writeRS(static_cast<std::uint16_t>(strBits >> 15));
+                w.writeRS(static_cast<std::uint16_t>((strBits & 0x7FFFu) | 0x8000u));
+            } else {
+                w.writeRS(static_cast<std::uint16_t>(strBits));
+            }
+            w.writeB(true);                             // 有字符串区（读取端 2337）
+        } else {
+            w.writeB(false);
+        }
+        // bitSize = **句柄流起点**（相对 w 起点，即节内 160 位处）：
+        // 读取端 drw_header.cpp:1792-1794 直接 setPosition((160+bitSize)>>3) 定位
+        // hBbuf，并把 (160+bitSize)-1 当字符串区标志位、(160+bitSize)-17 当 u16
+        // 位数——写成句柄流【末尾】会让 hBbuf 定位到句柄流之后，读出一串垃圾
+        //（症状：所有 CONTROL 句柄错、控制对象全部 not found）。
+        const std::size_t handleStartBit = w.bitPosition();
+        w.appendBitsFrom(hdlStream);                    // 句柄流紧随其后
+        const std::size_t endBit = w.bitPosition();
+        w.setBitPosition(bitSizeSlot);
+        w.writeRL(static_cast<std::uint32_t>(handleStartBit));  // bitSize = 句柄流起点
+        w.setBitPosition(endBit);
+    }
 }
 
 /// 写一条类记录（R2000 classes 节）
 void writeOneClass(dwgBitWriter& w, dwgW::Private& d, std::uint16_t num,
-                   const char* cppName, const char* dxfName, DRW::Version ver)
+                   const char* cppName, const char* dxfName, DRW::Version ver,
+                   std::uint16_t itemClassId = 499)
 {
     w.writeBS(static_cast<dint16>(num));                // 类号（500 起）
     w.writeBS(0);                                       // 版本/代理标志
@@ -2993,7 +3455,12 @@ void writeOneClass(dwgBitWriter& w, dwgW::Private& d, std::uint16_t num,
     w.writeT(cppName, d.codec);                         // C++ 类名
     w.writeT(dxfName, d.codec);                         // DXF 记录名
     w.writeB(false);                                    // is_zombie
-    w.writeBS(499);                                     // item_class_id（AutoCAD 固定值）
+    // item_class_id：499（0x1F3）= 非图元对象，498（0x1F2）= 图元。
+    // 规格按该位区分「实体」与「普通对象」——二者公共数据布局不同（实体多
+    // entmode/属主等字段）。弧长标注 / 表格本质是图元，若写成 499，读取端会
+    // 按普通对象解析，公共数据随即错位（实测 libredwg 报
+    // `num_reactors: 93 > AVAIL_BITS(hdl_dat)`，对象内容整段失效）。
+    w.writeBS(static_cast<dint16>(itemClassId));        // item_class_id
     // 2004+ 的类记录尾部多 5 个 BitLong（读取端 drw_classes.cpp 的
     // `if (version > DRW::AC1015)`）：实例计数、DWG 版本、维护版本与两个未知值。
     if (ver > DRW::AC1015) {
@@ -3015,9 +3482,12 @@ void writeClassesData(dwgBitWriter& w, dwgW::Private& d, std::uint16_t& nextClas
     writeOneClass(w, d, nextClassNum++, "AcDbDictionaryVar", "DICTIONARYVAR", ver);
     // 弧长标注（ARC_DIMENSION）在 DWG 里是类对象，没有固定类型号：
     // 实体写出时用的就是**这里的类号**（kClassArcDim），两处必须一致。
-    writeOneClass(w, d, nextClassNum++, "AcDbArcDimension", "ARC_DIMENSION", ver);
+    // 它是**图元**，item_class_id 必须写 498（0x1F2），否则读取端按普通对象
+    // 解析，公共数据错位。
+    writeOneClass(w, d, nextClassNum++, "AcDbArcDimension", "ARC_DIMENSION", ver, 498);
     // 表格（ACAD_TABLE）同样是类对象：实体写出时用这里的类号 kClassTable。
-    writeOneClass(w, d, nextClassNum++, "AcDbTable", "ACAD_TABLE", ver);
+    // 同样是图元 → item_class_id = 498。
+    writeOneClass(w, d, nextClassNum++, "AcDbTable", "ACAD_TABLE", ver, 498);
 }
 
 } // namespace
@@ -3036,7 +3506,10 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
     // 文本编码：$DWGCODEPAGE 决定（默认简中 ANSI_936），文件头记录对应 id
     std::uint16_t codepageId = kCodepageId936;
     {
-        std::string verStr = (dwgVer == DRW::AC1018) ? "AC1018" : "AC1015";
+        // 文本编码：AC1021 起为 UTF-16，故版本串必须是 AC1021 —— 它同时决定
+        // writeT 是否走独立字符串流（见 dwgBitWriter::writeT）。
+        std::string verStr = (dwgVer == DRW::AC1021) ? "AC1021"
+                          : (dwgVer == DRW::AC1018) ? "AC1018" : "AC1015";
         d->codec.setVersion(&verStr, false);
     }
     d->codec.setCodePage(std::string("ANSI_936"), false);
@@ -3177,9 +3650,45 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
         dwgBitWriter w;
         std::uint16_t classNum = 500;
         writeClassesData(w, *d, classNum, dwgVer);
-        w.padToByte();
-        out.classesData = w.takeData();
         out.maxClassNum = static_cast<std::uint16_t>(classNum - 1);
+        if (dwgVer > DRW::AC1018) {
+            // 2007+：类记录之后多一段**独立字符串区**（三个类名），读取端
+            //（dwgReader21::readDwgClasses）用本段首个 RL bitSize 反推字符串起点
+            //（strStartPos = bitSize + 159），再按 sBuf 逐个读字符串。故数据区为
+            //   [RL bitSize][BS 最大类号][RC][RC][1 位][类记录][字符串区][u16 位数][1 位标志]
+            dwgBitWriter body;
+            body.writeBS(static_cast<dint16>(out.maxClassNum));
+            body.writeRC(0);
+            body.writeRC(0);
+            body.writeB(true);
+            body.appendBitsFrom(w);
+            const std::size_t strBits = w.stringBits();
+            if (strBits > 0) {
+                body.appendBitsFrom(*w.stringStream());
+                if (strBits >= 0x8000u) {
+                    body.writeRS(static_cast<std::uint16_t>(strBits >> 15));
+                    body.writeRS(static_cast<std::uint16_t>((strBits & 0x7FFFu) | 0x8000u));
+                } else {
+                    body.writeRS(static_cast<std::uint16_t>(strBits));
+                }
+                body.writeB(true);
+            } else {
+                body.writeB(false);
+            }
+            dwgBitWriter area;
+            const std::size_t slot = area.bitPosition();
+            area.writeRL(0);
+            area.appendBitsFrom(body);
+            const std::size_t endBit = area.bitPosition();
+            area.setBitPosition(slot);
+            area.writeRL(static_cast<std::uint32_t>(endBit));
+            area.setBitPosition(endBit);
+            area.padToByte();
+            out.classesData = area.takeData();
+        } else {
+            w.padToByte();
+            out.classesData = w.takeData();
+        }
     }
 
     // ---- 3. 导出对象表（供各版本容器按自身偏移规则装配）-----------------------------

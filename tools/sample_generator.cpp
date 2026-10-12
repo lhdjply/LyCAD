@@ -39,6 +39,7 @@
 #include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
 #include "core/Linetype.h"
+#include "core/MTextEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/RayEntity.h"
@@ -216,6 +217,30 @@ void buildSample(Document& document)
         centered->setBackwards(true);          // 背面文字（DXF 71 bit2）
         centered->setWidthFactor(1.1);         // 宽度因子（DXF 41）
         document.addEntity(std::move(centered));
+    }
+
+    // 多行文字（MTEXT）：与 TEXT 是两种定位语义不同的对象，必须单独覆盖——
+    // TEXT 由「第一/第二对齐点 + 72/73 档」定位，MTEXT 由「插入点 + 附着点 +
+    // 参考矩形宽度」定位，且 MTEXT 的中间行垂直基准是基线到小写高度的中点。
+    // 内容里带段落码（\P）与内联格式码（\f 字体、\b 粗体、\i 斜体、\C 颜色），
+    // 这些码必须**原样往返**：外部工具打开时应看到三行、第二行字型变化、
+    // 第三行变色。参考矩形宽度（41）只影响编辑器折行，显示不据此重排。
+    // 附着点取 4（左中）、行距样式取「固定」、行距系数 1.5 —— 都是**非默认**值：
+    // 取默认值时 71/73/44 会被写出端省略，等于这些组码没有被真正验证。
+    {
+        auto mtext = std::make_unique<MTextEntity>(
+            QStringLiteral("多行文字（MTEXT）示例\\P"
+                           "第二行：内联格式 \\fArial|b1;加粗\\fArial|b0; 与斜体 "
+                           "\\fArial|i1;Italic\\fArial|i0;\\P"
+                           "第三行：颜色 \\C1;红\\C3;绿\\C5;蓝"),
+            Point2D(95.0, 130.0), 4.0);
+        mtext->setLayerName(QStringLiteral("标注"));
+        mtext->setAttachment(MTextEntity::Attachment::MiddleLeft);         // DXF 71 = 4
+        mtext->setReferenceWidth(80.0);                                    // DXF 41
+        mtext->setDrawingDirection(MTextEntity::DrawingDirection::LeftToRight); // DXF 72
+        mtext->setLineSpacingStyle(MTextEntity::LineSpacingStyle::Exact);       // DXF 73 = 2
+        mtext->setLineSpacingFactor(1.5);                                  // DXF 44
+        document.addEntity(std::move(mtext));
     }
 
     // 填充：五边形边界，ANSI31 图案
@@ -408,6 +433,14 @@ int inspect(const QString& path)
         if (entity->type() == EntityType::Text) {
             extra = QStringLiteral("|text=%1")
                         .arg(static_cast<const TextEntity*>(entity)->displayString());
+        } else if (entity->type() == EntityType::MText) {
+            // 输出**原始内容**（含 \P 与内联格式码），便于脚本核对保真度；
+            // 附着点与参考矩形宽度一并给出，用于验证 MTEXT 的定位语义。
+            const auto* mtext = static_cast<const MTextEntity*>(entity);
+            extra = QStringLiteral("|text=%1|attach=%2|width=%3")
+                        .arg(mtext->content())
+                        .arg(static_cast<int>(mtext->attachment()))
+                        .arg(mtext->referenceWidth());
         } else if (entity->type() == EntityType::Dimension) {
             extra = QStringLiteral("|dim=%1")
                         .arg(static_cast<const DimensionEntity*>(entity)->displayText());
@@ -458,16 +491,18 @@ int main(int argc, char* argv[])
             out() << QStringLiteral("读取失败: %1").arg(loaded.error) << Qt::endl;
             return 1;
         }
-        const QString version = (arguments.size() > 4) ? arguments.at(4)
-                                                       : QStringLiteral("AC1015");
+        const bool hasVersion = arguments.size() > 4;
+        const QString version = hasVersion ? arguments.at(4)
+                                           : QStringLiteral("AC1015");
         // 按目标扩展名路由编解码器（.dwg 走 DwgCodec 的原生 dwgW 写出），
         // 不能直接调 writeDxfWithLibDxfRw——否则 .dwg 里装的是 DXF 文本，
         // 再打开时会被文件头签名检查拦下（提示"不具备 DWG 的文件头签名"）。
         WriteOptions options;
         if (arguments.at(3).endsWith(QStringLiteral(".dwg"), Qt::CaseInsensitive)) {
-            // DWG 的写出版本由 dwgVersion 决定（与 DXF 的 version 各管一路）
-            options.dwgVersion = (version.compare(QStringLiteral("AC1015"), Qt::CaseInsensitive) == 0)
-                                     ? QStringLiteral("AC1015") : QStringLiteral("AC1018");
+            // DWG 的写出版本由 dwgVersion 决定（与 DXF 的 version 各管一路）：
+            // 显式给出可写 DWG 版本时按它写，否则退回默认（AC1021）。
+            options.dwgVersion = (hasVersion && WriteOptions::isWritableDwgVersion(version))
+                                     ? version : QStringLiteral("AC1021");
         } else {
             options.version = version;
         }
@@ -494,16 +529,16 @@ int main(int argc, char* argv[])
         return 2;
     }
 
-    // 目标版本矩阵：目录名（同时也是文件名里的年代）-> DXF 版本代号。
-    // 每个年代出一个文件，便于直接用对应版本的 CAD 打开核对。
-    struct Target { const char* year; const char* version; };
+    // 目标版本矩阵：目录名（同时也是文件名里的年代）-> DXF 版本代号 + DWG 目标版本。
+    // DXF 每个年代出一份；DWG 只出写出器（dwgW）已支持的版本，其余年代留空。
+    struct Target { const char* year; const char* version; const char* dwgVersion; };
     static const Target kTargets[] = {
-        { "2000", "AC1015" },     // AutoCAD 2000
-        { "2004", "AC1018" },     // AutoCAD 2004
-        { "2007", "AC1021" },     // AutoCAD 2007
-        { "2010", "AC1024" },     // AutoCAD 2010
-        { "2013", "AC1027" },     // AutoCAD 2013
-        { "2018", "AC1032" },     // AutoCAD 2018
+        { "2000", "AC1015", "AC1015" },   // AutoCAD 2000 / R2000
+        { "2004", "AC1018", "AC1018" },   // AutoCAD 2004 / R2004
+        { "2007", "AC1021", "AC1021" },   // AutoCAD 2007 / R2007
+        { "2010", "AC1024", nullptr },    // AutoCAD 2010（写出器暂不支持）
+        { "2013", "AC1027", nullptr },    // AutoCAD 2013（写出器暂不支持）
+        { "2018", "AC1032", nullptr },    // AutoCAD 2018（写出器暂不支持）
     };
 
     const bool flat = arguments.size() > 1;
@@ -533,19 +568,18 @@ int main(int argc, char* argv[])
 
     int failures = 0;
     for (const Target& target : kTargets) {
-        failures += writeOne(document,
-                             dirOf(target) + QStringLiteral("/lycad_sample_%1.dxf")
-                                                 .arg(QLatin1String(target.year)),
+        const QString stem = dirOf(target)
+                             + QStringLiteral("/lycad_sample_%1").arg(QLatin1String(target.year));
+        failures += writeOne(document, stem + QStringLiteral(".dxf"),
                              QString::fromLatin1(target.version));
+        // DWG：走内置 dwgW 原生写出，与 DXF 同内容，供「同一张图两种格式」的
+        // 交叉比对。写出版本由 WriteOptions::dwgVersion 决定（与 version 各管一路）。
+        if (target.dwgVersion != nullptr) {
+            failures += writeOne(document, stem + QStringLiteral(".dwg"),
+                                 QString::fromLatin1(target.version),
+                                 QString::fromLatin1(target.dwgVersion));
+        }
     }
-    // DWG：走内置 dwgW 原生写出，与 DXF 同内容，供「同一张图两种格式」的
-    // 交叉比对。R2000 / R2004 各一份（写出版本由 WriteOptions::dwgVersion 决定）。
-    failures += writeOne(document,
-                         dirOf(kTargets[0]) + QStringLiteral("/lycad_sample_2000.dwg"),
-                         QStringLiteral("AC1015"), QStringLiteral("AC1015"));
-    failures += writeOne(document,
-                         dirOf(kTargets[1]) + QStringLiteral("/lycad_sample_2004.dwg"),
-                         QStringLiteral("AC1018"), QStringLiteral("AC1018"));
 
     if (failures == 0) {
         out() << QStringLiteral("完成。") << Qt::endl;

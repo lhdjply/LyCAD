@@ -20,6 +20,30 @@
 #include "drw_textcodec.h"
 #include "../libdwgrw.h"
 
+//  解压目标缓冲区必须留的溢出余量。
+//
+//  AC1021 的字面量拷贝（intern/dwgutil.cpp::copyCompBytes21）在长度为 6 / 7 / 11
+//  时会**写超出被复制的字节数**：这几个分支缺 break，会接着执行下一个长度分支继续
+//  写。参考实现（.cache/opencadcodec 的 decompressor_ac21.rs 注明 C# 参考实现
+//  DwgLZ77AC21Decompressor 亦如此，并把解压缓冲区垫到 32 字节以上规避）确认这是
+//  格式实现本身的行为，不是可以「顺手修掉」的笔误——擅自补 break 会让这些长度的
+//  解码结果与 AutoCAD 不一致。因此这里同样留余量，而不是改拷贝语义。
+//
+//  实测：浩辰 CAD 写出的 R2007 文件，Header 节 605 字节、其最后一页 uSize 也是 605，
+//  缓冲区按节尺寸精确分配时，末尾那段字面量的溢出写正好落在缓冲区外 1 字节 ——
+//  Release 下打开该文件界面直接段错误（rc=139），ASan 报 heap-buffer-overflow。
+static const duint32 kAc21DecompressSlack = 32;
+
+duint32 dwgReader21::sectionBufferSize(const dwgSectionInfo& si){
+    duint64 need = si.size;
+    for (std::map<duint32, dwgPageInfo>::const_iterator it = si.pages.begin();
+         it != si.pages.end(); ++it) {
+        const duint64 end = it->second.startOffset + it->second.uSize;
+        if (end > need) need = end;      // 防御：页区间可能超出节声明长度
+    }
+    return static_cast<duint32>(need) + kAc21DecompressSlack;
+}
+
 bool dwgReader21::readMetaData() {
     version = parent->getVersion();
     decoder.setVersion(version, false);
@@ -68,7 +92,16 @@ bool dwgReader21::parseSysPage(duint64 sizeCompressed, duint64 sizeUncompressed,
     fileBuf->getBytes(tmpDataRaw, fpsize);
     duint8 *tmpDataRS = new duint8[fpsize];
     dwgRSCodec::decode239I(tmpDataRaw, tmpDataRS, fpsize/255);
-    dwgCompressor::decompress21(tmpDataRS, decompData, sizeCompressed, sizeUncompressed);
+    // 该页是否压缩由尺寸关系判定 —— 规范、AutoCAD、浩辰与 libredwg 都是
+    // 「压缩后尺寸 < 解压后尺寸」才算压缩。写出端在 LZ77 不划算时会退回原文
+    // 存放（compressedSize == uncompressedSize），此时 RS 去交织后的前
+    // sizeUncompressed 字节就是原文，若仍按压缩流解压会得到乱码，
+    // 页映像 / 段映像随之解析失败，整个文件被判为「已损坏」。
+    if (sizeCompressed < sizeUncompressed) {
+        dwgCompressor::decompress21(tmpDataRS, decompData, sizeCompressed, sizeUncompressed);
+    } else {
+        memcpy(decompData, tmpDataRS, sizeUncompressed);
+    }
     delete[]tmpDataRaw;
     delete[]tmpDataRS;
     return true;
@@ -111,7 +144,12 @@ bool dwgReader21::parseDataPage(dwgSectionInfo si, duint8 *dData){
         DRW_DBG("\npage uncomp size: "); DRW_DBG(pi.uSize); DRW_DBG(" comp size: "); DRW_DBG(pi.cSize);
         DRW_DBG("\noffset: "); DRW_DBG(pi.startOffset);
         duint8 *pageData = dData + pi.startOffset;
-        dwgCompressor::decompress21(tmpPageRS, pageData, pi.cSize, pi.uSize);
+        // 同上：cSize < uSize 才算压缩流；否则（cSize == uSize）是原文直取。
+        if (pi.cSize < pi.uSize) {
+            dwgCompressor::decompress21(tmpPageRS, pageData, pi.cSize, pi.uSize);
+        } else {
+            memcpy(pageData, tmpPageRS, pi.uSize);
+        }
 
     #ifdef DRW_DBG_DUMP
         DRW_DBG("\n\nSection OBJECTS decompresed data=\n");
@@ -162,13 +200,13 @@ bool dwgReader21::readFileHeader() {
     duint8 *fileHdrData;
     if (fileHdrCompLength < 0) {
         fileHdrDataLength = fileHdrCompLength * -1;
-        fileHdrData = new duint8[fileHdrDataLength];
+        fileHdrData = new duint8[fileHdrDataLength + kAc21DecompressSlack];
         fileHdrBuf.getBytes(fileHdrData, fileHdrDataLength);
     }else {
         DRW_DBG("\ndwgReader21:: file header are compresed:\n");
-        duint8 *compByteStr = new duint8[fileHdrCompLength];
+        duint8 *compByteStr = new duint8[fileHdrCompLength + kAc21DecompressSlack];
         fileHdrBuf.getBytes(compByteStr, fileHdrCompLength);
-        fileHdrData = new duint8[fileHdrDataLength];
+        fileHdrData = new duint8[fileHdrDataLength + kAc21DecompressSlack];
         dwgCompressor::decompress21(compByteStr, fileHdrData, fileHdrCompLength, fileHdrDataLength);
         delete[] compByteStr;
     }
@@ -230,7 +268,7 @@ bool dwgReader21::readFileHeader() {
     delete[] fileHdrData;
 
     DRW_DBG("\ndwgReader21::parse page map:\n");
-    duint8 *PagesMapData = new duint8[PagesMapSizeUncompressed];
+    duint8 *PagesMapData = new duint8[PagesMapSizeUncompressed + kAc21DecompressSlack];
 
     bool ret = parseSysPage(PagesMapSizeCompressed, PagesMapSizeUncompressed, PagesMapCorrectionFactor, 0x480+PagesMapOffset, PagesMapData);
     if (!ret) {
@@ -261,7 +299,7 @@ bool dwgReader21::readFileHeader() {
     delete[]PagesMapData;
 
     DRW_DBG("\n*** dwgReader21: Processing Section Map ***\n");
-    duint8 *SectionsMapData = new duint8[SectionsMapSizeUncompressed];
+    duint8 *SectionsMapData = new duint8[SectionsMapSizeUncompressed + kAc21DecompressSlack];
     dwgPageInfo sectionMap = sectionPageMapTmp[SectionsMapId];
     ret = parseSysPage(SectionsMapSizeCompressed, SectionsMapSizeUncompressed, SectionsMapCorrectionFactor, sectionMap.address, SectionsMapData);
     if (!ret)
@@ -336,7 +374,7 @@ bool dwgReader21::readDwgHeader(DRW_Header& hdr){
     if (si.Id<0)//not found, ends
         return false;
     DRW_DBG("\nprepare section of size "); DRW_DBG(si.size);DRW_DBG("\n");
-    duint8 *tmpHeaderData = new duint8[si.size];
+    duint8 *tmpHeaderData = new duint8[sectionBufferSize(si)];
     bool ret = dwgReader21::parseDataPage(si, tmpHeaderData);
     if (!ret) {
         delete[]tmpHeaderData;
@@ -359,7 +397,7 @@ bool dwgReader21::readDwgClasses(){
         return false;
 
     DRW_DBG("\nprepare section of size "); DRW_DBG(si.size);DRW_DBG("\n");
-    duint8 *tmpClassesData = new duint8[si.size];
+    duint8 *tmpClassesData = new duint8[sectionBufferSize(si)];
     bool ret = dwgReader21::parseDataPage(si, tmpClassesData);
     if (!ret)
         return ret;
@@ -445,7 +483,7 @@ bool dwgReader21::readDwgHandles(){
         return false;
 
     DRW_DBG("\nprepare section of size "); DRW_DBG(si.size);DRW_DBG("\n");
-    duint8 *tmpHandlesData = new duint8[si.size];
+    duint8 *tmpHandlesData = new duint8[sectionBufferSize(si)];
     bool ret = dwgReader21::parseDataPage(si, tmpHandlesData);
     if (!ret)
         return ret;
@@ -470,7 +508,7 @@ bool dwgReader21::readDwgTables(DRW_Header& hdr) {
 
     DRW_DBG("\nprepare section of size "); DRW_DBG(si.size);DRW_DBG("\n");
     dataSize = si.size;
-    objData = new duint8 [dataSize];
+    objData = new duint8 [sectionBufferSize(si)];
     bool ret = dwgReader21::parseDataPage(si, objData);
     if (!ret)
         return ret;

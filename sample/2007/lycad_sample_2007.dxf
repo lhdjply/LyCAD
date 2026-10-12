@@ -1307,6 +1307,36 @@ AcDbSymbolTableRecord
 100
 AcDbLinetypeTableRecord
   2
+DASHED
+ 70
+    0
+  3
+__ __ __ __ __ __ __ __ __ __ __ __ __
+ 72
+   65
+ 73
+    2
+ 40
+0.75
+ 49
+0.5
+ 74
+    0
+ 49
+-0.25
+ 74
+    0
+  0
+LTYPE
+  5
+33
+330
+5
+100
+AcDbSymbolTableRecord
+100
+AcDbLinetypeTableRecord
+  2
 CENTER
  70
     0
@@ -1328,36 +1358,6 @@ ____ _ ____ _ ____ _ ____ _ ____
     0
  49
 0.25
- 74
-    0
- 49
--0.25
- 74
-    0
-  0
-LTYPE
-  5
-33
-330
-5
-100
-AcDbSymbolTableRecord
-100
-AcDbLinetypeTableRecord
-  2
-DASHED
- 70
-    0
-  3
-__ __ __ __ __ __ __ __ __ __ __ __ __
- 72
-   65
- 73
-    2
- 40
-0.75
- 49
-0.5
  74
     0
  49
@@ -5995,9 +5995,61 @@ AcDbText
  73
     2
   0
-HATCH
+MTEXT
   5
 C5
+100
+AcDbEntity
+  8
+标注
+  6
+ByLayer
+ 62
+  256
+370
+   -3
+330
+1F
+100
+AcDbMText
+ 10
+95
+ 20
+130
+ 30
+0
+ 40
+4
+ 41
+80
+ 71
+    4
+ 72
+    1
+  1
+多行文字（MTEXT）示例\P第二行：内联格式 \fArial|b1;加粗\fArial|b0; 与斜体 \fArial|i1;Italic\fArial|i0;\P第三行：颜色 \C1;红\C3;绿\C5;蓝
+  7
+Standard
+210
+0
+220
+0
+230
+1
+ 11
+1
+ 21
+0
+ 31
+0
+ 73
+    2
+ 44
+1.5
+  0
+HATCH
+  5
+C6
 100
 AcDbEntity
   8
@@ -6091,7 +6143,7 @@ ANSI31
   0
 DIMENSION
   5
-C6
+C7
 100
 AcDbEntity
   8
@@ -6153,7 +6205,7 @@ AcDbAlignedDimension
   0
 DIMENSION
   5
-C7
+C8
 100
 AcDbEntity
   8
@@ -6219,7 +6271,7 @@ AcDbRotatedDimension
   0
 DIMENSION
   5
-C8
+C9
 100
 AcDbEntity
   8
@@ -6273,11 +6325,11 @@ AcDbRadialDimension
  35
 0
  40
-23.36232490837574
+4.69852298863029e-310
   0
 DIMENSION
   5
-C9
+CA
 100
 AcDbEntity
   8
@@ -6335,7 +6387,7 @@ AcDbDiametricDimension
   0
 DIMENSION
   5
-CA
+CB
 100
 AcDbEntity
   8
@@ -6397,7 +6449,7 @@ AcDbOrdinateDimension
   0
 ARC_DIMENSION
   5
-CB
+CC
 100
 AcDbEntity
   8
@@ -6483,7 +6535,7 @@ AcDbArcDimension
   0
 XLINE
   5
-CC
+CD
 100
 AcDbEntity
   8
@@ -6509,7 +6561,7 @@ AcDbXline
   0
 RAY
   5
-CD
+CE
 100
 AcDbEntity
   8
@@ -6535,7 +6587,7 @@ AcDbRay
   0
 ACAD_TABLE
   5
-CE
+CF
 100
 AcDbEntity
   8

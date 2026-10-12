@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -182,6 +183,11 @@ public:
     /// H：句柄。ref==0 时写 0 字节句柄（code 5）。
     void writeHandle(std::uint8_t code, std::uint32_t ref)
     {
+        if (m_hdlSink != nullptr && m_mainHandle == 0) {
+            m_hdlSink->writeHandle(code, ref);
+            return;
+        }
+        if (m_mainHandle != 0) --m_mainHandle;
         std::uint8_t size = 0;
         if (ref != 0) {
             std::uint32_t t = ref;
@@ -192,17 +198,83 @@ public:
             writeRC(static_cast<std::uint8_t>((ref >> (8 * i)) & 0xFFu));
     }
 
+    /// 明确写进**数据流**的句柄（绕过句柄分流）。
+    /// 2007+ 的 header 变量流里只有 HANDSEED 一个句柄留在数据流
+    ///（读取端 drw_header.cpp 用 `buf->getHandle()` 读它），其余句柄全在独立句柄流。
+    void writeMainHandle(std::uint8_t code, std::uint32_t ref)
+    {
+        // 只在这里 ++ ：writeHandle 走进主流分支时会自减，若此处再 -- 一次，
+        // 计数会变成负数，之后 `m_mainHandle == 0` 永远不成立 —— 句柄流被整体
+        // 旁路，全部句柄写进数据流（症状：句柄流为空、控制对象全部 not found）。
+        ++m_mainHandle;
+        writeHandle(code, ref);
+    }
+
     /// 定长句柄：尾部字节数固定为 sizeBytes（高位补零）。
     /// 用于需要"等长回填"的字段（如实体 prev/next 链），装配期按位替换数值。
     void writeHandleFixed(std::uint8_t code, std::uint32_t ref, int sizeBytes)
     {
+        if (m_hdlSink != nullptr) {
+            m_hdlSink->writeHandleFixed(code, ref, sizeBytes);
+            return;
+        }
         writeRC(static_cast<std::uint8_t>((code << 4) | (sizeBytes & 0x0F)));
         for (int i = sizeBytes - 1; i >= 0; --i)
             writeRC(static_cast<std::uint8_t>((ref >> (8 * i)) & 0xFFu));
     }
 
     /// TV/T：R2000 文本 = BS 长度（不含结尾 \0）+ 按文件代码页编码的字节
+    ///
+    /// 2007+（AC1021 及以上）文本改为**独立字符串流**：读取端
+    ///（drw_entities.cpp / drw_objects.cpp 的 `version > AC1018` 分支）用
+    /// objSize-1 位上的标志把字符串缓冲区定位到对象末尾的字符串区，再按
+    /// `getVariableText`（= `getUCSText`：BS 字符数 + UTF-16LE）逐个读。
+    /// 因此 2007+ 下本函数把内容写进 setStringSink() 指定的字符串流
+    ///（顺序即读取端的读取顺序），由装配方追加到数据流之后。
     void writeT(const std::string& utf8, DRW_TextCodec& codec);
+
+    /// TU：BS 字符数 + UTF-16LE 码元（读取端 dwgBuffer::getUCSText 的对偶）。
+    /// 长度为**字符数**（UTF-16 码元数），不是字节数——写成字节数会让读取端
+    /// 按 2 倍长度去读，紧随其后的所有字段整体错位。
+    void writeUCS(const std::string& utf8);
+
+    /// 2007+ 的字符串流：writeT 依据 codec 版本自动分流到这里（懒创建）。
+    /// 装配方用 stringBits() / stringStream() 把它追加到数据流之后。
+    dwgBitWriter* ensureStringSink()
+    {
+        if (!m_ownedSink) m_ownedSink.reset(new dwgBitWriter());
+        return m_ownedSink.get();
+    }
+    const dwgBitWriter* stringStream() const { return m_ownedSink.get(); }
+    std::size_t stringBits() const { return m_ownedSink ? m_ownedSink->bitPosition() : 0; }
+
+    /// 2007+ 的句柄分流目标：非空时 writeHandle / writeHandleFixed 写入该流。
+    /// header 变量流在 2007+ 走「独立句柄流」，起点由 RL bitSize 给出
+    ///（读取端 drw_header.cpp 把 hBbuf 定位到节内 160+bitSize 位）。
+    void setHandleSink(dwgBitWriter* sink) { m_hdlSink = sink; }
+    dwgBitWriter* handleSink() const { return m_hdlSink; }
+
+    /// 按位追加另一个写入器已写好的内容（字符串流并入主流时使用）。
+    void appendBitsFrom(const dwgBitWriter& other)
+    {
+        for (std::size_t i = 0; i < other.m_bitPos; ++i)
+            writeB(other.bitAt(i));
+    }
+
+    /// 位区间追加（把已写好的句柄流搬到字符串区之后用）。
+    void appendBitsRange(const dwgBitWriter& other, std::size_t from, std::size_t to)
+    {
+        for (std::size_t i = from; i < to; ++i)
+            writeB(other.bitAt(i));
+    }
+
+    /// 读取指定位（越界返回 false）。
+    bool bitAt(std::size_t pos) const
+    {
+        const std::size_t byteIdx = pos >> 3;
+        if (byteIdx >= buf.size()) return false;
+        return (buf[byteIdx] & (0x80 >> (pos & 7))) != 0;
+    }
 
     /// 补 0 到字节边界
     void padToByte() { while (m_bitPos & 7) writeB(false); }
@@ -220,12 +292,26 @@ private:
         for (int i = nbits - 1; i >= 0; --i) {
             const std::size_t byteIdx = m_bitPos >> 3;
             if (buf.size() <= byteIdx) buf.resize(byteIdx + 1, 0);
+            const std::uint8_t mask = static_cast<std::uint8_t>(0x80 >> (m_bitPos & 7));
+            // 逐位**改写**（置位与清位都做）。只置位会让「回退覆盖」写失败：
+            // 装配 2007+ 的字符串区时要先把游标退回数据区末尾重写，
+            // 若旧位不被清除，新值与旧值按位或在一起（实测：写 32 读回 41632）。
             if ((value >> i) & 1u)
-                buf[byteIdx] |= static_cast<std::uint8_t>(0x80 >> (m_bitPos & 7));
+                buf[byteIdx] |= mask;
+            else
+                buf[byteIdx] = static_cast<std::uint8_t>(buf[byteIdx] & ~mask);
             ++m_bitPos;
         }
     }
 
+    /// 2007+ 的字符串流（懒创建；writeT 按 codec 版本分流）
+    std::unique_ptr<dwgBitWriter> m_ownedSink;
+    /// 2007+ 的句柄分流目标（非空时 writeHandle/writeHandleFixed 都写它）
+    dwgBitWriter* m_hdlSink = nullptr;
+    /// >0 时把接下来的 N 次 writeHandle 强制写进主流（writeMainHandle 用）
+    int m_mainHandle = 0;
+
+private:
     std::vector<std::uint8_t> buf;
     std::size_t m_bitPos = 0;
 };

@@ -87,16 +87,18 @@ void dwgRSCodec::decode251I(unsigned char *in, unsigned char *out, duint32 blk){
 
 duint32 dwgCompressor::twoByteOffset(duint32 *ll){
     duint32 cont = 0;
-    duint8 fb = bufC[pos++];
-    cont = (fb >> 2) | (bufC[pos++] << 6);
+    // 指令解析的取字节一律先判 sizeC：压缩缓冲区是按 csize 精确分配的
+    //（dwgReader18::parseDataPage 的 cData），越界读同样是不允许的。
+    duint8 fb = (pos < sizeC) ? bufC[pos++] : 0;
+    cont = (fb >> 2) | (((pos < sizeC) ? bufC[pos++] : 0) << 6);
     *ll = (fb & 0x03);
     return cont;
 }
 
 duint32 dwgCompressor::longCompressionOffset(){
     duint32 cont = 0;
-    duint8 ll = bufC[pos++];
-    while (ll == 0x00){
+    duint8 ll = (pos < sizeC) ? bufC[pos++] : 0;
+    while (ll == 0x00 && pos < sizeC){
         cont += 0xFF;
         ll = bufC[pos++];
     }
@@ -107,8 +109,8 @@ duint32 dwgCompressor::longCompressionOffset(){
 duint32 dwgCompressor::long20CompressionOffset(){
 //    duint32 cont = 0;
     duint32 cont = 0x0F;
-    duint8 ll = bufC[pos++];
-    while (ll == 0x00){
+    duint8 ll = (pos < sizeC) ? bufC[pos++] : 0;
+    while (ll == 0x00 && pos < sizeC){
 //        cont += 0xFF;
         ll = bufC[pos++];
     }
@@ -118,7 +120,7 @@ duint32 dwgCompressor::long20CompressionOffset(){
 
 duint32 dwgCompressor::litLength18(){
     duint32 cont=0;
-    duint8 ll = bufC[pos++];
+    duint8 ll = (pos < sizeC) ? bufC[pos++] : 0;
     //no literal length, this byte is next opCode
     if (ll > 0x0F) {
         pos--;
@@ -127,8 +129,8 @@ duint32 dwgCompressor::litLength18(){
 
     if (ll == 0x00) {
         cont = 0x0F;
-        ll = bufC[pos++];
-        while (ll == 0x00){//repeat until ll != 0x00
+        ll = (pos < sizeC) ? bufC[pos++] : 0;
+        while (ll == 0x00 && pos < sizeC){//repeat until ll != 0x00
             cont +=0xFF;
             ll = bufC[pos++];
         }
@@ -141,7 +143,7 @@ duint32 dwgCompressor::litLength18(){
 void dwgCompressor::decompress18(duint8 *cbuf, duint8 *dbuf, duint32 csize, duint32 dsize){
     bufC = cbuf;
     bufD = dbuf;
-    sizeC = csize -2;
+    sizeC = (csize >= 2) ? csize - 2 : 0;      // 小于 2 字节的流不应存在，防无符号下溢
     sizeD = dsize;
     DRW_DBG("dwgCompressor::decompress, last 2 bytes: ");
     DRW_DBGH(bufC[sizeC]);DRW_DBGH(bufC[sizeC+1]);DRW_DBG("\n");
@@ -155,6 +157,11 @@ void dwgCompressor::decompress18(duint8 *cbuf, duint8 *dbuf, duint32 csize, duin
     rpos=0; //current position in resulting decompresed buffer
     litCount = litLength18();
     //copy first lileral lenght
+    //  首段字面量与 decompress21 一样必须双向截断：超出目标尺寸会写穿 bufD，
+    //  超出压缩流会读穿 bufC。真实文件末尾的字面量 run 可能长过本节尺寸。
+    if (litCount > sizeD) litCount = sizeD;
+    if (pos >= sizeC) litCount = 0;
+    else if (litCount > sizeC - pos) litCount = sizeC - pos;
     for (duint32 i=0; i < litCount; ++i) {
         bufD[rpos++] = bufC[pos++];
     }
@@ -200,17 +207,25 @@ void dwgCompressor::decompress18(duint8 *cbuf, duint8 *dbuf, duint32 csize, duin
             return; //fails, not valid
         }
         //copy "compresed data", TODO Needed verify out of bounds
-        duint32 remaining = sizeD - (litCount+rpos);
-        if (remaining < compBytes){
-            compBytes = remaining;
+        // 匹配段与随后字面量共同占用本节剩余空间：litCount 可能已超过剩余量
+        //（真实文件末尾 run），此前用 sizeD - (litCount+rpos) 会无符号下溢成
+        // 极大值，compBytes 不再被截断，匹配段随即写穿 bufD。
+        duint32 avail = (rpos < sizeD) ? (sizeD - rpos) : 0;
+        duint32 litKeep = (litCount < avail) ? litCount : avail;
+        duint32 roomForMatch = avail - litKeep;
+        if (roomForMatch < compBytes){
+            compBytes = roomForMatch;
             DRW_DBG("WARNING dwgCompressor::decompress, bad compBytes size, Cpos: ");
             DRW_DBG(pos);DRW_DBG(", Dpos: ");DRW_DBG(rpos);DRW_DBG("\n");
         }
-        for (duint32 i=0, j= rpos - compOffset -1; i < compBytes; i++) {
+        // 回溯距离可能大于已输出长度（损坏数据 / 截断流）：夹住 j 的下界，
+        // 否则 j 会下溢成极大值，从 bufD 之外读数据。
+        duint32 back = (rpos > compOffset + 1) ? (compOffset + 1) : rpos;
+        for (duint32 i=0, j= rpos - back; i < compBytes; i++) {
             bufD[rpos++] = bufD[j++];
         }
         //copy "uncompresed data", TODO Needed verify out of bounds
-        for (duint32 i=0; i < litCount; i++) {
+        for (duint32 i=0; i < litCount && rpos < sizeD && pos < sizeC; i++) {
             bufD[rpos++] = bufC[pos++];
         }
     }
@@ -234,20 +249,30 @@ void dwgCompressor::decrypt18Hdr(duint8 *buf, duint32 size, duint32 offset){
         *pHdr++ ^= secMask;
 }*/
 
-duint32 dwgCompressor::litLength21(duint8 *cbuf, duint8 oc, duint32 *si){
+duint32 dwgCompressor::litLength21(duint8 *cbuf, duint8 oc, duint32 *si, duint32 csize){
 
     duint32 srcIndex=*si;
 
     duint32 length = oc + 8;
     if (length == 0x17) {
-        duint32 n = cbuf[srcIndex++];
-        length += n;
-        if (n == 0xff) {
-            do {
-                n = cbuf[srcIndex++];
-                n |= (duint32)(cbuf[srcIndex++] << 8);
-                length += n;
-            } while (n == 0xffff);
+        // 读取长度扩展字节。真实文件的压缩流末尾可能被截断（末段字面量 run
+        // 声明得比剩余数据更长），这里必须先判 csize，否则会读穿压缩缓冲区。
+        if (srcIndex < csize) {
+            duint32 n = cbuf[srcIndex++];
+            length += n;
+            if (n == 0xff) {
+                do {
+                    if (srcIndex + 1 >= csize) {
+                        srcIndex = csize;
+                        break;
+                    }
+                    n = cbuf[srcIndex++];
+                    n |= (duint32)(cbuf[srcIndex++] << 8);
+                    length += n;
+                } while (n == 0xffff);
+            }
+        } else {
+            srcIndex = csize;
         }
     }
 
@@ -270,13 +295,31 @@ void dwgCompressor::decompress21(duint8 *cbuf, duint8 *dbuf, duint32 csize, duin
 
     while (srcIndex < csize && (dstIndex < dsize+1)){//dstIndex < dsize to prevent crash more robust are needed
         if (length == 0)
-            length = litLength21(cbuf, opCode, &srcIndex);
+            length = litLength21(cbuf, opCode, &srcIndex, csize);
+        // 字面量 run 必须双向截断：
+        //   · 目标侧：真实文件的最后一个字面量 run 可以长过本页 uSize（编码器
+        //     压缩的是对齐后的缓冲）。实测浩辰 R2007 的 Header 页即如此：605
+        //     字节的节被写到第 606 字节 —— Release 下直接段错误，ASan 报
+        //     heap-buffer-overflow。多出来的字节本就不属于本节，丢弃即可。
+        //   · 源侧：run 声明的长度也可能超过压缩流剩余长度（截断/损坏文件）。
+        if (length > dsize - dstIndex) {
+            DRW_DBG("\nWARNING dwgCompressor::decompress21 => 字面量 run 超出目标剩余，已截断。");
+            length = dsize - dstIndex;
+        }
+        if (length > csize - srcIndex) {
+            DRW_DBG("\nWARNING dwgCompressor::decompress21 => 字面量 run 超出压缩流剩余，已截断。");
+            length = csize - srcIndex;
+        }
+        if (length == 0)
+            break;                              // 无可复制内容：收敛退出，避免死循环
         copyCompBytes21(cbuf, dbuf, length, srcIndex, dstIndex);
         srcIndex += length;
         dstIndex += length;
         if (dstIndex >=dsize) break; //check if last chunk are compresed & terminate
 
         length = 0;
+        if (srcIndex >= csize)
+            break;                              // 流已结束：不再读操作码
         opCode = cbuf[srcIndex++];
         readInstructions21(cbuf, &srcIndex, &opCode, &sourceOffset, &length);
         while (true) {

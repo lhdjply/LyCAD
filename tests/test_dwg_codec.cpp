@@ -141,8 +141,10 @@ void TestDwgCodec::dwgWriteVersionIsSelectable()
     const QStringList versions = WriteOptions::availableDwgVersions();
     QVERIFY(versions.contains(QStringLiteral("AC1015")));
     QVERIFY(versions.contains(QStringLiteral("AC1018")));
+    QVERIFY(versions.contains(QStringLiteral("AC1021")));
     QVERIFY(versions.contains(WriteOptions::defaultDwgVersion()));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1018")));
+    QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1021")));
     QVERIFY(!WriteOptions::isWritableDwgVersion(QStringLiteral("AC1032")));
 
     Document document;
@@ -160,6 +162,18 @@ void TestDwgCodec::dwgWriteVersionIsSelectable()
     QFile file(path);
     QVERIFY(file.open(QIODevice::ReadOnly));
     QCOMPARE(file.read(6), QByteArray("AC1018"));
+    file.close();
+
+    // 选 AC1021（R2007）同样必须落到签名上：它走的是 RS 纠错 + 分页容器，
+    // 与 R2004 的 LZ77 分页容器是两条不同的写出路径，各自都要能被选中并生效。
+    const QString path2007 = m_dir.filePath(QStringLiteral("v2007.dwg"));
+    options.dwgVersion = QStringLiteral("AC1021");
+    const IoResult result2007 = CadFile::save(path2007, document, options);
+    QVERIFY2(result2007.ok, qPrintable(result2007.error));
+
+    QFile file2007(path2007);
+    QVERIFY(file2007.open(QIODevice::ReadOnly));
+    QCOMPARE(file2007.read(6), QByteArray("AC1021"));
 }
 
 void TestDwgCodec::nativeReadWriteRoundTrip()
@@ -182,7 +196,7 @@ void TestDwgCodec::nativeReadWriteRoundTrip()
     QFile file(dwgPath);
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray content = file.readAll();
-    QCOMPARE(content.left(6), QByteArray("AC1018"));   // 默认写出版本 AC1018/R2004
+    QCOMPARE(content.left(6), QByteArray("AC1021"));   // 默认写出版本 AC1021/R2007
     QVERIFY2(!content.contains("ENTITIES"), "DWG 应是二进制格式，而不是 DXF 文本");
 
     // 走出原生写出时应在提示中说明，便于用户追溯

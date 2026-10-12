@@ -39,7 +39,7 @@ public:
 
 private:
     duint32 litLength18();
-    static duint32 litLength21(duint8 *cbuf, duint8 oc, duint32 *si);
+    static duint32 litLength21(duint8 *cbuf, duint8 oc, duint32 *si, duint32 csize);
     static void copyCompBytes21(duint8 *cbuf, duint8 *dbuf, duint32 l, duint32 si, duint32 di);
     static void readInstructions21(duint8 *cbuf, duint32 *si, duint8 *oc, duint32 *so, duint32 *l);
 
