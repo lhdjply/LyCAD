@@ -135,12 +135,32 @@ target_compile_options(lycad_dxfrw PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w>
     $<$<CXX_COMPILER_ID:MSVC>:/w>)
 
+# iconv：intern/drw_textcodec.cpp 用它做文本编码转换（DWG/DXF 的代码页 → UTF-8）。
+#   · glibc / macOS 把 iconv 放在 C 库里，Iconv::Iconv 是个空的 INTERFACE 目标；
+#   · Windows 没有自带 iconv，得靠 MSYS2 的 libiconv（包名 libiconv）——
+#     不链接的话，链接期报 `undefined reference to 'libiconv_open'`
+#     （GNU libiconv 的头文件把 iconv_open 宏映射成 libiconv_open，符号名带前缀）。
+# Windows 上找不到就直接失败：这条依赖缺了必然链接不过，配置期报错比链接期清楚；
+# 本仓库的 Windows 构建只支持 MinGW，MSVC 侧取不到 iconv.h，也会走到这条报错。
 find_package(Iconv QUIET)
+if(WIN32 AND NOT Iconv_FOUND)
+    message(FATAL_ERROR
+        "Windows 上找不到 iconv，而 drw_textcodec.cpp 需要它（缺了链接期会报 libiconv_open 未定义）。\n"
+        "  MinGW（MSYS2）：pacboy libiconv:p\n"
+        "  注：本仓库的 Windows 构建只支持 MinGW，MSVC 侧没有可链接的 iconv。")
+endif()
 if(Iconv_FOUND)
     target_link_libraries(lycad_dxfrw PRIVATE Iconv::Iconv)
 endif()
 
-set(LYCAD_DXFRW_OBJECTS "$<TARGET_OBJECTS:lycad_dxfrw>")
+# 消费 libdxfrw 对象的方式：target_link_libraries(<目标> PRIVATE lycad_dxfrw)
+#
+# 不要改成把 $<TARGET_OBJECTS:lycad_dxfrw> 塞进 add_executable 的源码列表：
+# 那个写法只把 .o 放进链接行，**不携带**本目标的使用要求（CMake 文档
+# 「Linking Object Libraries via $<TARGET_OBJECTS>」一节写明了这点），
+# 上面挂的 PRIVATE 依赖 Iconv::Iconv 就会丢。Linux/macOS 上 iconv 在 libc 里，
+# 丢了也看不出来；Windows/MinGW 上表现为链接期 libiconv_open 未定义。
+# 链接目标本身则两者都给：对象文件 + 使用要求（PRIVATE 依赖以 $<LINK_ONLY:> 传递）。
 set(LYCAD_DXFRW_INCLUDES
     "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src"
     "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src/intern")
@@ -154,12 +174,11 @@ add_executable(lycad
     src/main.cpp
     ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
-    ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad PRIVATE "${LYCAD_SRC_ROOT}")
 # libdxfrw 头文件以 SYSTEM 引入：其自带告警与本项目无关，交给编译器忽略
 target_include_directories(lycad SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
-target_link_libraries(lycad PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
+target_link_libraries(lycad PRIVATE lycad_dxfrw ${LYCAD_QT_LIBS} LyCAD::Warnings)
 
 set_target_properties(lycad PROPERTIES
     AUTORCC          ON

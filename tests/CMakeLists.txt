@@ -7,7 +7,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 
 function(lycad_add_test target source)
     add_executable(${target} EXCLUDE_FROM_ALL
-        ${source} ${LYCAD_HEADLESS_SOURCES} ${LYCAD_DXFRW_OBJECTS})
+        ${source} ${LYCAD_HEADLESS_SOURCES})
     # 函数内 set 是局部作用域，函数返回即丢；用全局属性收集目标清单
     set_property(GLOBAL APPEND PROPERTY LYCAD_TEST_TARGETS ${target})
     target_include_directories(${target} PRIVATE "${LYCAD_SRC_ROOT}")
@@ -16,7 +16,7 @@ function(lycad_add_test target source)
     target_compile_definitions(${target} PRIVATE
         LYCAD_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     target_link_libraries(${target}
-        PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test LyCAD::Warnings)
+        PRIVATE lycad_dxfrw Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test LyCAD::Warnings)
     add_test(NAME ${target} COMMAND ${target})
     set_tests_properties(${target} PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

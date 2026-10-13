@@ -186,32 +186,6 @@ jobs:
           $deploy_tool "$bin_dir/$exe" $options || { echo "::error::windeployqt 部署 $exe 失败"; exit 1; }
         done
 
-    - name: 校验 Qt 依赖已部署齐全
-      run: |
-        bin_dir="build/${{ env.APP_NAME }}/bin"
-        exe="$bin_dir/${{ env.APP_NAME }}.exe"
-
-        # exe 导入表里的 Qt6*.dll 必须都在 bin/ 下。被 --no-<模块> 关掉的模块
-        # 属于"成功地没部署"，退出码照样是 0，只能这样查。
-        missing=0
-        for dll in $(objdump -p "$exe" | awk '/DLL Name:/ {print $3}'); do
-          case "$dll" in
-            Qt6*)
-              if [ ! -f "$bin_dir/$dll" ]; then
-                echo "::error::$dll 没有部署，但它在 ${{ env.APP_NAME }}.exe 的导入表里"
-                missing=1
-              fi
-              ;;
-          esac
-        done
-
-        if [ "$missing" -ne 0 ]; then
-          ls -la "$bin_dir" || true
-          exit 1
-        fi
-
-        ls "$bin_dir"/Qt6*.dll
-          
     - name: 复制非 Qt 的 DLL
       run: |
         shopt -s extglob
@@ -221,7 +195,36 @@ jobs:
             cp -r "$file" build/${{ env.APP_NAME }}/bin
           fi
         done
-            
+
+    - name: 校验依赖已部署齐全
+      run: |
+        bin_dir="build/${{ env.APP_NAME }}/bin"
+        exe="$bin_dir/${{ env.APP_NAME }}.exe"
+        sys_bin="/${{ matrix.config.msystem }}/bin"
+
+        # 判据：exe 导入表里的每个 DLL，只要 MSYS2 的 bin 下有同名文件，就说明它
+        # 不是系统 DLL（KERNEL32.dll 之类不在那里），必须也躺在 bin/ 下。
+        # 这样 Qt6*.dll 与 libiconv-2.dll 一并覆盖，不需要维护系统 DLL 白名单。
+        # 另：被 --no-<模块> 关掉的模块对 windeployqt 而言属于「成功地没部署」，
+        # 退出码照样是 0，只能靠这里查。
+        missing=0
+        for dll in $(objdump -p "$exe" | awk '/DLL Name:/ {print $3}'); do
+          if [ -f "$sys_bin/$dll" ] && [ ! -f "$bin_dir/$dll" ]; then
+            echo "::error::$dll 是 MSYS2 提供的依赖，却没有被放进 bin/"
+            missing=1
+          fi
+        done
+
+        if [ "$missing" -ne 0 ]; then
+          ls -la "$bin_dir" || true
+          exit 1
+        fi
+
+        echo "非 Qt 依赖："
+        ls "$bin_dir" | grep -v '^Qt6' || true
+        echo "Qt6 依赖："
+        ls "$bin_dir"/Qt6*.dll
+
     - name: 打包为 zip
       run: |
         cd build/${{ env.APP_NAME }}

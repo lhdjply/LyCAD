@@ -7,11 +7,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
 add_executable(lycad_sample_generator EXCLUDE_FROM_ALL
     sample_generator.cpp
     ${LYCAD_CORE_IO_SOURCES}
-    ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad_sample_generator PRIVATE "${LYCAD_SRC_ROOT}")
 target_include_directories(lycad_sample_generator SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
-target_link_libraries(lycad_sample_generator PRIVATE Qt6::Core Qt6::Gui LyCAD::Warnings)
+target_link_libraries(lycad_sample_generator
+    PRIVATE lycad_dxfrw Qt6::Core Qt6::Gui LyCAD::Warnings)
 # 样例默认写入仓库的 sample/ 目录：由构建系统注入绝对路径，
 # 生成器在任何工作目录下运行都能落到同一处（可用命令行参数覆盖）。
 target_compile_definitions(lycad_sample_generator PRIVATE
@@ -21,11 +21,10 @@ add_executable(lycad_icon_sheet EXCLUDE_FROM_ALL
     icon_sheet.cpp
     ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
-    ${LYCAD_DXFRW_OBJECTS}
 )
 target_include_directories(lycad_icon_sheet PRIVATE "${LYCAD_SRC_ROOT}")
 target_include_directories(lycad_icon_sheet SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
-target_link_libraries(lycad_icon_sheet PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
+target_link_libraries(lycad_icon_sheet PRIVATE lycad_dxfrw ${LYCAD_QT_LIBS} LyCAD::Warnings)
 set_target_properties(lycad_icon_sheet PROPERTIES AUTORCC ON)
 
 # 界面快照需要 QTest 注入鼠标事件
@@ -36,12 +35,11 @@ if(TARGET Qt6::Test)
         ui_snapshot.cpp
         ${LYCAD_SOURCES}
         ${LYCAD_RESOURCES}
-        ${LYCAD_DXFRW_OBJECTS}
     )
     target_include_directories(lycad_ui_snapshot PRIVATE "${LYCAD_SRC_ROOT}")
     target_include_directories(lycad_ui_snapshot SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
     target_link_libraries(lycad_ui_snapshot
-        PRIVATE ${LYCAD_QT_LIBS} Qt6::Test LyCAD::Warnings)
+        PRIVATE lycad_dxfrw ${LYCAD_QT_LIBS} Qt6::Test LyCAD::Warnings)
     set_target_properties(lycad_ui_snapshot PROPERTIES AUTORCC ON)
 endif()
 

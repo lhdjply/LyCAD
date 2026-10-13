@@ -76,6 +76,12 @@ VS 工程、文档全部不随仓库分发，由根构建脚本把它的源码�
 （它有自己的书写风格，上百条告警会把真正的问题淹没），而 CMake 的「源文件属性」
 只在同一目录内可见，`tools/` 与 `tests/` 下的目标读不到在根目录设的属性。
 
+消费这个对象库的方式是 `target_link_libraries(<目标> PRIVATE lycad_dxfrw)`，
+**不要**改成把 `$<TARGET_OBJECTS:lycad_dxfrw>` 塞进 `add_executable` 的源码清单：
+后者只把 `.o` 放进链接行，不带这个目标的使用要求，挂在它上面的依赖（Windows 的
+`Iconv::Iconv`）就丢了——Linux/macOS 的 iconv 在 libc 里，丢了看不出来，
+只有 MinGW 会以 `undefined reference to 'libiconv_open'` 的形式报出来。
+
 **依赖方向严格单向，无循环：**
 
 ```
@@ -805,9 +811,11 @@ debuild -us -uc                                     # 产物落在仓库的上�
 
 Windows 侧统一走 **MSYS2 / MinGW** 而不是 MSVC：DWG 的文本编码转换依赖 iconv
 （`third-party/libdxfrw-modify/src/intern/drw_textcodec.cpp`），MSVC 侧没有现成的
-iconv 可链接。Windows 产物有两种形态：`zip` 解压即用；`setup.exe` 由 Inno Setup 6
-编译 `resources/win/lycad.iss` 得到（带 `resources/win/ChineseSimplified.isl` 简体中文
-语言包，要求 Inno Setup 6.5.0+；CI 里若缺 Inno 会自行安装）。
+iconv 可链接，MinGW 侧由 MSYS2 的 libiconv 提供（链接期 `-liconv`，运行时需要
+`libiconv-2.dll`，打包时会随 `bin/` 一起带走）。Windows 产物有两种形态：`zip`
+解压即用；`setup.exe` 由 Inno Setup 6 编译 `resources/win/lycad.iss` 得到（带
+`resources/win/ChineseSimplified.isl` 简体中文语言包，要求 Inno Setup 6.5.0+；
+CI 里若缺 Inno 会自行安装）。
 
 ---
 

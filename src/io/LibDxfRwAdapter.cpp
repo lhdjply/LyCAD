@@ -2333,15 +2333,12 @@ void applyEdaLayerColorHeuristic(Document& document, IoResult* result)
     // 未携带颜色的 EDA 导出文件，避免对普通图纸过度干预
     std::vector<std::pair<Layer*, int>> pending;
     int matched = 0;
-    int colored = 0;
 
     for (Layer& layer : document.layers().all()) {
         if (const int aci = heuristicEdaColor(layer.name()); aci > 0) {
             ++matched;
-            if (layer.colorIndex() != 7) {
-                ++colored;      // 已有显式颜色，不覆盖
-                continue;
-            }
+            // 已有显式颜色（非索引 7）的图层不覆盖，只计入命中数
+            if (layer.colorIndex() != 7) continue;
             pending.emplace_back(&layer, aci);
         }
     }
