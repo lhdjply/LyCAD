@@ -383,13 +383,15 @@ std::vector<std::uint8_t> buildObjFreeSpacePayload(std::uint32_t handleCount,
     return d;
 }
 
-/// AcDb:AuxHeader（段 10，119 字节）：版本/保存次数/时间戳/HANDSEED。
+/// AcDb:AuxHeader（段 10）：版本/保存次数/时间戳/HANDSEED。
 /// 结构与真实文件逐字节一致：0xFF 0x77 0x01 引导，两遍版本号，
 /// 0x0005/0x0893 常量对，TDCREATE/TDUPDATE/HANDSEED 与保存计数。
+/// 长度：AC1018~AC1027 = 119 字节；AC1032（R2018）再 +6 字节（见函数尾注）。
 std::vector<std::uint8_t> buildAuxHeaderPayload(std::uint32_t tdDay,
                                                 std::uint32_t tdMsec,
                                                 std::uint32_t handSeed,
-                                                std::uint16_t internalVer)
+                                                std::uint16_t internalVer,
+                                                bool r2018)
 {
     const std::uint16_t kInternalVer = internalVer;
     constexpr std::uint32_t kNumSaves = 1;       // 保存次数（新建即 1）
@@ -419,6 +421,15 @@ std::vector<std::uint8_t> buildAuxHeaderPayload(std::uint32_t tdDay,
     for (int i = 0; i < 3; ++i) putU32(d, 0);
     putU32(d, kNumSaves);
     for (int i = 0; i < 4; ++i) putU32(d, 0);
+    // R2018+：尾部再 3 个 RS（6 字节）——libredwg auxheader.spec 的
+    //   SINCE (R_2018) { FIELD_VECTOR_INL (zero_18, RS, 3, 0); }
+    // R2004~R2013 无这三个字段。漏写会让本段比规格少 6 字节，严格读取端按
+    // 段长/后续哨兵校验即判文件损坏。
+    if (r2018) {
+        putU16(d, 0);
+        putU16(d, 0);
+        putU16(d, 0);
+    }
     return d;
 }
 
@@ -686,12 +697,16 @@ bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver)
     // libredwg 的 decode.c 也是把 R2010 及以后交给 decode_R2004（注释写着
     // "for 2004 and 2010+"），而 R2007 走的是另一套 decode_R2007。
     // 故这里只需按版本取标识与常量。
-    const bool r2010 = (ver > DRW::AC1018);        // 2010+（含 2013）
+    const bool r2010 = (ver > DRW::AC1018);        // 2010+（含 2013/2018）
     const bool r2013 = (ver >= DRW::AC1027);       // 2013+
-    const char* const versionStr = r2013 ? "AC1027" : (r2010 ? "AC1024" : "AC1018");
+    const bool r2018 = (ver >= DRW::AC1032);       // 2018+
+    const char* const versionStr = r2018 ? "AC1032"
+                                : r2013 ? "AC1027"
+                                : r2010 ? "AC1024" : "AC1018";
     // 内部版本号：与 libredwg 版本表的 dwg_version 一致（R2004 = 0x19 = 25、
-    // R2010 = 0x1d = 29、R2013 = 0x1f = 31）。R2004 沿用本实现既有的 25。
-    const std::uint16_t internalVer = r2013 ? 31 : (r2010 ? 29 : 25);
+    // R2010 = 0x1d = 29、R2013 = 0x1f = 31、R2018 = 0x21 = 33）。
+    // R2004 沿用本实现既有的 25。
+    const std::uint16_t internalVer = r2018 ? 33 : r2013 ? 31 : r2010 ? 29 : 25;
 
     dwgW::SectionData sd;
     if (!writer.buildSections(iface, ver, sd))
@@ -871,7 +886,7 @@ bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver)
     addSection(1,  "AcDb:Template",     buildTemplatePayload(sd.measurement));
     addSection(7,  "AcDb:Handles",      std::move(handlesPayload));
     addSection(9,  "AcDb:Classes",      std::move(classesPayload));
-    addSection(10, "AcDb:AuxHeader",    buildAuxHeaderPayload(sd.tdDay, sd.tdMsec, sd.nextHandle, internalVer));
+    addSection(10, "AcDb:AuxHeader",    buildAuxHeaderPayload(sd.tdDay, sd.tdMsec, sd.nextHandle, internalVer, r2018));
     addSection(6,  "AcDb:Header",       std::move(headerPayload));
 
     // ---- 1.5 为预览容器定址并重建其载荷 ------------------------------------------
@@ -1024,14 +1039,17 @@ bool writeAs(dwgW& writer, DRW_Interface* iface, DRW::Version ver)
                     reinterpret_cast<const std::uint8_t*>(versionStr) + 6);
         for (int i = 0; i < 5; ++i) meta.push_back(0x00);
         // 维护版本（0x0B）与写出版本（0x11/0x12）。AC1018 沿用本实现既有取值；
-        // AC1024 取 libredwg 版本表的权威值（maint_rel_version / dwg_version
-        // = 0x6d / 0x1d）、AC1027 取 0x7d / 0x1f，该表同时被 libredwg 的
-        // header.spec 用来解读文件头。
-        meta.push_back(r2013 ? 0x7d : (r2010 ? 0x6d : 0x00));   // maintenance version
+        // AC1024 / AC1027 / AC1032 取 libredwg 版本表的权威值
+        //（maint_rel_version / dwg_version）：
+        //     R2010 → 0x6d / 0x1d      R2013 → 0x7d / 0x1f      R2018 → 0x1d / 0x21
+        // 该表同时被 libredwg 的 header.spec 用来解读文件头。
+        // 注意 R2018 的 maint_rel_version 回落到 0x1d（仍 > 3，满足
+        // 「2010+ 高位尺寸字段」的判定条件）。
+        meta.push_back(r2018 ? 0x1d : r2013 ? 0x7d : (r2010 ? 0x6d : 0x00));   // maintenance version
         meta.push_back(0x03);                       // byte 0x0C
         putU32(meta, previewAddr);                  // 预览图数据地址（页头后 0x20）
-        meta.push_back(r2013 ? 0x1f : (r2010 ? 0x1d : 0x21));   // app dwg version
-        meta.push_back(r2013 ? 0x1f : (r2010 ? 0x1d : 0x00));   // app maintenance version
+        meta.push_back(r2018 ? 0x21 : r2013 ? 0x1f : (r2010 ? 0x1d : 0x21));   // app dwg version
+        meta.push_back(r2018 ? 0x21 : r2013 ? 0x1f : (r2010 ? 0x1d : 0x00));   // app maintenance version
         putU16(meta, sd.codepageId);                // codepage
         for (int i = 0; i < 3; ++i) meta.push_back(0x00);
         putU32(meta, 0);                            // security flags

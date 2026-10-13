@@ -87,16 +87,16 @@ QStringList WriteOptions::availableDxfVersions()
 QStringList WriteOptions::availableDwgVersions()
 {
     return { QStringLiteral("AC1015"), QStringLiteral("AC1018"), QStringLiteral("AC1021"),
-             QStringLiteral("AC1024"), QStringLiteral("AC1027") };
+             QStringLiteral("AC1024"), QStringLiteral("AC1027"), QStringLiteral("AC1032") };
 }
 
 QString WriteOptions::defaultDwgVersion()
 {
-    // AC1027（AutoCAD 2013 / R2013）：与 R2004 / R2010 同族容器（0x80 加密文件头 +
-    // 页/段映射 + 分页），版本常量取 libredwg 版本表权威值（0x0B=0x7d / 0x11=0x1f）。
-    // 较之 AC1024 更贴近现代 CAD 的默认保存版本。
+    // AC1032（AutoCAD 2018 / R2018）：与 R2004 / R2010 / R2013 同族容器
+    //（0x80 加密文件头 + 页/段映射 + 分页），版本常量取 libredwg 版本表权威值
+    //（0x0B=0x1d / 0x11=0x21）。支持度最高的档位，实体集完整。
     // 必须与 WriteOptions::dwgVersion 的初值保持一致。
-    return QStringLiteral("AC1027");
+    return QStringLiteral("AC1032");
 }
 
 QString WriteOptions::dwgVersionShortName(const QString& version)
@@ -111,6 +111,8 @@ QString WriteOptions::dwgVersionShortName(const QString& version)
         return QStringLiteral("AutoCAD 2010");
     if (version.compare(QStringLiteral("AC1027"), Qt::CaseInsensitive) == 0)
         return QStringLiteral("AutoCAD 2013");
+    if (version.compare(QStringLiteral("AC1032"), Qt::CaseInsensitive) == 0)
+        return QStringLiteral("AutoCAD 2018");
     return version;
 }
 

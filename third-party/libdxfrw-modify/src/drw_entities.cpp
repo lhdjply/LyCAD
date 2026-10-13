@@ -2384,6 +2384,14 @@ bool DRW_MText::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
             buf->getBitLong();
         }
     }
+    // 2018+：一个「非注释性」位（libredwg dwg.spec 的
+    // `SINCE (R_2018) FIELD_B (is_not_annotative, 0)`；为真时其后跟一整块
+    // AnnotScaleObject 字段）。本实现按普通多行文字处理。
+    // 必须与写出端对称：漏读会让公共句柄段整体错 1 位、文字样式句柄读错。
+    if (version >= DRW::AC1032) {//2018+
+        duint8 isNotAnnotative = buf->getBit();
+        DRW_DBG("\nis_not_annotative: "); DRW_DBG(isNotAnnotative); DRW_DBG("\n");
+    }
 
     /* Common Entity Handle Data */
     ret = DRW_Entity::parseDwgEntHandle(version, buf);

@@ -144,12 +144,15 @@ void TestDwgCodec::dwgWriteVersionIsSelectable()
     QVERIFY(versions.contains(QStringLiteral("AC1021")));
     QVERIFY(versions.contains(QStringLiteral("AC1024")));
     QVERIFY(versions.contains(QStringLiteral("AC1027")));
+    QVERIFY(versions.contains(QStringLiteral("AC1032")));
     QVERIFY(versions.contains(WriteOptions::defaultDwgVersion()));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1018")));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1021")));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1024")));
     QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1027")));
-    QVERIFY(!WriteOptions::isWritableDwgVersion(QStringLiteral("AC1032")));
+    QVERIFY(WriteOptions::isWritableDwgVersion(QStringLiteral("AC1032")));
+    // 超出支持范围（AC1055 = 未识别的版本）仍不可写
+    QVERIFY(!WriteOptions::isWritableDwgVersion(QStringLiteral("AC1055")));
 
     Document document;
     document.beginBatchLoad();
@@ -200,7 +203,7 @@ void TestDwgCodec::nativeReadWriteRoundTrip()
     QFile file(dwgPath);
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray content = file.readAll();
-    QCOMPARE(content.left(6), QByteArray("AC1027"));   // 默认写出版本 AC1027/R2013
+    QCOMPARE(content.left(6), QByteArray("AC1032"));   // 默认写出版本 AC1032/R2018
     QVERIFY2(!content.contains("ENTITIES"), "DWG 应是二进制格式，而不是 DXF 文本");
 
     // 走出原生写出时应在提示中说明，便于用户追溯

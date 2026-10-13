@@ -38,6 +38,7 @@
 #include "intern/dwgwriter21.h"
 #include "intern/dwgwriter24.h"
 #include "intern/dwgwriter27.h"
+#include "intern/dwgwriter32.h"
 
 #define FIRSTHANDLE 48
 
@@ -371,6 +372,12 @@ bool dwgW::write(DRW_Interface* iface, DRW::Version ver)
     // （intern/dwgwriter27.cpp）。
     if (dwgWriter27::supports(ver))
         return dwgWriter27::write(*this, iface);
+
+    // AC1032（R2018）：容器同样与 R2010/R2013 同族（libredwg decode.c 的
+    // `SINCE (R_2010b) → decode_R2004`），复用 dwgWriter18 的摆放代码
+    // （intern/dwgwriter32.cpp）。
+    if (dwgWriter32::supports(ver))
+        return dwgWriter32::write(*this, iface);
 
     return false;                       // 暂不支持的目标版本
 }
@@ -3118,6 +3125,13 @@ bool dwgW::writeMText(DRW_MText* ent)
         // `if (version > DRW::AC1015)`）。0 = 无背景填充，其后不跟任何字段。
         if (d->version > DRW::AC1015)
             b.w.writeBL(0);
+        // 2018+：再一个 B「非注释性」标志（读取端 DRW_MText::parseDwg 的
+        // `version >= AC1032` 分支；libredwg dwg.spec 的
+        // `SINCE (R_2018) FIELD_B (is_not_annotative, 0)`）。为真时其后跟一整块
+        // AnnotScaleObject 字段；本实现恒写 0（普通多行文字）。
+        // 漏写会让 MTEXT 的公共句柄段整体前移 1 位，文字样式句柄随即读错。
+        if (d->version >= DRW::AC1032)
+            b.w.writeB(false);          // is_not_annotative = 0
     }, [&](Private::ObjBuilder& b) {
         b.w.writeHandle(kHcAbsolute, d->styleHandle(ent->style));
     });
@@ -3817,7 +3831,8 @@ bool dwgW::buildSections(DRW_Interface* iface, DRW::Version dwgVer,
         // （实测：Classes 节 endbit 写成 0，读取端算出天文数字的 strDataSize，
         //  类名全丢 → BAD_READ_CLASSES）。DRW_TextCodec::setVersion 对
         // AC1021/AC1024/AC1027/AC1032 一视同仁，都归到 UTF-16 档。
-        std::string verStr = (dwgVer == DRW::AC1027) ? "AC1027"
+        std::string verStr = (dwgVer == DRW::AC1032) ? "AC1032"
+                          : (dwgVer == DRW::AC1027) ? "AC1027"
                           : (dwgVer == DRW::AC1024) ? "AC1024"
                           : (dwgVer == DRW::AC1021) ? "AC1021"
                           : (dwgVer == DRW::AC1018) ? "AC1018" : "AC1015";

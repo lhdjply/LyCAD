@@ -538,7 +538,7 @@ int main(int argc, char* argv[])
         { "2007", "AC1021", "AC1021" },   // AutoCAD 2007 / R2007
         { "2010", "AC1024", "AC1024" },   // AutoCAD 2010 / R2010（与 R2004 同族容器）
         { "2013", "AC1027", "AC1027" },   // AutoCAD 2013 / R2013（与 R2004 同族容器）
-        { "2018", "AC1032", nullptr },    // AutoCAD 2018（写出器暂不支持）
+        { "2018", "AC1032", "AC1032" },   // AutoCAD 2018 / R2018（与 R2004 同族容器）
     };
 
     const bool flat = arguments.size() > 1;
