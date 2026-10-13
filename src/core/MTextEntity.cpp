@@ -58,17 +58,101 @@ double charAdvance(QChar ch, double height)
     return lines;
 }
 
-/// 把正文按段落切开（`\P` 与裸换行都算段落分隔）
-std::vector<QString> splitParagraphs(const QString& plain)
+/// parseRuns 的解析状态：随内联码变化、随 `{`/`}` 分组压栈/出栈。
+struct RunState {
+    bool    bold = false;
+    bool    italic = false;
+    bool    hasColor = false;
+    int     colorAci = 0;
+    QString font;
+    double  heightFactor = 1.0;
+    double  widthFactor = 1.0;
+    double  obliqueDeg = 0.0;
+    double  tracking = 1.0;
+};
+
+/// 解析 `\f` / `\F` 的参数：`字体名|b0|i1|…`。
+/// `b` = 粗体、`i` = 斜体（0 关 1 开）；`c`/`p`/`t`（字符集与字体族）不参与显示。
+void applyFontCode(const QString& param, RunState& state)
 {
-    std::vector<QString> paragraphs;
-    int start = 0;
-    for (int i = 0; i <= plain.size(); ++i) {
-        if (i < plain.size() && plain.at(i) != kParagraph) continue;
-        paragraphs.push_back(plain.mid(start, i - start));
-        start = i + 1;
+    const QStringList parts = param.split(QLatin1Char('|'));
+    if (!parts.isEmpty()) {
+        const QString name = parts.first().trimmed();
+        if (!name.isEmpty()) state.font = name;
     }
-    return paragraphs;
+    for (int k = 1; k < parts.size(); ++k) {
+        const QString opt = parts.at(k).trimmed();
+        if (opt.isEmpty()) continue;
+        const QChar flag = opt.at(0);
+        const QString value = opt.mid(1).trimmed();
+        const bool on = value != QLatin1String("0");
+        if (flag == QLatin1Char('b')) state.bold = on;
+        else if (flag == QLatin1Char('i')) state.italic = on;
+    }
+}
+
+/// 解析 `\C` 的参数：ACI 索引。0（随块）/ 256（随层）或越界值视为「不着色」。
+void applyColorCode(const QString& param, RunState& state)
+{
+    bool ok = false;
+    const int aci = param.trimmed().toInt(&ok);
+    if (!ok || !lycad::aci::isVisibleIndex(aci)) {
+        state.hasColor = false;
+        return;
+    }
+    state.hasColor = true;
+    state.colorAci = aci;
+}
+
+/// 解析 `\H` 的参数：`2.5x` 为「图元字高的 2.5 倍」，`5` 为绝对字高。
+void applyHeightCode(const QString& param, RunState& state, double baseHeight)
+{
+    QString text = param.trimmed();
+    const bool relative = text.endsWith(QLatin1Char('x'), Qt::CaseInsensitive);
+    if (relative) text.chop(1);
+    bool ok = false;
+    const double value = text.toDouble(&ok);
+    if (!ok || value <= 0.0) return;
+    const double factor = relative ? value : value / baseHeight;
+    state.heightFactor = std::clamp(factor, 0.02, 100.0);
+}
+
+/// 解析一个「单值」格式码（`\W` 宽度因子、`\Q` 倾斜角、`\T` 字距）
+void applyScalarCode(const QString& param, double& target, double low, double high)
+{
+    bool ok = false;
+    const double value = param.trimmed().toDouble(&ok);
+    if (!ok) return;
+    target = std::clamp(value, low, high);
+}
+
+/// `\S` 堆叠码：`\S上^下;`（`^` 上标、`#` 下标、`/` 分隔）。
+/// 本实现不做上下标的缩排，按 `上/下` 平铺显示——保住可见文本，格式码仍原样在内容里。
+QString flattenStackCode(const QString& param)
+{
+    QString out;
+    out.reserve(param.size());
+    for (const QChar ch : param) {
+        if (ch == QLatin1Char('^') || ch == QLatin1Char('#') || ch == QLatin1Char('/')) {
+            out.append(QLatin1Char('/'));
+        } else {
+            out.append(ch);
+        }
+    }
+    return out;
+}
+
+/// 一个 Run 的宽度（世界单位）：按字高倍数与宽度因子估算，再加字距的额外量。
+/// 估算口径与 TextEntity::estimateLineWidth 一致，故把它当参数透传。
+double runWidth(const QString& text, const MTextEntity::RunStyle& style, double baseHeight)
+{
+    const double height = baseHeight * style.heightFactor;
+    double width = TextEntity::estimateLineWidth(text, height, style.widthFactor);
+    if (std::abs(style.tracking - 1.0) > 1e-9 && text.size() > 1) {
+        // 字距的额外量加在**字符之间**的间隙上（首字符前不加）
+        width += (style.tracking - 1.0) * static_cast<double>(text.size() - 1) * height;
+    }
+    return std::max(0.0, width);
 }
 
 } // namespace
@@ -207,7 +291,15 @@ QString MTextEntity::stripInlineCodes(const QString& raw)
         if (next == QLatin1Char('P')) { out.append(kParagraph); ++i; continue; }        // 段落
         int j = i + 1;
         while (j < raw.size() && raw.at(j) != QLatin1Char(';')) ++j;
-        if (j < raw.size()) { i = j; continue; }   // 到分号为止整段剥除
+        if (j < raw.size()) {                      // 到分号为止整段剥除
+            if (next == QLatin1Char('S')) {
+                // 堆叠码 `\S上^下;` 在可见文本里平铺成「上/下」——与 parseRuns 同口径，
+                // 否则堆叠内容会整段消失（早期实现即如此）。
+                out.append(flattenStackCode(raw.mid(i + 2, j - i - 2)));
+            }
+            i = j;
+            continue;
+        }
         out.append(ch);                            // 没有分号：按字面保留
     }
     return out;
@@ -275,6 +367,106 @@ QString MTextEntity::inlineFontNameOf(const QString& raw)
     return QString();
 }
 
+std::vector<std::vector<MTextEntity::Run>> MTextEntity::parseRuns(const QString& raw,
+                                                                 double baseHeight)
+{
+    const double height = baseHeight > kGeomTol ? baseHeight : 3.5;
+
+    std::vector<std::vector<Run>> paragraphs;
+    std::vector<Run> runs;
+    QString buffer;                       // 当前 Run 累积的可见文本
+    RunState state;
+    std::vector<RunState> stack;          // `{`/`}` 的格式作用域栈
+
+    // 把 buffer 落成一个 Run（格式取当前 state）
+    const auto flush = [&]() {
+        if (buffer.isEmpty()) return;
+        Run run;
+        run.text = buffer;
+        run.style.bold = state.bold;
+        run.style.italic = state.italic;
+        run.style.hasColor = state.hasColor;
+        run.style.colorAci = state.colorAci;
+        run.style.fontFamily = state.font;
+        run.style.heightFactor = state.heightFactor;
+        run.style.widthFactor = state.widthFactor;
+        run.style.obliqueDeg = state.obliqueDeg;
+        run.style.tracking = state.tracking;
+        runs.push_back(std::move(run));
+        buffer.clear();
+    };
+    const auto endParagraph = [&]() {
+        flush();
+        paragraphs.push_back(std::move(runs));
+        runs.clear();
+        buffer.clear();
+    };
+
+    for (int i = 0; i < raw.size(); ++i) {
+        const QChar ch = raw.at(i);
+
+        if (ch == QLatin1Char('\r')) continue;
+        if (ch == QLatin1Char('\n')) { endParagraph(); continue; }
+
+        // 分组：`{` 保存格式、`}` 恢复。分组符本身不显示（与 AutoCAD 一致）
+        if (ch == QLatin1Char('{')) { flush(); stack.push_back(state); continue; }
+        if (ch == QLatin1Char('}')) {
+            flush();
+            if (!stack.empty()) { state = stack.back(); stack.pop_back(); }
+            continue;
+        }
+
+        if (ch != QLatin1Char('\\')) { buffer.append(ch); continue; }
+        if (i + 1 >= raw.size()) break;
+
+        const QChar next = raw.at(i + 1);
+        if (next == QLatin1Char('\\')) { buffer.append(QLatin1Char('\\')); ++i; continue; }
+        if (next == QLatin1Char('{') || next == QLatin1Char('}')) { buffer.append(next); ++i; continue; }
+        if (next == QLatin1Char('~')) { buffer.append(QLatin1Char(' ')); ++i; continue; }   // 不换行空格
+        if (next == QLatin1Char('P')) { endParagraph(); ++i; continue; }                    // 段落
+
+        // 其余内联码一律 `\X…;`：读到分号为止
+        int semi = i + 2;
+        while (semi < raw.size() && raw.at(semi) != QLatin1Char(';')) ++semi;
+        if (semi >= raw.size()) {
+            buffer.append(QLatin1Char('\\'));      // 没有分号：按字面保留
+            continue;
+        }
+        const QChar code = next;
+        const QString param = raw.mid(i + 2, semi - i - 2);
+        i = semi;
+
+        if (code == QLatin1Char('f') || code == QLatin1Char('F')) {
+            flush(); applyFontCode(param, state);
+        } else if (code == QLatin1Char('C')) {
+            flush(); applyColorCode(param, state);
+        } else if (code == QLatin1Char('H')) {
+            flush(); applyHeightCode(param, state, height);
+        } else if (code == QLatin1Char('W')) {
+            flush(); applyScalarCode(param, state.widthFactor, 0.01, 100.0);
+        } else if (code == QLatin1Char('Q')) {
+            flush(); applyScalarCode(param, state.obliqueDeg, -85.0, 85.0);
+        } else if (code == QLatin1Char('T')) {
+            flush(); applyScalarCode(param, state.tracking, 0.0, 10.0);
+        } else if (code == QLatin1Char('S')) {
+            buffer.append(flattenStackCode(param));   // 堆叠：平铺成「上/下」
+        }
+        // 其余（`\A` 对齐、`\p` 段落属性、`\L\O\K` 装饰、`\X` 等）不参与显示，整段剥除
+    }
+    endParagraph();
+
+    // 计算每段内各 Run 的位置与宽度（局部坐标，自段落起点起算）
+    for (std::vector<Run>& paragraph : paragraphs) {
+        double cursor = 0.0;
+        for (Run& run : paragraph) {
+            run.offsetX = cursor;
+            run.width = runWidth(run.text, run.style, height);
+            cursor += run.width;
+        }
+    }
+    return paragraphs;
+}
+
 // -----------------------------------------------------------------------------
 //  排版
 // -----------------------------------------------------------------------------
@@ -283,7 +475,6 @@ MTextEntity::Layout MTextEntity::layout() const
     Layout out;
     out.lineHeight = lineHeight();
 
-    const QString plain = plainText();
     const std::vector<int> paragraphAlign = paragraphJustifications(m_content);
     const double anchor = attachmentColumn(m_attachment) * 0.5;   // 附着点的列锚：0 / 0.5 / 1
     const double box = m_referenceWidth;
@@ -303,18 +494,28 @@ MTextEntity::Layout MTextEntity::layout() const
     //    每行的起点由「附着点定矩形、段落码定行位」共同决定（矩形宽 W、行宽 w、
     //    附着列锚 a、行锚 t）：x = -a·W + (W - w)·t，t 缺省取 a 时退化为 -w·t；
     //    W = 0（不折行）时 x = -w·t。
-    const std::vector<QString> paragraphs = splitParagraphs(plain);
+    //
+    //    行内再由内联格式码切成若干同格式片段（Run，见 parseRuns）：行宽取「最后一段的
+    //    右端」，与逐段渲染出来的宽度是同一份数据。
+    const std::vector<std::vector<Run>> paragraphs = parseRuns(m_content, m_height);
     for (std::size_t index = 0; index < paragraphs.size(); ++index) {
         const int align = (index < paragraphAlign.size()) ? paragraphAlign[index] : -1;
         const double lineAnchor = align >= 0 ? align * 0.5 : anchor;
-        const QString& text = paragraphs[index];
-        const double lineWidth = TextEntity::estimateLineWidth(text, m_height, 1.0);
+        const std::vector<Run>& runs = paragraphs[index];
+
+        QString text;
+        double lineWidth = 0.0;
+        for (const Run& run : runs) {
+            text.append(run.text);
+            lineWidth = std::max(lineWidth, run.offsetX + run.width);
+        }
+
         const double x = (box > kGeomTol)
                              ? (-anchor * box + (box - lineWidth) * lineAnchor)
                              : (-lineWidth * lineAnchor);
-        out.lines.push_back(LayoutLine { text, x, lineWidth });
+        out.lines.push_back(LayoutLine { text, x, lineWidth, runs });
     }
-    if (out.lines.empty()) out.lines.push_back(LayoutLine { QString(), 0.0, 0.0 });
+    if (out.lines.empty()) out.lines.push_back(LayoutLine { QString(), 0.0, 0.0, {} });
 
     double minX = out.lines.front().x;
     double maxX = minX + out.lines.front().width;

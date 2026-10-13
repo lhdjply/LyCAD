@@ -4,6 +4,7 @@
 #include "render/EntityRenderer.h"
 
 #include "core/ArcEntity.h"
+#include "core/AciPalette.h"
 #include "core/CircleEntity.h"
 #include "core/DimensionEntity.h"
 #include "core/EllipseEntity.h"
@@ -518,9 +519,10 @@ void drawTextEntity(QPainter& painter, const TextEntity& text, const DrawContext
 /// 的中点」，不是 TEXT 的大写高度框（两者差 (capHeight − xHeight)/2 ≈ 0.13 倍字高，
 /// 这也正是把 MTEXT 降级成 TEXT 会在 AutoCAD / 浩辰里整体错位的原因）。
 ///
-/// 内联格式码只做「尽力还原」：内容已由模型剥成可见文本，这里额外采用内容里声明的
-/// 内联字体（\f…;），字号与颜色等其余格式码不再解析（文件里的原文一字未改，别的
-/// CAD 仍按原样显示）。
+/// 内联格式码按「行内片段」还原：模型（parseRuns）已把每行切成若干同格式片段
+/// （`\f…|b1;` 粗体、`\f…|i1;` 斜体、`\C…;` 颜色、`\H`/`\W`/`\Q`/`\T` 字高/宽度/
+/// 倾斜/字距），这里逐段设字体与颜色绘制。段起点、行宽与包围盒都取自同一份排版结果，
+/// 因此屏幕上的字形位置与拾取框一致。文件里的原文一字未改，别的 CAD 仍按原样显示。
 void drawMTextEntity(QPainter& painter, const MTextEntity& text,
                      const DrawContext& context)
 {
@@ -535,8 +537,8 @@ void drawMTextEntity(QPainter& painter, const MTextEntity& text,
         return;
     }
 
-    QFont font = painter.font();
-    font.setPixelSize(std::max(2, static_cast<int>(std::lround(capHeightPixels
+    QFont baseFont = painter.font();
+    baseFont.setPixelSize(std::max(2, static_cast<int>(std::lround(capHeightPixels
                                                               / kCapHeightToEmRatio))));
     // 内联字体码声明了字体时优先采用它；否则退回图元的样式名
     const QString inlineName = text.inlineFontName();
@@ -544,9 +546,12 @@ void drawMTextEntity(QPainter& painter, const MTextEntity& text,
                                ? inlineName
                                : text.fontStyle();
     if (!family.isEmpty() && QFontDatabase::hasFamily(family)) {
-        font.setFamily(family);
+        baseFont.setFamily(family);
     }
-    painter.setFont(font);
+
+    // 图层/随层解析后的颜色：没有内联颜色的片段沿用它
+    const QColor baseColor = painter.pen().color();
+    const bool themeIsDark = context.settings->themeIsDark;
 
     const Point2D anchorDevice = context.view->toDevice(text.insertionPoint());
     const double scale = context.view->scale();
@@ -560,9 +565,58 @@ void drawMTextEntity(QPainter& painter, const MTextEntity& text,
     for (std::size_t i = 0; i < laid.lines.size(); ++i) {
         const MTextEntity::LayoutLine& line = laid.lines[i];
         if (line.text.isEmpty()) continue;
-        const double x = line.x * scale;
         const double y = -(laid.firstBaseline - static_cast<double>(i) * laid.lineHeight) * scale;
-        painter.drawText(QPointF(x, y), line.text);
+
+        // 快路径：整行没有任何内联格式（绝大多数文字）——与早期实现完全同画法
+        const bool plainLine = line.runs.empty()
+                               || (line.runs.size() == 1 && line.runs.front().style.isPlain());
+        if (plainLine) {
+            painter.setFont(baseFont);
+            painter.setPen(baseColor);
+            painter.drawText(QPointF(line.x * scale, y), line.text);
+            continue;
+        }
+
+        // 逐段绘制：每段自带字体（粗/斜/族）、字号、颜色、宽度因子、倾斜与字距。
+        // 段起点来自模型的 offsetX（与行宽用的是同一份数据），故画出来不会互相错位。
+        for (const MTextEntity::Run& run : line.runs) {
+            if (run.text.isEmpty()) continue;
+            const MTextEntity::RunStyle& style = run.style;
+
+            QFont font = baseFont;
+            if (!style.fontFamily.isEmpty() && QFontDatabase::hasFamily(style.fontFamily)) {
+                font.setFamily(style.fontFamily);
+            }
+            if (style.bold) font.setBold(true);
+            if (style.italic) font.setItalic(true);
+            if (std::abs(style.heightFactor - 1.0) > 1e-9) {
+                // `\H` 改的是本段的字高（图元字高 × 倍数）
+                const double pixels = capHeightPixels * style.heightFactor / kCapHeightToEmRatio;
+                font.setPixelSize(std::max(2, static_cast<int>(std::lround(pixels))));
+            }
+            if (std::abs(style.tracking - 1.0) > 1e-3) {
+                // `\T`：字距因子。附加量加在字符之间，与模型算宽度用的口径一致
+                const double extra = (style.tracking - 1.0) * capHeightPixels * style.heightFactor;
+                font.setLetterSpacing(QFont::AbsoluteSpacing, extra);
+            }
+            painter.setFont(font);
+            painter.setPen(style.hasColor ? aci::toColor(style.colorAci, themeIsDark) : baseColor);
+
+            painter.save();
+            painter.translate((line.x + run.offsetX) * scale, 0.0);
+            // 宽度因子（`\W`）用横向缩放实现：字形与步进同步压/拉，
+            // 与模型按 widthFactor 估出来的段宽一致（QFont::setStretch 在非可变字体上会被忽略，
+            // 那样画出来的宽度会与排版不符、后续段就会压在一起）。
+            if (std::abs(style.widthFactor - 1.0) > 1e-9) {
+                painter.scale(style.widthFactor, 1.0);
+            }
+            // 倾斜角（`\Q`）：设备帧 y 向下，右倾需要负的剪切系数
+            if (std::abs(style.obliqueDeg) > 1e-9) {
+                painter.shear(-std::tan(degToRad(style.obliqueDeg)), 0.0);
+            }
+            painter.drawText(QPointF(0.0, y), run.text);
+            painter.restore();
+        }
     }
     painter.restore();
 }

@@ -12,6 +12,9 @@ function(lycad_add_test target source)
     set_property(GLOBAL APPEND PROPERTY LYCAD_TEST_TARGETS ${target})
     target_include_directories(${target} PRIVATE "${LYCAD_SRC_ROOT}")
     target_include_directories(${target} SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
+    # 源码根目录：个别用例要读 sample/ 下的样例文件（找不到时用例自行跳过）
+    target_compile_definitions(${target} PRIVATE
+        LYCAD_TEST_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
     target_link_libraries(${target}
         PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test LyCAD::Warnings)
     add_test(NAME ${target} COMMAND ${target})

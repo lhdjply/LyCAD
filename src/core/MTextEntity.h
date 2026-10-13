@@ -31,6 +31,8 @@
 #include "core/Entity.h"
 #include "core/TextEntity.h"
 
+#include <cmath>
+
 namespace lycad {
 
 class MTextEntity final : public Entity {
@@ -146,12 +148,54 @@ public:
     /// 竖直方向的行距（世界单位）：行距系数 × 基准行距
     double lineHeight() const noexcept;
 
+    // ---- 内联格式（\f 的粗/斜/字体、\C 颜色、\H 字高、\W 宽度、\Q 倾斜、\T 字距）----
+    //
+    //  MTEXT 的一段文字可以用内联码改变自身格式，例如
+    //      \fArial|b1;加粗\fArial|b0; 与斜体 \fArial|i1;Italic\fArial|i0;
+    //      \C1;红\C3;绿\C5;蓝
+    //  这些码是**行内**生效的（只影响其后、且受 `{…}` 分组约束的那一段文字），
+    //  所以「一行」可以被切成若干**同格式片段（Run）**。下面这组类型就是该切分结果，
+    //  排版（行宽）与渲染（逐段设字体/颜色）共用同一份，避免两边各解析一遍。
+    //
+    /// 一个 Run 的格式快照。所有量都以「相对图元自身」为准。
+    struct RunStyle {
+        bool    bold = false;
+        bool    italic = false;
+        bool    hasColor = false;      ///< `\C` 给出了有效的 ACI 索引
+        int     colorAci = 0;          ///< `\C` 的 ACI 索引（0/256 = 随块/随层，视作未着色）
+        QString fontFamily;            ///< `\f` 的字体名；空 = 未指定
+        double  heightFactor = 1.0;    ///< 相对图元字高的倍数（`\H2.5x;` 直接给 2.5，`\H5;` 按绝对高换算）
+        double  widthFactor = 1.0;     ///< `\W`：宽度因子
+        double  obliqueDeg = 0.0;      ///< `\Q`：倾斜角（度）
+        double  tracking = 1.0;        ///< `\T`：字距因子（1.0 = 常规）
+
+        /// 是否为「无格式」（可以走单段快路径）
+        bool isPlain() const noexcept
+        {
+            return !bold && !italic && !hasColor && fontFamily.isEmpty()
+                && std::abs(heightFactor - 1.0) <= 1e-9
+                && std::abs(widthFactor - 1.0) <= 1e-9
+                && std::abs(obliqueDeg) <= 1e-9
+                && std::abs(tracking - 1.0) <= 1e-9;
+        }
+    };
+
+    /// 行内的一段同格式文本。offsetX / width 由 parseRuns 按图元字高算好，
+    /// 与渲染用的位置、包围盒用的行宽是同一份数据。
+    struct Run {
+        QString  text;              ///< 可见文本（内联码已剥除）
+        double   offsetX = 0.0;     ///< 行内起始 X（局部坐标，世界单位）
+        double   width = 0.0;       ///< 该段宽度（世界单位）
+        RunStyle style;
+    };
+
     // ---- 排版 -----------------------------------------------------------------
     /// 一行可见文本及其在局部坐标系里的起始 X（沿文字方向，自插入点起算）
     struct LayoutLine {
-        QString text;
+        QString text;           ///< 该行可见文本（各 Run 拼接；无内联格式时即整行）
         double x = 0.0;         ///< 起始 X（局部坐标）
         double width = 0.0;     ///< 行宽（世界单位）
+        std::vector<Run> runs;  ///< 带格式的片段（含 offsetX / width）；每段的文本拼起来 = text
     };
 
     /// 排版结果：分行 + 行起点 + 首行基线与块的墨迹范围（局部坐标系）
@@ -192,6 +236,20 @@ public:
     static std::vector<int> paragraphJustifications(const QString& raw);
     /// `\f…;` 里的字体名（第 1 段）；没有该码返回空串
     static QString inlineFontNameOf(const QString& raw);
+
+    /// 按内联格式码把内容切成**逐段的格式片段**：外层按段落（`\P` / 换行）分段、
+    /// 内层是同格式的 Run。每一段的 Run 文本拼起来即该段的可见文本，
+    /// `offsetX` / `width` 已按 `baseHeight`（图元字高）算好。
+    ///
+    /// 与 stripInlineCodes 的关系：后者只给「看什么字」，本函数还给「用什么格式看」。
+    /// 两者对可见文本的口径一致（`{`/`}` 分组不显示、无分号的 `\` 按字面保留、
+    /// `\~` 作空格）。排版与渲染都走这一份结果，因此屏幕上的行宽与包围盒不会两算。
+    ///
+    /// 支持的码：`\f`/`\F`（字体名 + `|b0|b1` 粗体 + `|i0|i1` 斜体）、`\C`（ACI 颜色）、
+    /// `\H`（字高，可带 `x` 表示倍数）、`\W`（宽度因子）、`\Q`（倾斜角）、`\T`（字距）、
+    /// `\S`（堆叠，按 `上/下` 平铺显示）；`{`/`}` 分组、`\P` 段落、`\\`/`\{`/`\}`/`\~` 转义。
+    /// 其余码（`\A` 对齐、`\p` 段落属性、`\L\O\K` 装饰、`\X` 等）按无格式剥除。
+    static std::vector<std::vector<Run>> parseRuns(const QString& raw, double baseHeight);
 
     // ---- Entity 接口 ----------------------------------------------------------
     std::unique_ptr<Entity> clone() const override;
