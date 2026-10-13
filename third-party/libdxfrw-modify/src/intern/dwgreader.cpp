@@ -1153,6 +1153,14 @@ bool dwgReader::readDwgEntity(dwgBuffer *dbuf, objHandle& obj, DRW_Interface& in
             e.name = findTableName(DRW::BLOCK_RECORD, e.blockRecH.ref);
             intfa.addTable(e);
             break; }
+        // 光源：类对象（LIGHT / AcDbLight，所属模块 SCENEOE），类型号 202 同样由
+        // DRW_Class::toDwgType 约定。不分派的话整条光源被丢弃（它没有几何，
+        // 别的实体也不会引用它，图上就彻底看不到）。
+        case 202: {
+            DRW_Light e;
+            ENTRY_PARSE(e)
+            intfa.addLight(e);
+            break; }
         case 45: {
             DRW_Leader e;
             ENTRY_PARSE(e)

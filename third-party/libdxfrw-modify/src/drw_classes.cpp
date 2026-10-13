@@ -120,6 +120,10 @@ void DRW_Class::toDwgType(){
         // 用内部约定编号 201 让 dwgreader 能认出来；几何挂在它引用的 *Tnn 块里，
         // 不解析本体时表格会整张消失（实体流里没有别的图元引用那个块）。
         dwgType = 201;
+    else if (recName == "LIGHT")
+        // 光源同样是类对象（AcDbLight，所属模块 SCENEOE），无固定对象类型号。
+        // 内部约定编号 202 —— 不认它的话整条光源在 DWG 里被丢掉。
+        dwgType = 202;
     else
         dwgType =0;
 }

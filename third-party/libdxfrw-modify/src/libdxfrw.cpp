@@ -1064,6 +1064,43 @@ bool dxfRW::writeLeader(DRW_Leader *ent){
     }
     return true;
 }
+
+//! 写出 LIGHT（光度控制光源）。组码次序照 libredwg dwg2.spec 的 DWG_ENTITY (LIGHT)：
+//! 100 AcDbLight 之后依次是类版本、名称、类型、开关、颜色、图标、强度、位置、
+//! 目标、衰减、聚光角、阴影。R2007 之前的版本没有这个实体，直接不写。
+bool dxfRW::writeLight(DRW_Light *ent) {
+    if (version < DRW::AC1021) {
+        return true;                  // R2007 之前无 LIGHT 实体
+    }
+    writer->writeString(0, "LIGHT");
+    writeEntity(ent);
+    writer->writeString(100, "AcDbLight");
+    writer->writeInt32(90, ent->classVersion);
+    writer->writeUtf8String(1, ent->name);
+    writer->writeInt16(70, ent->type);
+    writer->writeBool(290, ent->status);
+    writer->writeInt16(63, ent->lightColor);
+    writer->writeBool(291, ent->plotGlyph);
+    writer->writeDouble(40, ent->intensity);
+    writer->writeDouble(10, ent->position.x);
+    writer->writeDouble(20, ent->position.y);
+    writer->writeDouble(30, ent->position.z);
+    writer->writeDouble(11, ent->target.x);
+    writer->writeDouble(21, ent->target.y);
+    writer->writeDouble(31, ent->target.z);
+    writer->writeInt16(72, ent->attenuationType);
+    writer->writeBool(292, ent->useAttenuationLimits);
+    writer->writeDouble(41, ent->attenuationStartLimit);
+    writer->writeDouble(42, ent->attenuationEndLimit);
+    writer->writeDouble(50, ent->hotspotAngle);
+    writer->writeDouble(51, ent->falloffAngle);
+    writer->writeBool(293, ent->castShadows);
+    writer->writeInt16(73, ent->shadowType);
+    writer->writeInt16(91, ent->shadowMapSize);
+    writer->writeInt16(280, ent->shadowSoftness);
+    return true;
+}
+
 bool dxfRW::writeDimension(DRW_Dimension *ent) {
     if (version == DRW::AC1009) {
         //R12：无句柄与子类标记，数据组直接跟在实体头之后；
@@ -2495,6 +2532,8 @@ bool dxfRW::processEntities(bool isblock) {
     } else if (!isblock) {
             return false;  //first record in entities is 0
    }
+    // 上一轮循环是否仍在同一条**未知实体**内部（见下方 else 分支的说明）
+    bool inUnknownEntity = false;
     do {
         if (nextentity == "ENDSEC" || nextentity == "ENDBLK") {
             return true;  //found ENDSEC or ENDBLK terminate
@@ -2542,18 +2581,30 @@ bool dxfRW::processEntities(bool isblock) {
             processArcDimension();
         } else if (nextentity == "LEADER") {
             processLeader();
+        } else if (nextentity == "LIGHT") {
+            processLight();
         } else if (nextentity == "RAY") {
             processRay();
         } else if (nextentity == "XLINE") {
             processXline();
         } else {
-            // 未知实体类型交给应用层计数上报（不认识的类型不能静默吞掉）；
-            // 只在 processEntities 上报，processObjects 里的对象不是图元。
-            fprintf(stderr, "[UNKNOWN] %s (code=%d)\n", nextentity.c_str(), code);
-            iface->addUnknownEntity(nextentity);
+            // 未知实体类型交给应用层计数上报（不认识的类型不能静默吞掉）。
+            //
+            // 注意上调一次、不上调多次：本分支是**按组码**进入的——每读掉一个组码，
+            // 只要它不是 0 号（实体起始标记），nextentity 仍是同一张实体的名字，
+            // 于是循环又回到这里。因此用一个「上一轮是否也在同一未知实体内」的标志
+            // 把上报压到**实体起始那一次**：否则一条 310 组码很多的 3DSOLID 会被
+            // 记成上百个实体（实测 example.dxf 的 1 个 3DSOLID 曾报成 157 个）。
+            if (!inUnknownEntity) {
+                DRW_DBG("[UNKNOWN] "); DRW_DBG(nextentity); DRW_DBG("\n");
+                iface->addUnknownEntity(nextentity);
+            }
+            inUnknownEntity = true;
             if (reader->readRec(&code)){
-                if (code == 0)
+                if (code == 0) {
                     nextentity = reader->getString();
+                    inUnknownEntity = false;    // 实体到此结束
+                }
             } else
                 return false; //end of file without ENDSEC
         }
@@ -3284,6 +3335,29 @@ bool dxfRW::processLeader() {
         }
         default:
             leader.parseCode(code, reader);
+            break;
+        }
+    }
+    return true;
+}
+
+//! 读取 LIGHT。整条实体只由组码驱动（parseCode 逐码赋值），这里只负责把
+//! 结束标记与实体实例交给上层。注意 0 号组码既可能是下一条图元，也可能是 ENDSEC。
+bool dxfRW::processLight() {
+    DRW_DBG("dxfRW::processLight\n");
+    int code;
+    DRW_Light light;
+    while (reader->readRec(&code)) {
+        DRW_DBG(code); DRW_DBG("\n");
+        switch (code) {
+        case 0: {
+            nextentity = reader->getString();
+            DRW_DBG(nextentity); DRW_DBG("\n");
+            iface->addLight(light);
+            return true;  //found new entity or ENDSEC, terminate
+        }
+        default:
+            light.parseCode(code, reader);
             break;
         }
     }

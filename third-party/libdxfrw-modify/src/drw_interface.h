@@ -185,6 +185,12 @@ public:
 	 */
     virtual void addImage(const DRW_Image *data) = 0;
 
+    /**
+     * Called for every light entity（R2007+ 的光度控制光源，本体没有几何）。
+     * 默认为空实现：不关心光源的调用方无需实现它。
+     */
+    virtual void addLight(const DRW_Light& data) { (void)data; }
+
 	/**
 	 * Called for every image definition.
 	 */

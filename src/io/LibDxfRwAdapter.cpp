@@ -49,6 +49,7 @@
 #include "core/InfiniteLineEntity.h"
 #include "core/InsertEntity.h"
 #include "core/Layer.h"
+#include "core/LightEntity.h"
 #include "core/Linetype.h"
 #include "core/LineEntity.h"
 #include "core/MTextEntity.h"
@@ -302,6 +303,9 @@ public:
     void addSolid(const DRW_Solid& data) override;
     void addMText(const DRW_MText& data) override;
     void addText(const DRW_Text& data) override;
+    /// LIGHT（R2007+ 的光度控制光源）：本体没有几何，只有标记与属性。
+    /// 建原生 LightEntity，图纸里看得见、选得中，保存时原样写回。
+    void addLight(const DRW_Light& data) override;
 
     // ---- 标注 ----------------------------------------------------------------
     void addDimAlign(const DRW_DimAligned* data) override;
@@ -917,6 +921,46 @@ void Builder::noteTable(const DRW_Table& data)
 void Builder::addPoint(const DRW_Point& data)
 {
     auto entity = std::make_unique<PointEntity>(toPoint(data.basePoint));
+    applyCommon(*entity, data);
+    place(std::move(entity));
+}
+
+void Builder::addLight(const DRW_Light& data)
+{
+    auto entity = std::make_unique<LightEntity>(toPoint(data.position));
+
+    // 类型（70）：按规范 1=平行光 2=点光源 3=聚光灯 4=光域网。取值越界时保持
+    // 构造函数给的默认（点光源）——真文件里只出现 1~4。
+    switch (data.type) {
+    case 1:  entity->setLightType(LightEntity::LightType::Distant); break;
+    case 2:  entity->setLightType(LightEntity::LightType::Point);   break;
+    case 3:  entity->setLightType(LightEntity::LightType::Spot);    break;
+    case 4:  entity->setLightType(LightEntity::LightType::Web);     break;
+    default: break;
+    }
+    switch (data.attenuationType) {
+    case 1:  entity->setAttenuation(LightEntity::Attenuation::InverseLinear); break;
+    case 2:  entity->setAttenuation(LightEntity::Attenuation::InverseSquare); break;
+    default: entity->setAttenuation(LightEntity::Attenuation::None);          break;
+    }
+
+    entity->setName(toQString(data.name));
+    entity->setOn(data.status);
+    entity->setLightColorIndex(data.lightColor);
+    entity->setPlotGlyph(data.plotGlyph);
+    entity->setIntensity(data.intensity);
+    entity->setPositionZ(data.position.z);
+    entity->setTarget(toPoint(data.target));
+    entity->setTargetZ(data.target.z);
+    entity->setUseAttenuationLimits(data.useAttenuationLimits);
+    entity->setAttenuationLimits(data.attenuationStartLimit, data.attenuationEndLimit);
+    entity->setConeAngles(data.hotspotAngle, data.falloffAngle);
+    entity->setCastShadows(data.castShadows);
+    entity->setShadowType(data.shadowType);
+    entity->setShadowMapSize(data.shadowMapSize);
+    entity->setShadowSoftness(data.shadowSoftness);
+    entity->setClassVersion(data.classVersion);
+
     applyCommon(*entity, data);
     place(std::move(entity));
 }
@@ -2491,6 +2535,15 @@ public:
 
     void setDxfRw(RW* rw) { m_rw = rw; }
 
+    /// 目标格式 / 版本承载不了的图元：类型名 -> (个数, 原因)。调用方据此在结果里
+    /// 提示用户。目前只有 LIGHT（DWG 写出端未实现该对象；DXF 侧 R2007 之前没有
+    /// 这个实体），但机制是通用的——将来任何「目标写不出来」的图元都走这里，
+    /// 而不是在库里被静默丢掉。
+    const std::map<QString, std::pair<int, QString>>& skippedForTarget() const
+    {
+        return m_skippedForTarget;
+    }
+
     /// 预扫描：把文档实际引用到的块定义收集起来，并给每个定一个**文件内唯一**的名字。
     ///
     /// 必须遍历 referencedBlocks 而不是 blocks().all()：块参照在非相似变换下会把
@@ -2584,6 +2637,7 @@ public:
     void addSolid(const DRW_Solid&) override {}
     void addMText(const DRW_MText&) override {}
     void addText(const DRW_Text&) override {}
+    void addLight(const DRW_Light&) override {}
     void addDimAlign(const DRW_DimAligned*) override {}
     void addDimLinear(const DRW_DimLinear*) override {}
     void addDimRadial(const DRW_DimRadial*) override {}
@@ -2876,6 +2930,7 @@ private:
         case EntityType::Ray:       writeRay(static_cast<const RayEntity&>(entity)); break;
         case EntityType::Insert:    writeInsert(static_cast<const InsertEntity&>(entity)); break;
         case EntityType::Table:     writeTable(static_cast<const TableEntity&>(entity)); break;
+        case EntityType::Light:     writeLight(static_cast<const LightEntity&>(entity)); break;
         }
     }
 
@@ -3253,6 +3308,56 @@ private:
         m_rw->writePoint(&record);
     }
 
+    /// LIGHT：本体没有几何，写出的就是那组属性（名称/类型/开关/光色/强度/位置与
+    /// 目标/衰减/聚光角/阴影）。DXF 与 DWG 两条写出路径都有原生实现
+    ///（DXF = LIGHT 实体，DWG = CLASSES 段里的 AcDbLight 类对象）。
+    ///
+    /// 唯一的「写不出来」是**版本**：LIGHT 是 R2007 起才有的实体/类，目标是更早的
+    /// 版本时必须如实上报，不能让图元静静消失。
+    void writeLight(const LightEntity& light)
+    {
+        if (m_version < DRW::AC1021) {
+            const QString name = m_version == DRW::AC1018 ? QStringLiteral("AC1018/R2004")
+                                                          : QStringLiteral("AC1015/R2000");
+            skipForTarget(QStringLiteral("LIGHT"),
+                          QStringLiteral("%1 早于 R2007，该版本没有 LIGHT").arg(name));
+            return;
+        }
+
+        DRW_Light record;
+        applyCommonWrite(record, light);
+        // class_version（DXF 90）：规范范围 0~10 —— libredwg 对该字段有
+        // VALUEOUTOFBOUNDS 检查，越界会让严格解析端**中止整条对象的解析**
+        //（实测 example.dxf 的 Spotlight1 是 -1023410171，即 0xC3000005，
+        //  典型的转换器产物）。照抄回去等于把坏数据继续传下去，因此越界统一
+        //  归一为 0 —— 与表格的 90 组码同一处理（写 0 已被浩辰接受）。
+        //  导入侧不改模型：文件里是什么值就存什么值，只在这一步做规范化。
+        const int rawClassVersion = light.classVersion();
+        record.classVersion = (rawClassVersion >= 0 && rawClassVersion <= 10)
+                                  ? rawClassVersion
+                                  : 0;
+        record.name = light.name().toStdString();
+        record.type = static_cast<dint16>(static_cast<int>(light.lightType()));
+        record.status = light.isOn();
+        record.lightColor = static_cast<dint16>(light.lightColorIndex());
+        record.plotGlyph = light.plotGlyph();
+        record.intensity = light.intensity();
+        record.position = DRW_Coord(light.position().x, light.position().y, light.positionZ());
+        record.target = DRW_Coord(light.target().x, light.target().y, light.targetZ());
+        record.attenuationType = static_cast<dint16>(static_cast<int>(light.attenuation()));
+        record.useAttenuationLimits = light.useAttenuationLimits();
+        record.attenuationStartLimit = light.attenuationStartLimit();
+        record.attenuationEndLimit = light.attenuationEndLimit();
+        record.hotspotAngle = light.hotspotAngle();
+        record.falloffAngle = light.falloffAngle();
+        record.castShadows = light.castShadows();
+        record.shadowType = static_cast<dint16>(light.shadowType());
+        record.shadowMapSize = static_cast<dint16>(light.shadowMapSize());
+        record.shadowSoftness = static_cast<dint16>(light.shadowSoftness());
+
+        m_rw->writeLight(&record);
+    }
+
     void writePolyline(const PolylineEntity& polyline)
     {
         // 一律走 LWPOLYLINE（R2000 起）：顶点与凸度压在一个实体里，
@@ -3624,6 +3729,15 @@ private:
     const Document& m_doc;
     RW* m_rw = nullptr;
     DRW::Version m_version = DRW::AC1015;
+    /// 写出目标承载不了的图元：类型名 -> (个数, 原因)
+    std::map<QString, std::pair<int, QString>> m_skippedForTarget;
+    /// 记一次「目标写不出来」的图元（见 skippedForTarget 的说明）
+    void skipForTarget(const QString& type, const QString& reason)
+    {
+        auto& entry = m_skippedForTarget[type];
+        ++entry.first;
+        entry.second = reason;
+    }
     /// 目标版本的 DXF 文本是否按 UTF-8 存放（AC1021 及以后为真）
     bool m_utf8Text = false;
     std::map<EntityId, std::string> m_dimBlocks;
@@ -3666,7 +3780,12 @@ IoResult writeDxfWithLibDxfRw(const QString& path, const Document& document,
         return IoResult::failure(QStringLiteral("DXF 写出失败（libdxfrw）。"));
     }
 
-    return IoResult::success(document.entityCount());
+    IoResult result = IoResult::success(document.entityCount());
+    for (const auto& [type, info] : exporter.skippedForTarget()) {
+        result.addWarning(QStringLiteral("跳过 %1 个：%2（%3）")
+                              .arg(info.first).arg(type, info.second));
+    }
+    return result;
 }
 
 // -----------------------------------------------------------------------------
@@ -3711,7 +3830,12 @@ IoResult writeDwgWithLibDxfRw(const QString& path, const Document& document,
                                              : QStringLiteral("AC1015/R2000")));
     }
 
-    return IoResult::success(document.entityCount());
+    IoResult result = IoResult::success(document.entityCount());
+    for (const auto& [type, info] : exporter.skippedForTarget()) {
+        result.addWarning(QStringLiteral("跳过 %1 个：%2（%3）")
+                              .arg(info.first).arg(type, info.second));
+    }
+    return result;
 }
 
 } // namespace lycad

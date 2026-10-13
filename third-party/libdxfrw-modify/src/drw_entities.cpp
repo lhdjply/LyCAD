@@ -534,6 +534,144 @@ bool DRW_Point::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
     return buf->isGood();
 }
 
+// -----------------------------------------------------------------------------
+//  LIGHT（AcDbLight）
+// -----------------------------------------------------------------------------
+//  字段与组码的对应关系见 drw_entities.h 的类注释（取自 libredwg dwg2.spec 的
+//  DWG_ENTITY (LIGHT)）。这里只做逐码赋值；未建模的光度扩展块与代理图形
+//  （92 + 310）会落到 default 分支，由基类按公共组码处理或忽略。
+void DRW_Light::parseCode(int code, dxfReader *reader){
+    switch (code) {
+    case 90:
+        classVersion = reader->getInt32();
+        break;
+    case 1:
+        name = reader->getUtf8String();
+        break;
+    case 70:
+        type = static_cast<dint16>(reader->getInt32());
+        break;
+    case 290:
+        status = reader->getBool();
+        break;
+    case 63:
+        lightColor = static_cast<dint16>(reader->getInt32());
+        break;
+    case 291:
+        plotGlyph = reader->getBool();
+        break;
+    case 40:
+        intensity = reader->getDouble();
+        break;
+    case 10:
+        position.x = reader->getDouble();
+        break;
+    case 20:
+        position.y = reader->getDouble();
+        break;
+    case 30:
+        position.z = reader->getDouble();
+        break;
+    case 11:
+        target.x = reader->getDouble();
+        break;
+    case 21:
+        target.y = reader->getDouble();
+        break;
+    case 31:
+        target.z = reader->getDouble();
+        break;
+    case 72:
+        attenuationType = static_cast<dint16>(reader->getInt32());
+        break;
+    case 292:
+        useAttenuationLimits = reader->getBool();
+        break;
+    case 41:
+        attenuationStartLimit = reader->getDouble();
+        break;
+    case 42:
+        attenuationEndLimit = reader->getDouble();
+        break;
+    case 50:
+        hotspotAngle = reader->getDouble();
+        break;
+    case 51:
+        falloffAngle = reader->getDouble();
+        break;
+    case 293:
+        castShadows = reader->getBool();
+        break;
+    case 73:
+        shadowType = static_cast<dint16>(reader->getInt32());
+        break;
+    case 91:
+        shadowMapSize = static_cast<dint16>(reader->getInt32());
+        break;
+    case 280:
+        shadowSoftness = static_cast<dint16>(reader->getInt32());
+        break;
+    default:
+        DRW_Entity::parseCode(code, reader);
+        break;
+    }
+}
+
+//! DWG 路径的 LIGHT 位布局照 libredwg 的 dwg2.spec（DWG_ENTITY (LIGHT) 的
+//! 非 DXF 分支）逐字段对齐：
+//!     BL class_version → T name → BL type → B status → CMC light_color
+//!     → B plot_glyph → BD intensity → 3BD position → 3BD target
+//!     → BL attenuation_type → B use_attenuation_limits
+//!     → BD attenuation_start_limit → BD attenuation_end_limit
+//!     → BD hotspot_angle → BD falloff_angle → B cast_shadows
+//!     → BL shadow_type → BS shadow_map_size → RC shadow_map_softness
+//!
+//! 未建模的「光度扩展块」（LIGHTINGUNITS = 2 的图纸才有）不读：实体的公共句柄段
+//! 是框架按**对象末尾**定位的（parseDwgEntHandle），多出的类型数据不影响句柄。
+bool DRW_Light::parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs){
+    // 2007+ 的文本在独立字符串流里，必须用它的副本读文字（与 MTEXT/ATTRIB 同）
+    dwgBuffer sBuff = *buf;
+    dwgBuffer *sBuf = buf;
+    if (version > DRW::AC1018) {//2007+
+        sBuf = &sBuff;
+    }
+
+    bool ret = DRW_Entity::parseDwg(version, buf, sBuf, bs);
+    if (!ret)
+        return ret;
+    DRW_DBG("\n***************************** parsing light *********************************************\n");
+
+    classVersion = buf->getBitLong();
+    name = sBuf->getVariableText(version, false);
+    type = static_cast<dint16>(buf->getBitLong());
+    status = buf->getBit();
+    lightColor = static_cast<dint16>(buf->getCmColor(version));
+    plotGlyph = buf->getBit();
+    intensity = buf->getBitDouble();
+    position = buf->get3BitDouble();
+    target = buf->get3BitDouble();
+    attenuationType = static_cast<dint16>(buf->getBitLong());
+    useAttenuationLimits = buf->getBit();
+    attenuationStartLimit = buf->getBitDouble();
+    attenuationEndLimit = buf->getBitDouble();
+    hotspotAngle = buf->getBitDouble();
+    falloffAngle = buf->getBitDouble();
+    castShadows = buf->getBit();
+    shadowType = static_cast<dint16>(buf->getBitLong());
+    shadowMapSize = static_cast<dint16>(buf->getBitShort());
+    shadowSoftness = static_cast<dint16>(buf->getRawChar8());
+
+    DRW_DBG("light name: "); DRW_DBG(name.c_str());
+    DRW_DBG(", type: "); DRW_DBG(type);
+    DRW_DBG(", size: "); DRW_DBGPT(position.x, position.y, position.z);
+    DRW_DBG("\n");
+
+    ret = DRW_Entity::parseDwgEntHandle(version, buf);
+    if (!ret)
+        return ret;
+    return buf->isGood();
+}
+
 void DRW_Line::parseCode(int code, dxfReader *reader){
     switch (code) {
     case 11:

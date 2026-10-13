@@ -165,6 +165,10 @@ public:
     /// 弧长标注：DWG 里是类对象（CLASSES 段的 ARC_DIMENSION），
     /// 对象头写类号而非固定类型号。
     bool writeArcDimension(DRW_DimArc* ent);
+    /// 光源：DWG 里是类对象（CLASSES 段的 LIGHT / AcDbLight，所属模块 SCENEOE），
+    /// 对象头写类号。本体没有几何，只有那一组属性。**仅 R2007+ 有**这个类，
+    /// 更低版本的文件里不登记、也不该写出。
+    bool writeLight(DRW_Light* ent);
     bool writeText(DRW_Text* ent);
     /// 块属性：ATTRIB（块参照上的值）与 ATTDEF（块定义里的定义）。
     /// 两者与 TEXT 共用同一段文字数据，尾部再多「标签 + 字段长度 + 标志(+提示)」。

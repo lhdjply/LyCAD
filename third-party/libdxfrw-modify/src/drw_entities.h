@@ -51,7 +51,7 @@ namespace DRW {
         IMAGE,
         INSERT,
         LEADER,
-//        LIGHT,
+        LIGHT,
         LINE,
         LWPOLYLINE,
 //        MESH,
@@ -1679,6 +1679,79 @@ private:
     DRW_Coord *vertexpoint;   /*!< current control point to add data */
     dwgHandle dimStyleH;
     dwgHandle AnnotH;
+};
+
+//! Class to handle light entity
+/*!
+*  LIGHT（AcDbLight）是 R2007 起的光度控制光源：本体**没有几何**，在屏幕上
+*  画成一个小图标（AutoCAD / 浩辰 / 中望 都一样），属性包括名称、类型
+*  （平行光 / 点光源 / 聚光灯 / 光域网）、开关、颜色、强度、位置与目标、
+*  衰减、聚光角与阴影。不建这个类的话，整条光源在导入时会被静默丢掉。
+*
+*  字段与组码次序照 libredwg 的 dwg2.spec（DWG_ENTITY (LIGHT)）逐项对齐：
+*      100 AcDbLight → 90 classVersion → 1 name → 70 type → 290 status
+*      → 63 lightColor → 291 plotGlyph → 40 intensity → 10/20/30 position
+*      → 11/21/31 target → 72 attenuationType → 292 useAttenuationLimits
+*      → 41 attenuationStart → 42 attenuationEnd → 50 hotspot → 51 falloff
+*      → 293 castShadows → 73 shadowType → 91 shadowMapSize → 280 shadowSoftness
+*
+*  未建模：光度（photometric）扩展块（295/300/70/40/41/71/42/72/43/73/46-49/
+*  50-54/74-77）与代理图形（92 + 310）。前者只在 LIGHTINGUNITS=2 的图纸里出现，
+*  后者是本库对所有实体都未处理的公共组码。
+*  @author Rallaz
+*/
+class DRW_Light : public DRW_Entity {
+    SETENTFRIENDS
+public:
+    DRW_Light() {
+        eType = DRW::LIGHT;
+        classVersion = 0;
+        type = 2;                  // 默认点光源
+        status = true;             // 默认开启
+        lightColor = 7;            // 默认白
+        plotGlyph = false;
+        intensity = 1.0;
+        attenuationType = 0;       // 无衰减
+        useAttenuationLimits = false;
+        attenuationStartLimit = 1.0;
+        attenuationEndLimit = 10.0;
+        hotspotAngle = 45.0;
+        falloffAngle = 50.0;
+        castShadows = false;
+        shadowType = 0;
+        shadowMapSize = 0;
+        shadowSoftness = 0;
+        position.z = target.z = 0.0;
+    }
+
+    virtual void applyExtrusion() {}
+
+protected:
+    void parseCode(int code, dxfReader *reader);
+    /// DWG 侧的 LIGHT 是带类映射的独立对象（SCENEOE），本库未实现读取。
+    /// 保留覆写是因为基类的三参 parseDwg 是纯虚函数。
+    virtual bool parseDwg(DRW::Version version, dwgBuffer *buf, duint32 bs=0);
+
+public:
+    dint32 classVersion;          /*!< 类版本号, code 90 */
+    UTF8STRING name;              /*!< 光源名, code 1 */
+    dint16 type;                  /*!< 类型, code 70：1=平行光 2=点光源 3=聚光灯 4=光域网 */
+    bool status;                  /*!< 开关, code 290 */
+    dint16 lightColor;            /*!< 光源颜色（ACI）, code 63 */
+    bool plotGlyph;               /*!< 是否打印图标, code 291 */
+    double intensity;             /*!< 强度, code 40 */
+    DRW_Coord position;           /*!< 位置, code 10, 20 & 30 */
+    DRW_Coord target;             /*!< 目标点, code 11, 21 & 31 */
+    dint16 attenuationType;       /*!< 衰减方式, code 72：0=无 1=线性 2=平方反比 */
+    bool useAttenuationLimits;    /*!< 是否使用衰减界限, code 292 */
+    double attenuationStartLimit; /*!< 衰减起点, code 41 */
+    double attenuationEndLimit;   /*!< 衰减终点, code 42 */
+    double hotspotAngle;          /*!< 聚光角（度）, code 50 */
+    double falloffAngle;          /*!< 衰退角（度）, code 51 */
+    bool castShadows;             /*!< 是否投射阴影, code 293 */
+    dint16 shadowType;            /*!< 阴影类型, code 73 */
+    dint16 shadowMapSize;         /*!< 阴影贴图尺寸, code 91 */
+    dint16 shadowSoftness;        /*!< 阴影柔化, code 280 */
 };
 
 //! Class to handle viewport entity

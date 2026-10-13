@@ -75,6 +75,8 @@ public:
     bool writeViewport(DRW_Viewport *ent);
     DRW_ImageDef *writeImage(DRW_Image *ent, std::string name);
     bool writeLeader(DRW_Leader *ent);
+    /// 光度控制光源（DXF 实体 LIGHT）
+    bool writeLight(DRW_Light *ent);
     bool writeDimension(DRW_Dimension *ent);
     /// 弧长标注：DXF 里是独立实体 ARC_DIMENSION（不是 DIMENSION 的变体）
     bool writeArcDimension(DRW_DimArc *ent);
@@ -127,6 +129,8 @@ private:
     /// 弧长标注（DXF 扩展实体 ARC_DIMENSION）
     bool processArcDimension();
     bool processLeader();
+    /// 光度控制光源（DXF 实体 LIGHT，R2007+）
+    bool processLight();
 
 //    bool writeHeader();
     bool writeEntity(DRW_Entity *ent);

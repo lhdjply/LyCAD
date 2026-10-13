@@ -446,6 +446,7 @@ constexpr std::uint16_t kClassLayout      = 502;   // AcDbLayout
 constexpr std::uint16_t kClassDictVar     = 503;   // AcDbDictionaryVar
 constexpr std::uint16_t kClassArcDim      = 504;   // AcDbArcDimension（弧长标注）
 constexpr std::uint16_t kClassTable       = 505;   // AcDbTable（表格 ACAD_TABLE）
+constexpr std::uint16_t kClassLight       = 506;   // AcDbLight（光源 LIGHT，仅 R2007+）
 
 constexpr std::uint8_t kHcAbsolute = 5;     // 句柄码 5：硬指针（绝对）
 constexpr std::uint8_t kHcSoftPtr  = 4;     // 句柄码 4：软指针（绝对）——实体/控制对象属主
@@ -1972,7 +1973,7 @@ void dwgW::Private::initInfrastructure()
     mlineStyle = allocHandle();         // MLINESTYLE "STANDARD"
     dictVar = allocHandle();            // AcDbVariableDictionary
     headerXrec = allocHandle();         // 字典（ACDBHEADERROUNDTRIPXREC）
-    dictVars.assign(3, 0);              // DIMASSOC / HIDETEXT / PROJECTNAME
+    dictVars.assign(4, 0);              // DIMASSOC / HIDETEXT / LIGHTINGUNITS / PROJECTNAME
     for (std::uint32_t& h : dictVars) h = allocHandle();
 }
 
@@ -2084,14 +2085,25 @@ void dwgW::Private::encodePendingDefaults()
     encodeDictionary(*this, dictPlotSettings, nod, {});
     encodeDictionary(*this, dictColor, nod, {});
     encodeDictionary(*this, dictMaterial, nod, {});
-    // AcDbVariableDictionary 的三个变量（与样例一致：DIMASSOC/HIDETEXT/PROJECTNAME）
-    encodeDictVar(*this, dictVars[0], dictVar, "2");
-    encodeDictVar(*this, dictVars[1], dictVar, "1");
-    encodeDictVar(*this, dictVars[2], dictVar, "");
+    // AcDbVariableDictionary 的变量。前三个与样例一致（DIMASSOC/HIDETEXT/
+    // PROJECTNAME），第四个 LIGHTINGUNITS 是本写出器额外声明的：
+    //
+    // DWG 里 LIGHT 对象**是否携带光度扩展块**由图纸的 LIGHTINGUNITS 决定
+    // （libredwg dwg2.spec 的 `DWG_ENTITY (LIGHT)` → DECODER 段即按
+    //  `LIGHTINGUNITS == "2"` 置 is_photometric，AutoCAD 亦然）。本写出器给光源
+    // 写的是**标准光照**字段、不写光度块；若图纸按默认值被当成「光度单位」，
+    // 严格的读取端会照光度布局继续读，把光源对象后面的字节当光度字段 ——
+    // 光源解析崩掉后在图形区就看不见了。显式写 "0"（标准光照）与本写出器的
+    // 光源布局自洽，也与源图（老格式、标准光照）一致。
+    encodeDictVar(*this, dictVars[0], dictVar, "2");     // DIMASSOC
+    encodeDictVar(*this, dictVars[1], dictVar, "1");     // HIDETEXT
+    encodeDictVar(*this, dictVars[2], dictVar, "0");     // LIGHTINGUNITS = 标准光照
+    encodeDictVar(*this, dictVars[3], dictVar, "");      // PROJECTNAME
     encodeDictionary(*this, dictVar, nod,
                      { { "DIMASSOC", dictVars[0] },
                        { "HIDETEXT", dictVars[1] },
-                       { "PROJECTNAME", dictVars[2] } });
+                       { "LIGHTINGUNITS", dictVars[2] },
+                       { "PROJECTNAME", dictVars[3] } });
     // 样例中 NOD 的 "ACDBHEADERROUNDTRIPXREC" 条目指向的是 DICTIONARY（非 XRECORD），
     // 类型必须一致，否则严格读取器判定文件损坏。此处按样例写空字典。
     encodeDictionary(*this, headerXrec, nod, {});
@@ -2728,7 +2740,43 @@ bool dwgW::writeArcDimension(DRW_DimArc* ent)
     return true;
 }
 
-// UTF-8 → UTF-16LE 码元（定义见文件前部，与 EED 字符串写出共用）。
+// 光源（LIGHT）：DWG 里的类对象，对象头写的是类号 kClassLight（= 506）。
+//
+// 位布局严格照读取端 DRW_Light::parseDwg（后者又照 libredwg dwg2.spec 的
+// DWG_ENTITY (LIGHT)）：BL class_version → T name → BL type → B status
+// → CMC light_color → B plot_glyph → BD intensity → 3BD position → 3BD target
+// → BL attenuation_type → B use_attenuation_limits → BD 衰减界限
+// → BD 聚光角/衰退角 → B cast_shadows → BL shadow_type → BS 阴影贴图
+// → RC 阴影柔化。之后由框架接公共实体句柄段（COMMON_ENTITY_HANDLE_DATA）。
+//
+// 这里刻意**不写**光度扩展块（LIGHTINGUNITS = 2 的图纸才有，本实现未建模），
+// 写出的光源一律是非光度的 —— 与读取端一致，两边成对。
+bool dwgW::writeLight(DRW_Light* ent)
+{
+    d->encodeEntity(kClassLight, *ent, [&](Private::ObjBuilder& b) {
+        b.w.writeBL(ent->classVersion);                 // class_version
+        b.w.writeT(ent->name, d->codec);                // name（2007+ 进字符串流）
+        b.w.writeBL(ent->type);                         // type
+        b.w.writeB(ent->status);                        // status
+        d->writeColor(b, ent->lightColor);              // light_color（CMC）
+        b.w.writeB(ent->plotGlyph);                     // plot_glyph
+        b.w.writeBD(ent->intensity);                    // intensity
+        b.w.write3BD(ent->position.x, ent->position.y, ent->position.z);
+        b.w.write3BD(ent->target.x, ent->target.y, ent->target.z);
+        b.w.writeBL(ent->attenuationType);              // attenuation_type
+        b.w.writeB(ent->useAttenuationLimits);          // use_attenuation_limits
+        b.w.writeBD(ent->attenuationStartLimit);        // attenuation_start_limit
+        b.w.writeBD(ent->attenuationEndLimit);          // attenuation_end_limit
+        b.w.writeBD(ent->hotspotAngle);                 // hotspot_angle
+        b.w.writeBD(ent->falloffAngle);                 // falloff_angle
+        b.w.writeB(ent->castShadows);                   // cast_shadows
+        b.w.writeBL(ent->shadowType);                   // shadow_type
+        b.w.writeBS(ent->shadowMapSize);                // shadow_map_size
+        b.w.writeRC(static_cast<std::uint8_t>(ent->shadowSoftness & 0xFF));  // shadow_map_softness
+    });
+    return true;
+}
+
 
 /// AC1021（R2007+）表格单元格的「值」（AcDbCellValue）。
 ///
@@ -3683,40 +3731,54 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
     // 整块位于 LTYPE CONTINUOUS 句柄之后、R14+ 的 4 个 BS 之前；其中
     // INTERFEREOBJVS/INTERFEREVPVS/DRAGVS 是句柄（走句柄流），INTERFERECOLOR 是
     // CMC。漏写这一整块会让其后 4 个 BS 与控制对象句柄流整体错位。
+    // R2007+ 新增的头变量：**取值必须用 AutoCAD 的默认值，不能用 0**。
+    //
+    // 这一段的取值来自 libredwg `header_variables.spec` 的
+    // `SINCE (R_2007a) { IF_ENCODE_FROM_EARLIER { ... } }` —— 那个分支正是
+    // AutoCAD 在把 R2004- 的图纸升级到 R2007+ 时为这些新变量填入的默认值
+    // （与本仓 sample 目录里 AutoCAccess 系 CAD 写出的 DXF 逐项吻合：
+    //  $STEPSPERSEC=2、$DWFFRAME=2、$TIMEZONE=-8000、$PSOLWIDTH=5、
+    //  $LIGHTGLYPHDISPLAY=1、$TILEMODELIGHTSYNCH=1、$SOLIDHIST=1、$SHOWHIST=1 …）。
+    //
+    // 早期实现整段写 0，其中 **LIGHTGLYPHDISPLAY=0 会让 AutoCAD / 浩辰不再绘制
+    // 光源标记**（光源对象仍在图里、仍能渲染，但屏幕上没有任何可见标记）——
+    // 表现为「文件能打开，却看不到光源」。其余变量的 0 值同样与真实文件不符
+    // （如 TIMEZONE=0 会让「太阳/地理位置」跑到格林尼治）。
     if (ver > DRW::AC1018) {
+        const double halfPi = 1.5707963267948966;
         w.writeB(false);                                // CAMERADISPLAY
         w.writeBL(0); w.writeBL(0);                     // 未知长整型 ×2
         w.writeBD(0.0);                                 // 未知 double
-        w.writeBD(1.0);                                 // STEPSPERSEC
-        w.writeBD(1.0);                                 // STEPSIZE
-        w.writeBD(0.5);                                 // 3DDWFPREC
+        w.writeBD(2.0);                                 // STEPSPERSEC
+        w.writeBD(50.0);                                // STEPSIZE
+        w.writeBD(2.0);                                 // 3DDWFPREC
         w.writeBD(50.0);                                // LENSLENGTH
         w.writeBD(0.0);                                 // CAMERAHEIGHT
-        w.writeRC(0);                                   // SOLIDHIST
-        w.writeRC(0);                                   // SHOWHIST
-        w.writeBD(0.0);                                 // PSOLWIDTH
-        w.writeBD(0.0);                                 // PSOLHEIGHT
-        w.writeBD(0.0);                                 // LOFTANG1
-        w.writeBD(0.0);                                 // LOFTANG2
+        w.writeRC(1);                                   // SOLIDHIST
+        w.writeRC(1);                                   // SHOWHIST
+        w.writeBD(5.0);                                 // PSOLWIDTH
+        w.writeBD(80.0);                                // PSOLHEIGHT
+        w.writeBD(halfPi);                              // LOFTANG1
+        w.writeBD(halfPi);                              // LOFTANG2
         w.writeBD(0.0);                                 // LOFTMAG1
         w.writeBD(0.0);                                 // LOFTMAG2
-        w.writeBS(0);                                   // LOFTPARAM
-        w.writeRC(0);                                   // LOFTNORMALS
-        w.writeBD(0.0);                                 // LATITUDE
-        w.writeBD(0.0);                                 // LONGITUDE
+        w.writeBS(7);                                   // LOFTPARAM
+        w.writeRC(1);                                   // LOFTNORMALS
+        w.writeBD(1.0);                                 // LATITUDE
+        w.writeBD(1.0);                                 // LONGITUDE
         w.writeBD(0.0);                                 // NORTHDIRECTION
-        w.writeBL(0);                                   // TIMEZONE
-        w.writeRC(0);                                   // LIGHTGLYPHDISPLAY
-        w.writeRC(0);                                   // TILEMODELIGHTSYNCH
-        w.writeRC(0);                                   // DWFFRAME
+        w.writeBL(-8000);                               // TIMEZONE
+        w.writeRC(1);                                   // LIGHTGLYPHDISPLAY（1=显示光源标记）
+        w.writeRC(1);                                   // TILEMODELIGHTSYNCH
+        w.writeRC(2);                                   // DWFFRAME
         w.writeRC(0);                                   // DGNFRAME
-        w.writeB(false);                                // 未知位
-        d.writeColor(w, 256);                           // INTERFERECOLOR（CMC，ByLayer）
+        w.writeB(true);                                 // REALWORLDSCALE
+        d.writeColor(w, 1);                             // INTERFERECOLOR（CMC，红）
         w.writeHandle(kHcAbsolute, 0);                  // INTERFEREOBJVS
         w.writeHandle(kHcAbsolute, 0);                  // INTERFEREVPVS
         w.writeHandle(kHcAbsolute, 0);                  // DRAGVS
         w.writeRC(0);                                   // CSHADOW
-        w.writeBD(0.0);                                 // 未知 double 2
+        w.writeBD(0.0);                                 // SHADOWPLANELOCATION
     }
 
     for (int i = 0; i < 4; ++i) w.writeBS(0);           // R14+ 未知短整型
@@ -3763,13 +3825,18 @@ void writeHeaderVars(dwgBitWriter& w, DRW_Header& hdr, dwgW::Private& d,
 }
 
 /// 写一条类记录（R2000 classes 节）
+///
+/// appName 是**所属模块名**：AutoCAD 自己的类用 "ObjectDBX Classes"，
+/// 而光源来自 SCENEOE 模块（实测 example.dxf 的 CLASS 记录 3 组码即 "SCENEOE"）。
+/// 写成别的名字会让严格解析端把它当代理类，光源属性读不出来。
 void writeOneClass(dwgBitWriter& w, dwgW::Private& d, std::uint16_t num,
                    const char* cppName, const char* dxfName, DRW::Version ver,
-                   std::uint16_t itemClassId = 499)
+                   std::uint16_t itemClassId = 499,
+                   const char* appName = "ObjectDBX Classes")
 {
     w.writeBS(static_cast<dint16>(num));                // 类号（500 起）
     w.writeBS(0);                                       // 版本/代理标志
-    w.writeT("ObjectDBX Classes", d.codec);             // 应用名
+    w.writeT(appName, d.codec);                         // 应用名（所属模块）
     w.writeT(cppName, d.codec);                         // C++ 类名
     w.writeT(dxfName, d.codec);                         // DXF 记录名
     w.writeB(false);                                    // is_zombie
@@ -3806,6 +3873,12 @@ void writeClassesData(dwgBitWriter& w, dwgW::Private& d, std::uint16_t& nextClas
     // 表格（ACAD_TABLE）同样是类对象：实体写出时用这里的类号 kClassTable。
     // 同样是图元 → item_class_id = 498。
     writeOneClass(w, d, nextClassNum++, "AcDbTable", "ACAD_TABLE", ver, 498);
+    // 光源（LIGHT）也是类对象，且 **R2007 起才有**：低版本不登记这个类，
+    // 那些版本的 classes 节因此与本条之前**逐字节一致**（回归不变量）。
+    // 所属模块是 SCENEOE（AutoCAD 实测如此），不是 ObjectDBX Classes。
+    if (ver >= DRW::AC1021) {
+        writeOneClass(w, d, nextClassNum++, "AcDbLight", "LIGHT", ver, 498, "SCENEOE");
+    }
 }
 
 } // namespace

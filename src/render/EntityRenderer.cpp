@@ -13,6 +13,7 @@
 #include "core/InsertEntity.h"
 #include "core/Layer.h"
 #include "core/LineEntity.h"
+#include "core/LightEntity.h"
 #include "core/Linetype.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
@@ -934,6 +935,96 @@ void drawPointMarker(QPainter& painter, const Point2D& devicePos, const QColor& 
     painter.setBrush(savedBrush);
 }
 
+// -----------------------------------------------------------------------------
+//  光源
+// -----------------------------------------------------------------------------
+/// 绘制光源的屏幕标记（LIGHT 本体没有几何）。
+///
+/// 与 AutoCAD / 浩辰 / 中望 同一约定：标记是**固定像素尺寸**的——放大图纸时它不会
+/// 跟着变大（否则 1:100 的图里一个光标记会涨成一团墨）。画法按类型区分：
+///   · 点光源  —— 圆 + 八向光芒
+///   · 聚光灯  —— 圆 + 光芒 + 指向目标的圆锥（开口朝目标）
+///   · 光域网  —— 同聚光灯
+///   · 平行光  —— 圆 + 光芒 + 带箭头的方向线
+/// 已关闭的光源（DXF 290 = 0）画成虚线，与 AutoCAD 的灰显语义一致。
+void drawLightEntity(QPainter& painter, const LightEntity& light, const DrawContext& context)
+{
+    const Point2D device = context.view->toDevice(light.position());
+    const double r = LightEntity::kGlyphRadiusPixels;
+    const QPointF c(device.x, device.y);
+
+    // 剔除：标记很小，按外接方框判可见即可
+    const double pad = r * 4.0;
+    if (!context.viewport.adjusted(-pad, -pad, pad, pad).contains(c)) return;
+
+    const QPen savedPen = painter.pen();
+    QPen pen(savedPen);
+    pen.setStyle(light.isOn() ? Qt::SolidLine : Qt::DashLine);
+    pen.setWidthF(std::max(1.0, pen.widthF()));
+    painter.setPen(pen);
+
+    painter.drawEllipse(c, r, r);
+
+    constexpr double kPi = 3.14159265358979323846;
+    for (int i = 0; i < 8; ++i) {
+        const double angle = static_cast<double>(i) * kPi / 4.0;
+        const double ca = std::cos(angle);
+        const double sa = std::sin(angle);
+        painter.drawLine(QPointF(c.x() + ca * r * 1.30, c.y() + sa * r * 1.30),
+                         QPointF(c.x() + ca * r * 2.00, c.y() + sa * r * 2.00));
+    }
+
+    if (light.lightType() == LightEntity::LightType::Point) {
+        painter.setPen(savedPen);
+        return;
+    }
+
+    // 方向：设备坐标下「位置 -> 目标」的单位向量（目标可能远在图外，只取方向）
+    const Point2D targetDevice = context.view->toDevice(light.target());
+    const double vx = targetDevice.x - device.x;
+    const double vy = targetDevice.y - device.y;
+    const double len = std::hypot(vx, vy);
+    if (len > 1e-9) {
+        const double dx = vx / len;
+        const double dy = vy / len;
+        const double nx = -dy;                 // 方向线的法向
+        const double ny = dx;
+
+        if (light.lightType() == LightEntity::LightType::Distant) {
+            const QPointF from(c.x() + dx * r * 1.20, c.y() + dy * r * 1.20);
+            const QPointF tip(c.x() + dx * r * 3.60, c.y() + dy * r * 3.60);
+            painter.drawLine(from, tip);
+            const double head = r * 0.85;
+            painter.drawLine(tip, QPointF(tip.x() - dx * head + nx * head * 0.55,
+                                          tip.y() - dy * head + ny * head * 0.55));
+            painter.drawLine(tip, QPointF(tip.x() - dx * head - nx * head * 0.55,
+                                          tip.y() - dy * head - ny * head * 0.55));
+        } else {
+            // 圆锥：顶点在圆边上，两条母线 + 底边弧（弧用折线逼近——Qt 的 drawArc
+            // 角度约定在 y 轴向下的设备坐标里容易绕错，这里宁可用明确的折线）
+            const QPointF apex(c.x() + dx * r * 1.10, c.y() + dy * r * 1.10);
+            const double far = r * 2.40;
+            const double spread = r * 1.00;
+            const double theta = std::atan2(dy, dx);
+            const double phi = std::atan2(spread, far);      // 锥的半角
+
+            constexpr int kSegments = 8;
+            QPointF previous(apex.x() + std::cos(theta - phi) * far,
+                             apex.y() + std::sin(theta - phi) * far);
+            painter.drawLine(apex, previous);
+            for (int k = 1; k <= kSegments; ++k) {
+                const double angle = theta - phi + 2.0 * phi * static_cast<double>(k) / kSegments;
+                const QPointF current(apex.x() + std::cos(angle) * far,
+                                      apex.y() + std::sin(angle) * far);
+                painter.drawLine(previous, current);
+                previous = current;
+            }
+            painter.drawLine(apex, previous);
+        }
+    }
+    painter.setPen(savedPen);
+}
+
 void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
           const QColor& color, double lineweightMm, const QString& linetypeName)
 {
@@ -1076,6 +1167,10 @@ void draw(QPainter& painter, const Entity& entity, const DrawContext& context,
     }
     case EntityType::Table: {
         drawTableEntity(painter, static_cast<const TableEntity&>(entity), context, color);
+        break;
+    }
+    case EntityType::Light: {
+        drawLightEntity(painter, static_cast<const LightEntity&>(entity), context);
         break;
     }
     }

@@ -13,6 +13,7 @@
 #include "core/HatchEntity.h"
 #include "core/InfiniteLineEntity.h"
 #include "core/LineEntity.h"
+#include "core/LightEntity.h"
 #include "core/PointEntity.h"
 #include "core/PolylineEntity.h"
 #include "core/SplineEntity.h"
@@ -305,6 +306,12 @@ void SnapEngine::collectEntityCandidates(const Document& document,
                     hit |= add(p, SnapKind::Endpoint);
                 }
             }
+            break;
+        }
+        case EntityType::Light: {
+            // 光源没有几何，只有位置：按节点语义捕捉（插拔灯具、对齐灯位时要用）
+            const auto& light = static_cast<const LightEntity&>(e);
+            if (m_settings.node) hit |= add(light.position(), SnapKind::NodePoint);
             break;
         }
         }

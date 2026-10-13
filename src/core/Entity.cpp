@@ -31,6 +31,7 @@ QString entityTypeName(EntityType type)
     case EntityType::Ray:      return QStringLiteral("RAY");
     case EntityType::Insert:   return QStringLiteral("INSERT");
     case EntityType::Table:    return QStringLiteral("ACAD_TABLE");
+    case EntityType::Light:    return QStringLiteral("LIGHT");
     }
     return QStringLiteral("UNKNOWN");
 }
@@ -53,6 +54,7 @@ QString entityTypeDisplayName(EntityType type)
     case EntityType::Ray:      return QStringLiteral("射线");
     case EntityType::Insert:   return QStringLiteral("块参照");
     case EntityType::Table:    return QStringLiteral("表格");
+    case EntityType::Light:    return QStringLiteral("光源");
     }
     return QStringLiteral("未知图元");
 }
