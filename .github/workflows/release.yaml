@@ -52,13 +52,23 @@ jobs:
         docker run --rm --platform linux/${{ matrix.platform }} -v ${{ github.workspace }}:/workspace \
           ${{ matrix.image }} \
           bash -c "
+          set -e
           cd /workspace &&
+          Jobs=\$(nproc) &&
+          echo \"容器内 CPU 数：\$Jobs\" &&
           apt update &&
           apt install -y build-essential devscripts dh-make equivs &&
           mk-build-deps -i -t 'apt-get -y' './debian/control' &&
-          DEB_BUILD_OPTIONS='${{ matrix.deb_build_options }}' debuild -us -uc &&
+          DEB_BUILD_OPTIONS=\"${{ matrix.deb_build_options }} parallel=\$Jobs\" debuild -us -uc &&
           cp ../*.deb ./
           "
+
+    # 关于上面那个 parallel=N：
+    #   · 主程序由 dh_auto_build 构建，它只认 DEB_BUILD_OPTIONS 里的 parallel，
+    #     debuild 不带 -j 时是**单线程**（~70 个 TU 顺序编）；
+    #   · 测试目标由 debian/rules 自己调用 cmake 构建，那里也会读同一个值
+    #     （没给就退回 nproc），绝不能写成不带数字的 --parallel——Make 生成器下
+    #     CMake 会把它翻译成 `make -j`（无限并发），几百个 g++ 同时起，容器直接卡住。
 
     - name: 归集 deb 安装包
       run: |

@@ -797,6 +797,12 @@ debuild -us -uc                                     # 产物落在仓库的上�
   而 `ctest` 不会自己编译缺失的二进制，所以 `debian/rules` 先显式构建 `lycad_tests`
   再跑；构建 chroot 里没有显示服务，用例自带 `QT_QPA_PLATFORM=offscreen`。
   嫌慢或构建环境不合适时，用 `DEB_BUILD_OPTIONS=nocheck debuild -us -uc` 跳过。
+  这一步是整条 deb 流程里最重的（11 个测试目标各自编入整套 headless 源码，约 520 次
+  编译，原因见上文「每个可执行文件各编一次」），所以并行度必须显式给数字：
+  `cmake --build --parallel` 不带数字时，Make 生成器下会变成 `make -j`（**无限并发**），
+  几百个 `g++` 一起抢内存，在构建容器里看着就像卡住。`debian/rules` 取
+  `DEB_BUILD_OPTIONS` 里的 `parallel=N`（CI 传的是容器自身的 `nproc`），没给就退回
+  `nproc`；`debuild` 不带 `-j` 时主程序那份本是单线程编的，同样靠这个值并行起来。
   构建目录固定为 `build/deb`（而不是让 debhelper 取 `obj-<triplet>`）——上面的测试步骤
   要按名字构建一个 `EXCLUDE_FROM_ALL` 目标，目录名自己拿在手里最省事；该目录由
   `debian/clean` 负责清理。
