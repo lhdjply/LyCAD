@@ -20,7 +20,10 @@ int main(int argc, char* argv[])
 
     QApplication::setApplicationName(QStringLiteral("LyCAD"));
     QApplication::setApplicationDisplayName(QStringLiteral("LyCAD"));
-    QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    // 版本号由构建系统以 LYCAD_VERSION 宏注入：唯一来源是仓库根的 VERSION 文件
+    //（读取见 CMakeLists.txt 开头，注入见 add_compile_definitions(LYCAD_VERSION)），
+    // 此处不写字面量。
+    QApplication::setApplicationVersion(QStringLiteral(LYCAD_VERSION));
     QApplication::setOrganizationName(QStringLiteral("LyCAD"));
     QApplication::setOrganizationDomain(QStringLiteral("lycad.local"));
 

@@ -1,0 +1,121 @@
+name: 测试
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+# 用例逐条设了 QT_QPA_PLATFORM=offscreen（tests/CMakeLists.txt 里的 ctest 属性），
+# 这里再兜一层：构建机没有显示服务。
+env:
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  test:
+    name: 测试 (Linux)
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统 Qt 与构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            cmake \
+            ninja-build \
+            g++ \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            qt6-svg-dev \
+            fonts-dejavu-core
+
+      - name: 打印实际使用的 Qt 版本
+        run: |
+          dpkg-query -W -f='${Package} ${Version}\n' qt6-base-dev qt6-svg-dev
+          # fonts-dejavu-core：MTEXT 与光源两个用例把渲染结果画到离屏图上再数像素，
+          # 环境里一个字体都没有的话，断言就没有东西可量。
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DLYCAD_BUILD_TESTS=ON
+          -DLYCAD_BUILD_TOOLS=OFF
+
+      # 测试目标是 EXCLUDE_FROM_ALL 的（日常构建只编主程序），而 ctest 不会自己
+      # 编译缺失的二进制——必须先显式构建 lycad_tests。
+      - name: 构建测试目标
+        run: cmake --build build --parallel --target lycad_tests
+
+      - name: 运行测试
+        shell: bash
+        run: |
+          set +e
+          ctest --test-dir build --output-on-failure 2>&1 | tee build/ctest-run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo
+            echo "########## 测试失败：失败用例的完整输出 ##########"
+            # QtTest 的输出有时抓不到，--output-on-failure 只剩一句 Failed。ctest
+            # 记得哪些用例失败，这里用 --rerun-failed -V 把它们的完整输出重新打进
+            # CI 日志，不必再去下载 artifact。
+            ctest --test-dir build --rerun-failed -V || true
+            echo "###################################################"
+            exit "$status"
+          fi
+
+  # 与 build.yaml 同理：Windows 走 MSYS2 / MinGW，因为 DWG 解析依赖 iconv。
+  # 见 build.yaml 顶部关于工具链选择的说明。
+  test-windows:
+    name: 测试 (Windows / MinGW)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 MSYS2 环境
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          cache: true
+          update: true
+          pacboy: cmake:p gcc:p ninja:p qt6-base:p qt6-svg:p libiconv:p
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DLYCAD_BUILD_TESTS=ON
+          -DLYCAD_BUILD_TOOLS=OFF
+
+      - name: 构建测试目标
+        run: cmake --build build --parallel --target lycad_tests
+
+      - name: 运行测试
+        shell: bash
+        run: |
+          set +e
+          ctest --test-dir build --output-on-failure 2>&1 | tee build/ctest-run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo
+            echo "########## 测试失败：失败用例的完整输出 ##########"
+            ctest --test-dir build --rerun-failed -V || true
+            echo "###################################################"
+            exit "$status"
+          fi

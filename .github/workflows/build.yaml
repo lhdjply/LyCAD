@@ -1,0 +1,82 @@
+name: 构建
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建 (Linux)
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统 Qt 与构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            cmake \
+            ninja-build \
+            g++ \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            qt6-svg-dev
+
+      - name: 打印实际使用的 Qt 版本
+        run: |
+          # 把版本打出来，便于对照"本地 6.8.0 上能过、CI 上为什么不行"。
+          dpkg-query -W -f='${Package} ${Version}\n' qt6-base-dev qt6-svg-dev
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DLYCAD_BUILD_TESTS=OFF
+
+      - name: 构建
+        run: cmake --build build --parallel
+
+      # 开发工具（sample_generator / icon_sheet / ui_snapshot）是 EXCLUDE_FROM_ALL
+      # 的：不进默认构建，也不随包发布。但它们的编译错误同样得有人管——这里显式
+      # 编一遍，免得工具悄悄失修。
+      - name: 构建开发工具（仅验证能编过）
+        run: cmake --build build --target lycad_tools --parallel
+
+  # Windows 用 MSYS2 / MinGW，而不是 MSVC + install-qt-action：
+  # DWG 的文本编码转换走 iconv（third-party/libdxfrw-modify/src/intern/drw_textcodec.cpp），
+  # MSVC 侧没有现成的 iconv 可链接，MinGW 侧由 libiconv 提供。发布用的也是这套
+  # 工具链（见 release.yaml），三条工作流因此保持一致。
+  build-windows:
+    name: 构建 (Windows / MinGW)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 MSYS2 环境
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          cache: true
+          update: true
+          pacboy: cmake:p gcc:p ninja:p qt6-base:p qt6-svg:p libiconv:p
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DLYCAD_BUILD_TESTS=OFF
+
+      - name: 构建
+        run: cmake --build build --parallel

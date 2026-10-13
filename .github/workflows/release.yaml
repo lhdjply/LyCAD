@@ -1,0 +1,435 @@
+name: 发布
+
+on:
+  push:
+    branches: [ '*' ]
+    tags: [ '*' ]
+  pull_request:
+    branches: [ '*' ]
+  workflow_dispatch:
+  
+env:
+  APP_NAME: "lycad"
+  BUILD_TYPE: "Release"
+
+jobs:
+  build-deb:
+    name: 打包 (Linux deb)
+    runs-on: ubuntu-26.04
+    continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - platform: amd64
+            image: linuxdeepin/deepin:crimson
+            # amd64 在 x86_64 runner 上是原生速度，照常跑 debian/rules 里的测试套件
+            deb_build_options: ""
+          # 其余三个架构要经 QEMU 仿真。debian/rules 默认会把 11 个测试二进制全编一遍
+          # 再跑（每个都编入整套 headless 源码），仿真下代价过高；测试由 amd64 那份
+          # 覆盖，这里按 Debian 惯例用 nocheck 跳过。
+          - platform: arm64
+            image: linuxdeepin/deepin:crimson-arm64
+            deb_build_options: "nocheck"
+          - platform: loong64
+            image: linuxdeepin/deepin:crimson-loong64
+            deb_build_options: "nocheck"
+          - platform: riscv64
+            image: linuxdeepin/deepin:crimson-riscv64
+            deb_build_options: "nocheck"
+    steps:
+    - name: 安装 QEMU
+      uses: docker/setup-qemu-action@v4
+      with:
+        platforms: ${{ matrix.platform }}
+
+    - name: 安装 Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - uses: actions/checkout@v6
+
+    - name: 构建 ${{ matrix.platform }} 安装包
+      run: |
+        docker run --rm --platform linux/${{ matrix.platform }} -v ${{ github.workspace }}:/workspace \
+          ${{ matrix.image }} \
+          bash -c "
+          cd /workspace &&
+          apt update &&
+          apt install -y build-essential devscripts dh-make equivs &&
+          mk-build-deps -i -t 'apt-get -y' './debian/control' &&
+          DEB_BUILD_OPTIONS='${{ matrix.deb_build_options }}' debuild -us -uc &&
+          cp ../*.deb ./
+          "
+
+    - name: 归集 deb 安装包
+      run: |
+        if ls ./*dbgsym*.deb 1> /dev/null 2>&1; then
+          rm ./*dbgsym*.deb
+        fi
+
+        if ls ./*build-deps*.deb 1> /dev/null 2>&1; then
+          rm ./*build-deps*.deb
+        fi
+        
+        mkdir deb_package
+        cp ./*.deb deb_package
+
+    - name: 上传 deb 产物
+      uses: actions/upload-artifact@v7
+      with:
+          name: ${{ env.APP_NAME }}_linux_deb_${{ matrix.platform }}
+          path: deb_package/*.deb
+      
+  # Windows 走 MSYS2 / MinGW 而不是 MSVC（DWG 解析依赖 iconv，MSVC 侧没有可链接的
+  # iconv，见 build.yaml 顶部说明）。产物两种形态：
+  #   · zip —— 解压即用，主程序 + windeployqt 部署好的 Qt DLL 与插件；
+  #   · setup.exe —— Inno Setup 6，脚本 resources/win/lycad.iss，带简体中文语言包。
+  build-windows:
+    name: 打包 (Windows / MinGW)
+    runs-on: ${{ matrix.config.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: windows-latest
+            msystem: ucrt64
+            compiler: gcc
+            platform_tag: win_x64
+            # MyArch 只用于安装包文件名；Inno 的目标架构约束值是另一个（x64compatible）。
+            arch: x64
+            arch_allowed: x64compatible
+          - os: windows-11-arm
+            msystem: clangarm64
+            compiler: clang
+            platform_tag: win_arm64
+            # Inno 的 arm64 约束值就是 arm64（6.3+），文件名也写 arm64。
+            arch: arm64
+            arch_allowed: arm64
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:  
+    - name: 关闭 Git 换行转换
+      shell: pwsh
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+
+    - name: 检出代码
+      uses: actions/checkout@v6
+
+    - name: 安装 MSYS2 环境
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{ matrix.config.msystem }}
+        cache: true
+        update: true
+        install: zip
+        # qt6-tools 提供 windeployqt（部署 Qt6 依赖那一步要用），libiconv 供
+        # drw_textcodec 的 iconv 调用链接。
+        pacboy: cmake:p ${{ matrix.config.compiler }}:p ninja:p qt6-base:p qt6-svg:p qt6-tools:p libiconv:p
+
+    - name: 用 CMake 构建
+      run: |
+        cmake.exe -B build/ -G 'Ninja' \
+                  -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+                  -DCMAKE_INSTALL_PREFIX=build/${{ env.APP_NAME }} \
+                  -DLYCAD_BUILD_TESTS=OFF \
+                  -DLYCAD_BUILD_TOOLS=OFF
+        cmake.exe --build build/ --parallel --config ${{env.BUILD_TYPE}}
+
+    # 版本号只有一个来源：仓库根目录的 VERSION 文件——CMake 的 project(VERSION)
+    # 也是从它读的（见根 CMakeLists.txt 开头）。zip/安装包名与 artifact 名都取它；
+    # debian/changelog 的版本是唯一需要手工同步的第二处（包名走 changelog）。
+    - name: 读取版本号
+      shell: pwsh
+      run: |
+        $version = (Get-Content VERSION -First 1).Trim()
+        if (-not $version) { throw "VERSION 文件为空" }
+        echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+        echo "版本号: $version"
+
+    - name: 安装到暂存目录
+      run: |
+        cmake --build build/ --target install
+        strip build/${{ env.APP_NAME }}/bin/*.exe
+
+    - name: 部署 Qt6 依赖
+      run: |
+        bin_dir="build/${{ env.APP_NAME }}/bin"
+
+        # MSYS2 的 qt6-tools 把可执行文件命名为 windeployqt6.exe（避免与 qt5 的
+        # windeployqt 撞名），Qt 官方安装包则叫 windeployqt.exe，这里两个都认。
+        deploy_tool=""
+        for candidate in windeployqt6.exe windeployqt.exe; do
+          if command -v "$candidate" > /dev/null 2>&1; then
+            deploy_tool="$candidate"
+            break
+          fi
+        done
+        if [ -z "$deploy_tool" ]; then
+          echo "::error::找不到 windeployqt（qt6-tools 没装？）"
+          exit 1
+        fi
+        echo "使用 $deploy_tool"
+
+        # 不传 --no-<模块>：本程序链接 Qt6Core / Gui / Widgets / Svg / PrintSupport，
+        # 都会被写进 exe 的导入表，windeployqt 按其导入表部署即可。
+        # --no-translations：本项目没有翻译文件（.qm）。
+        options="--no-translations --no-system-d3d-compiler"
+
+        executables=(
+          "${{ env.APP_NAME }}.exe"
+        )
+
+        for exe in "${executables[@]}"; do
+          $deploy_tool "$bin_dir/$exe" $options || { echo "::error::windeployqt 部署 $exe 失败"; exit 1; }
+        done
+
+    - name: 校验 Qt 依赖已部署齐全
+      run: |
+        bin_dir="build/${{ env.APP_NAME }}/bin"
+        exe="$bin_dir/${{ env.APP_NAME }}.exe"
+
+        # exe 导入表里的 Qt6*.dll 必须都在 bin/ 下。被 --no-<模块> 关掉的模块
+        # 属于"成功地没部署"，退出码照样是 0，只能这样查。
+        missing=0
+        for dll in $(objdump -p "$exe" | awk '/DLL Name:/ {print $3}'); do
+          case "$dll" in
+            Qt6*)
+              if [ ! -f "$bin_dir/$dll" ]; then
+                echo "::error::$dll 没有部署，但它在 ${{ env.APP_NAME }}.exe 的导入表里"
+                missing=1
+              fi
+              ;;
+          esac
+        done
+
+        if [ "$missing" -ne 0 ]; then
+          ls -la "$bin_dir" || true
+          exit 1
+        fi
+
+        ls "$bin_dir"/Qt6*.dll
+          
+    - name: 复制非 Qt 的 DLL
+      run: |
+        shopt -s extglob
+        FILES=$(ldd build/${{ env.APP_NAME }}/bin/${{ env.APP_NAME }}.exe | awk '($3 ~ /\/${{ matrix.config.msystem }}\/bin\//) {print $3}')
+        for file in $FILES; do
+          if [[ $(basename "$file") != Qt6* ]]; then
+            cp -r "$file" build/${{ env.APP_NAME }}/bin
+          fi
+        done
+            
+    - name: 打包为 zip
+      run: |
+        cd build/${{ env.APP_NAME }}
+        # Windows 上只装到 bin/（.desktop 与图标主题是 Linux 的事，根 CMakeLists.txt
+        # 里按平台分派），这里把实际存在的目录收进去，缺目录时不让 zip 报 warning。
+        items=""
+        for dir in bin share lib; do
+          [ -d "$dir" ] && items="$items ./$dir"
+        done
+        zip -r ../../${{ env.APP_NAME }}_${{ env.APP_VERSION }}_${{ matrix.config.platform_tag }}.zip $items
+        cd ../..
+
+    - name: 编译 Windows 安装包
+      shell: pwsh
+      run: |
+        $ver = (Get-Content VERSION -First 1).Trim()
+        $src = Join-Path $env:GITHUB_WORKSPACE 'build\lycad'
+        $out = Join-Path $env:GITHUB_WORKSPACE 'dist'
+        New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+        # runner 镜像不再自带 Inno Setup（2025-09 起移除），且 ChineseSimplified.isl
+        # 要求 6.5.0+，所以这里自行探测并保证版本。
+        #
+        # 版本必须从**注册表**读：ISCC.exe 是 GUI 子系统程序，`ISCC /?` 不写 stdout，
+        # 用 `& $iscc /?` 捕获输出只会拿到空串。注册表的 DisplayVersion 才是可靠的
+        # 版本来源（choco 包自己也靠 Get-UninstallRegistryKey 'Inno Setup*' 定位）。
+        function Find-IsccInstall {
+          $roots = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          foreach ($root in $roots) {
+            $entries = Get-ItemProperty $root -ErrorAction SilentlyContinue |
+                       Where-Object { $_.DisplayName -like 'Inno Setup*' }
+            foreach ($entry in $entries) {
+              if ($entry.InstallLocation) {
+                $candidate = Join-Path $entry.InstallLocation 'ISCC.exe'
+                if (Test-Path $candidate) {
+                  # DisplayVersion 不保证是干净的 x.y.z，转 [version] 要防抛异常。
+                  $parsed = $null
+                  if ($entry.DisplayVersion) {
+                    [void] [version]::TryParse($entry.DisplayVersion, [ref] $parsed)
+                  }
+                  return [pscustomobject]@{ Path = $candidate; Version = $parsed }
+                }
+              }
+            }
+          }
+          return $null
+        }
+
+        # 兜底：按路径找 ISCC.exe，并尝试从 exe 的文件版本读版本号。
+        function Find-IsccByPath {
+          $candidates = @()
+          $onPath = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if ($onPath) { $candidates += $onPath }
+          if ($env:ChocolateyInstall) { $candidates += "$env:ChocolateyInstall\bin\ISCC.exe" }
+          foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if (-not $base -or -not (Test-Path $base)) { continue }
+            $hit = Get-ChildItem -Path $base -Filter 'ISCC.exe' -Recurse -Depth 3 `
+                                 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $candidates += $hit.FullName }
+          }
+          foreach ($candidate in $candidates) {
+            if (-not (Test-Path $candidate)) { continue }
+            $fileVersion = $null
+            try {
+              $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($candidate)
+              if ($info.FileVersion) {
+                $parsed = $null
+                if ([version]::TryParse($info.FileVersion, [ref] $parsed)) { $fileVersion = $parsed }
+              }
+            } catch { }
+            return [pscustomobject]@{ Path = $candidate; Version = $fileVersion }
+          }
+          return $null
+        }
+
+        $minVersion = [version] '6.5.0'
+        $found = Find-IsccInstall
+        if (-not $found) { $found = Find-IsccByPath }
+        Write-Host "ISCC 探测结果：$(if($found){$found.Path}else{'未找到'})，版本 $(if($found -and $found.Version){$found.Version}else{'未知'})"
+
+        if (-not $found -or -not $found.Version -or $found.Version -lt $minVersion) {
+          Write-Host "安装/升级 Inno Setup 6…"
+          # 已装但版本过低时 choco 会拒绝重装，所以要 --force。
+          choco install innosetup -y --no-progress --force
+          # 1641/3010 = 装好了但需要重启，不算失败。
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1641 -and $LASTEXITCODE -ne 3010) {
+            throw "choco install innosetup 失败，退出码 $LASTEXITCODE"
+          }
+          # 优先用注册表（choco 装完必然写 DisplayVersion）；读不到就用文件版本兜底。
+          $found = Find-IsccInstall
+          if (-not $found) { $found = Find-IsccByPath }
+        }
+
+        if (-not $found) {
+          throw "找不到 ISCC.exe（注册表、PATH、Program Files 都没找到）。"
+        }
+        # 版本仍然未知时**不阻断**：ISCC 能跑就行，版本检查只是拦"明确过低"的情况。
+        if ($found.Version -and $found.Version -lt $minVersion) {
+          throw "ISCC 版本 $($found.Version) 低于要求的 $minVersion（ChineseSimplified.isl 需要 6.5.0+）。"
+        }
+        Write-Host "使用 ISCC：$($found.Path)，版本 $(if($found.Version){$found.Version}else{'未知'})"
+
+        & $found.Path "/DMyAppVersion=$ver" `
+                "/DMyArch=${{ matrix.config.arch }}" `
+                "/DMyArchAllowed=${{ matrix.config.arch_allowed }}" `
+                "/DMySourceDir=$src" `
+                "/DMyOutputDir=$out" `
+                "/DMyRepoRoot=$env:GITHUB_WORKSPACE" `
+                "/DMyChineseIsl=$env:GITHUB_WORKSPACE\resources\win\ChineseSimplified.isl" `
+                "resources\win\lycad.iss"
+        if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败，退出码 $LASTEXITCODE" }
+        Get-ChildItem $out
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.APP_NAME }}_${{ env.APP_VERSION }}_${{ matrix.config.platform_tag }}
+        path: ${{ env.APP_NAME }}_${{ env.APP_VERSION }}_${{ matrix.config.platform_tag }}.zip
+
+    - name: 上传 Windows 安装包
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.APP_NAME }}_${{ env.APP_VERSION }}_${{ matrix.config.platform_tag }}_setup
+        path: dist/*.exe
+
+  create-release:
+    name: 发布 Release
+    runs-on: ubuntu-26.04
+    if: github.event_name != 'pull_request'
+    needs: [build-deb, build-windows]
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v6
+
+    - name: 下载构建产物
+      uses: actions/download-artifact@v8
+      with:
+        path: ~/artifacts
+        merge-multiple: true
+
+    - name: 计算 SHA-256 校验和
+      run: |
+        cd ~/artifacts
+        > hashes.sha256
+        # 产物名用的是 platform_tag（win_x64 / win_arm64，下划线），所以这里不能再写
+        # 连字符的 win-x64，否则永远匹配不到，校验和里会缺掉 zip。
+        for file in $(find . -type f \( -name "*.deb" -o -name "*win*.zip" -o -name "*-setup.exe" \)); do
+          filename=$(basename "$file")
+          sha256sum "$file" | awk -v fname="$filename" '{print $1 " *" fname}' >> hashes.sha256
+        done
+        cd ..
+        tree ~/artifacts
+
+    - name: 准备发布信息
+      run: |
+        if [ "${{github.ref_type}}" == "tag" ]; then
+          echo "PRERELEASE=" >> $GITHUB_ENV
+          echo "RELEASE_NAME=${{ env.APP_NAME }} ${{ github.ref_name }}" >> $GITHUB_ENV
+          echo "TAG_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+          echo "RELEASE_NOTES=--generate-notes" >> $GITHUB_ENV
+        else
+          echo "PRERELEASE=-p" >> $GITHUB_ENV
+          echo "RELEASE_NAME=持续构建" >> $GITHUB_ENV
+          echo "TAG_NAME=continuous_build" >> $GITHUB_ENV
+          echo "RELEASE_NOTES=--notes \"由 CI 自动生成，对应提交 ${{ github.sha }}\"" >> $GITHUB_ENV
+        fi
+          
+    - name: 创建 GitHub Release
+      continue-on-error: false
+      run: |
+        # 找出已有的产物文件
+        zip_files=$(find ~/artifacts -name "*win*.zip"  -print0 | xargs -0 echo)
+        deb_files=$(find ~/artifacts -name "*.deb" -print0 | xargs -0 echo)
+        setup_files=$(find ~/artifacts -name "*-setup.exe" -print0 | xargs -0 echo)
+        hash_files=$(find ~/artifacts -name "*.sha256" -print0 | xargs -0 echo)
+
+        # 同名 release 已存在就先删掉（continuous_build 连带删 tag）
+        if gh release view ${{ env.TAG_NAME }} --repo $GITHUB_REPOSITORY &> /dev/null; then
+          if [ "${{ env.TAG_NAME }}" == "continuous_build" ]; then
+            gh release delete ${{ env.TAG_NAME }} --repo $GITHUB_REPOSITORY --cleanup-tag  --yes
+          else
+            gh release delete ${{ env.TAG_NAME }} --repo $GITHUB_REPOSITORY
+          fi
+          echo "已删除 ${{ env.TAG_NAME }}"
+        fi
+        
+        if [ -n "$zip_files" ] && [ -n "$deb_files" ] && [ -n "$setup_files" ]; then
+          gh release create ${{ env.TAG_NAME }} \
+                            $zip_files \
+                            $deb_files \
+                            $setup_files \
+                            $hash_files \
+                            ${{ env.PRERELEASE }} \
+                            --repo $GITHUB_REPOSITORY \
+                            --title "${{ env.RELEASE_NAME }}" \
+                            ${{ env.RELEASE_NOTES }}
+
+            echo "已创建 release: ${{ env.TAG_NAME }}"
+        else
+          echo "产物不全，放弃发布。"
+          echo "  zip   = [$zip_files]"
+          echo "  deb   = [$deb_files]"
+          echo "  setup = [$setup_files]"
+          exit 1
+        fi
+        
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

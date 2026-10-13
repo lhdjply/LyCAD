@@ -40,6 +40,8 @@ ctest --test-dir build --output-on-failure   # 运行测试
 ```
 CMakeLists.txt    构建脚本（源码清单 + 可执行程序 + 安装规则）
 LICENSE           Apache-2.0 许可全文（本项目自身代码）
+VERSION           版本号唯一来源（CMake 的 project(VERSION)、代码里的 LYCAD_VERSION 宏、
+                  Windows 安装包名与 release 产物名都取它）
 src/
 ├── core/       几何模型   10,327 行  —— 基础数学、图元、图层/文字样式表、文档、撤销栈
 ├── io/         文件解析    4,617 行  —— DXF 编解码器、libdxfrw-modify 适配层、DWG 后端、注册表
@@ -51,6 +53,7 @@ third-party/
               DWG/DXF 原生解析 87,331 行（libdxfrw 修改版，GPL-2.0-or-later，详见第 8 节）
               目录内只保留参与编译的源码（src/）与 COPYING、AUTHORS
 resources/        45 枚界面图标 + 应用图标（SVG 源与位图集）+ 资源清单
+resources/win/    Windows 打包资源：PE 图标脚本（.rc）、Inno Setup 脚本（.iss）、中文语言包
 debian/           Debian 打包（control / rules / changelog / copyright / watch）
 tests/          5,523 行（自带 CMakeLists.txt）
 tools/          3,027 行（自带 CMakeLists.txt）
@@ -774,7 +777,7 @@ debuild -us -uc                                     # 产物落在仓库的上�
 |---|---|
 | `debian/control` | 构建依赖（CMake + Qt6 Core/Gui/Widgets/Svg/PrintSupport）与运行时依赖（`${shlibs:Depends}` 自动带上实际链接到的 Qt6 库）；界面文案是中文，最小系统上一个中文字体都没有时整屏是豆腐块，故 `Recommends: fonts-wqy-zenhei`；离屏渲染类用例需要字体，故构建依赖里有 `fonts-dejavu-core` |
 | `debian/rules` | `dh` 默认流程 + 两处覆盖：构建时关掉不随包发布的开发工具；出包前真的跑一遍单元测试 |
-| `debian/changelog` | 版本号。**必须与根 `CMakeLists.txt` 的 `project(VERSION)` 一致**——包名与界面显示的版本各取一处，不同步就会做出「包里写 0.1.0、界面显示 0.2.0」的东西 |
+| `debian/changelog` | 版本号。**必须与根 `VERSION` 一致**（`CMakeLists.txt` 的 `project(VERSION)` 也是从 `VERSION` 读的）——包名与界面显示的版本各取一处，不同步就会做出「包里写 0.1.0、界面显示 0.2.0」的东西 |
 | `debian/copyright` | 项目自身（含 `debian/`）为 **Apache-2.0**；`third-party/libdxfrw-modify` 是 GPL-2.0-or-later 且链接进同一个二进制，所以分发二进制时整体按 GPL 处理（见第 8 节） |
 | `debian/source/format` | `3.0 (native)`——本包不带 Debian 修订号，`debuild` 直接对工作树出包，不需要上游 orig.tar.gz |
 | `debian/watch` | 只跟踪上游 tag（native 包不需要下载上游源码包） |
@@ -791,6 +794,20 @@ debuild -us -uc                                     # 产物落在仓库的上�
   构建目录固定为 `build/deb`（而不是让 debhelper 取 `obj-<triplet>`）——上面的测试步骤
   要按名字构建一个 `EXCLUDE_FROM_ALL` 目标，目录名自己拿在手里最省事；该目录由
   `debian/clean` 负责清理。
+
+`.github/workflows/` 下的三条工作流：
+
+| 文件 | 内容 |
+|---|---|
+| `build.yaml` | Linux 与 Windows(MinGW) 各编一遍主程序；Linux 另外显式编一遍开发工具，免得工具失修 |
+| `test.yaml` | 两平台各构建 `lycad_tests` 再跑 `ctest`；失败时用 `--rerun-failed -V` 把完整输出打进 CI 日志 |
+| `release.yaml` | 四架构 deb（QEMU + Deepin 容器；非 amd64 因仿真过慢用 `DEB_BUILD_OPTIONS=nocheck` 跳过测试）+ Windows 的 zip 与 setup.exe，汇总后发 Release |
+
+Windows 侧统一走 **MSYS2 / MinGW** 而不是 MSVC：DWG 的文本编码转换依赖 iconv
+（`third-party/libdxfrw-modify/src/intern/drw_textcodec.cpp`），MSVC 侧没有现成的
+iconv 可链接。Windows 产物有两种形态：`zip` 解压即用；`setup.exe` 由 Inno Setup 6
+编译 `resources/win/lycad.iss` 得到（带 `resources/win/ChineseSimplified.isl` 简体中文
+语言包，要求 Inno Setup 6.5.0+；CI 里若缺 Inno 会自行安装）。
 
 ---
 
@@ -1009,8 +1026,7 @@ DXF 格式依据 Autodesk 公开发布的 *DXF Reference* 实现。
 | `intern/dwgwriter15.cpp`（`encodeBlockRecord`） | R2004+ 块记录的块内实体句柄码由 4（软指针）改为 3（硬属主）；R2000 分支不变 | 实测浩辰原版与 OpenCADStudio 版在此处均用码 3；用码 4 会被严格读取器判为引用类型不符 |
 | `intern/dwgwriter15.cpp`（`writeHatch`） | R2004+ 补写 HATCH 数据段开头的**渐变填充字段块**（is_gradient / reserved / 角度 / 偏移 / 单色 / 色调 / 颜色数 / 名称，普通填充全 0 / 空串），写在 `basePoint.z` 之前 | 读取端 `DRW_Hatch::parseDwg` 的 `if (version > DRW::AC1015)` 块：漏写会把高程当成 is_gradient，其后 num_colors 与种子点数解析成天文数字（自家读取端直接死循环）。**这是既存缺陷**：含填充的图纸写出的 R2004 文件一直读不回，R2000 则正常 |
 | `intern/dwgwriter15.cpp`（`layerHandle` / `ltypeHandle` / `styleHandle` / `dimstyleHandle`） | 名称查表改为**忽略大小写**（`Private::findName`：先精确查、再逐项忽略大小写比对） | 内建项登记为混合大小写（`Continuous`），而文档侧存的是大写规范名（`CONTINUOUS`），精确匹配落空后静默回退到默认值——实测图层线型 CONTINUOUS 被写成 ByLayer（图层线型引用错误） |
-| `intern/dwgwriter15.cpp`（`writeHatch`） | R2004+ 补写 HATCH 数据段开头的**渐变填充字段块**（is_gradient / reserved / 角度 / 偏移 / 单色 / 色调 / 颜色数 / 名称，普通填充全 0 / 空串），写在 `basePoint.z` 之前 | 读取端 `DRW_Hatch::parseDwg` 的 `if (version > DRW::AC1015)` 块：漏写会把高程当成 is_gradient，其后 num_colors 与种子点数解析成天文数字（自家读取端直接死循环）。**这是既存缺陷**：含填充的图纸写出的 R2004 文件一直读不回，R2000 则正常 |
-| `intern/dwgwriter15.cpp`（`layerHandle` / `ltypeHandle` / `styleHandle` / `dimstyleHandle`） | 名称查表改为**忽略大小写**（`Private::findName`：先精确查、再逐项忽略大小写比对） | 内建项登记为混合大小写（`Continuous`），而文档侧存的是大写规范名（`CONTINUOUS`），精确匹配落空后静默回退到默认值——实测图层线型 CONTINUOUS 被写成 ByLayer（图层线型引用错误） |
+| `intern/dwgwriter18.cpp` / `dwgwriter21.cpp`（AppInfo 段） | 产品信息里的版本号不再写字面量，改由构建系统注入的 `LYCAD_VERSION` 宏提供（单独编译 libdxfrw 时退回 `"0.0.0"`） | 该段记录的是「谁写的、什么版本」，写死会在每次发版后与实际版本不符；实测把 VERSION 改成 9.9.9 后重建，两种写出器产出的 DWG 里 `build_version` / `registry_version` 同步变成 9.9.9 |
 
 回归测试是 `tests/test_libdxfrw_codec.cpp`（解码器不变量）、`test_dxf_roundtrip`
 的隐藏图元往返用例、`test_table`（表格 DXF/DWG 双链路逐字段往返），以及

@@ -1,7 +1,29 @@
 cmake_minimum_required(VERSION 3.21)
 
+# ---------------------------------------------------------------------------
+# 版本号只有一个来源：仓库根目录的 VERSION 文件
+#
+# 界面显示的版本、Windows 安装包名与 release 产物名都取它（.github/workflows/
+# release.yaml 直接读同一个文件）。debian/changelog 的版本是唯一需要手工同步的
+# 第二处——包名走的是 changelog 那一份。
+#
+# string(STRIP) 顺带吃掉行尾的 \r：Windows 上若按 CRLF 检出，版本号会带进一个
+# 回车，project(VERSION ...) 会直接解析失败。
+# ---------------------------------------------------------------------------
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" LYCAD_VERSION LIMIT_COUNT 1)
+string(STRIP "${LYCAD_VERSION}" LYCAD_VERSION)
+if(LYCAD_VERSION STREQUAL "")
+    message(FATAL_ERROR "无法从 ${CMAKE_CURRENT_SOURCE_DIR}/VERSION 读取版本号（文件缺失或为空）")
+endif()
+
+# file() 只在配置期读一次，CMake 不会自动把读过的文件登记成"重配置依赖"：
+# 少了这一行，改完 VERSION 直接 `cmake --build` 会继续用旧版本号（得手工再
+# configure 一次才生效）。登记之后，VERSION 一变，下一次构建会自动重跑 CMake。
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+
 project(LyCAD
-        VERSION 0.1.0
+        VERSION ${LYCAD_VERSION}
         DESCRIPTION "LyCAD - 开源二维 CAD 绘图软件"
         LANGUAGES CXX)
 
@@ -43,6 +65,12 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg PrintSupport)
 qt_standard_project_setup()          # AUTOMOC / AUTOUIC
 add_compile_definitions(QT_DISABLE_DEPRECATED_UP_TO=0x060500)
+
+# 应用版本以宏注入，唯一来源是根 VERSION 文件（见文件开头）。代码里**不要**再写
+# 版本字面量：main.cpp 用它设置 QApplication::applicationVersion()，也就是 --version
+# 与将来任何版本展示取的那一处。全局定义而非逐个目标添加，是因为 app、tools 与
+# tests 都会编同一批源码（这个宏只是常量，多一份不会有副作用）。
+add_compile_definitions(LYCAD_VERSION="${PROJECT_VERSION}")
 
 # ---------------------------------------------------------------------------
 # 统一编译告警
