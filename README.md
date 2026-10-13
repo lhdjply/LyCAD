@@ -39,6 +39,7 @@ ctest --test-dir build --output-on-failure   # 运行测试
 
 ```
 CMakeLists.txt    构建脚本（源码清单 + 可执行程序 + 安装规则）
+LICENSE           Apache-2.0 许可全文（本项目自身代码）
 src/
 ├── core/       几何模型   10,327 行  —— 基础数学、图元、图层/文字样式表、文档、撤销栈
 ├── io/         文件解析    4,617 行  —— DXF 编解码器、libdxfrw-modify 适配层、DWG 后端、注册表
@@ -50,12 +51,15 @@ third-party/
               DWG/DXF 原生解析 87,331 行（libdxfrw 修改版，GPL-2.0-or-later，详见第 8 节）
               目录内只保留参与编译的源码（src/）与 COPYING、AUTHORS
 resources/        45 枚界面图标 + 应用图标（SVG 源与位图集）+ 资源清单
+debian/           Debian 打包（control / rules / changelog / copyright / watch）
 tests/          5,523 行（自带 CMakeLists.txt）
 tools/          3,027 行（自带 CMakeLists.txt）
 ```
 
 **本项目自己写的**构建描述只有三处：根 `CMakeLists.txt`、`tools/CMakeLists.txt`、
 `tests/CMakeLists.txt`；`src/` 与 `resources/` 下只有内容，没有任何构建脚本。
+`debian/` 是第四处，但它**只描述"怎么打成 deb"**，不描述怎么编译——
+`debian/rules` 走的是 `dh` 的默认流程，包内容全部由根 `CMakeLists.txt` 的安装规则决定。
 
 `third-party/libdxfrw-modify/` 是 **libdxfrw 0.6.3 的永久修改版**：不再跟随上游，
 因此目录按「只保留编译所需」裁剪——上游的构建脚手架（autotools 一套与自带的
@@ -756,6 +760,38 @@ QT_QPA_PLATFORM=offscreen build/tools/lycad_ui_snapshot sample/2000/lycad_sample
 DWG 只出 R2000 一份——DWG 的写出版本固定为 R2000，不随 DXF 的版本矩阵变化。
 每份都可以直接用对应版本的 CAD 打开核对，这是「输出真的能用」的最终判据。
 
+### 4.6 Debian 安装包
+
+`debian/` 下的文件就是全部打包逻辑，`debuild -us -uc` 即可出包：
+
+```bash
+sudo apt install build-essential devscripts dh-make equivs
+mk-build-deps -i -t 'apt-get -y' ./debian/control   # 按 control 装齐构建依赖
+debuild -us -uc                                     # 产物落在仓库的上一级目录
+```
+
+| 文件 | 内容 |
+|---|---|
+| `debian/control` | 构建依赖（CMake + Qt6 Core/Gui/Widgets/Svg/PrintSupport）与运行时依赖（`${shlibs:Depends}` 自动带上实际链接到的 Qt6 库）；界面文案是中文，最小系统上一个中文字体都没有时整屏是豆腐块，故 `Recommends: fonts-wqy-zenhei`；离屏渲染类用例需要字体，故构建依赖里有 `fonts-dejavu-core` |
+| `debian/rules` | `dh` 默认流程 + 两处覆盖：构建时关掉不随包发布的开发工具；出包前真的跑一遍单元测试 |
+| `debian/changelog` | 版本号。**必须与根 `CMakeLists.txt` 的 `project(VERSION)` 一致**——包名与界面显示的版本各取一处，不同步就会做出「包里写 0.1.0、界面显示 0.2.0」的东西 |
+| `debian/copyright` | 项目自身（含 `debian/`）为 **Apache-2.0**；`third-party/libdxfrw-modify` 是 GPL-2.0-or-later 且链接进同一个二进制，所以分发二进制时整体按 GPL 处理（见第 8 节） |
+| `debian/source/format` | `3.0 (native)`——本包不带 Debian 修订号，`debuild` 直接对工作树出包，不需要上游 orig.tar.gz |
+| `debian/watch` | 只跟踪上游 tag（native 包不需要下载上游源码包） |
+
+两处刻意的取舍：
+
+- **没有 `debian/*.install`**。可执行文件、`.desktop` 条目、hicolor 图标主题里的 PNG
+  全部由根 `CMakeLists.txt` 的安装规则安装，`dh_auto_install` 只是去调它。再写一份
+  `.install` 等于把同一份清单抄第二遍，两边迟早跑偏。
+- **测试真的会跑**。LyCAD 的测试目标是 `EXCLUDE_FROM_ALL` 的（日常构建只编主程序），
+  而 `ctest` 不会自己编译缺失的二进制，所以 `debian/rules` 先显式构建 `lycad_tests`
+  再跑；构建 chroot 里没有显示服务，用例自带 `QT_QPA_PLATFORM=offscreen`。
+  嫌慢或构建环境不合适时，用 `DEB_BUILD_OPTIONS=nocheck debuild -us -uc` 跳过。
+  构建目录固定为 `build/deb`（而不是让 debhelper 取 `obj-<triplet>`）——上面的测试步骤
+  要按名字构建一个 `EXCLUDE_FROM_ALL` 目标，目录名自己拿在手里最省事；该目录由
+  `debian/clean` 负责清理。
+
 ---
 
 ## 5. DWG 支持
@@ -897,7 +933,8 @@ DWG 是二进制格式，而有些文件会把 DXF 内容套上 DWG 签名——
 
 ### 本项目
 
-本项目代码为原创实现。DXF 格式依据 Autodesk 公开发布的 *DXF Reference* 实现。
+本项目代码为原创实现，采用 **Apache-2.0**（许可全文见仓库根目录的 `LICENSE`）。
+DXF 格式依据 Autodesk 公开发布的 *DXF Reference* 实现。
 
 ### 第三方组件
 
@@ -909,6 +946,9 @@ DWG 是二进制格式，而有些文件会把 DXF 内容套上 DWG 签名——
 采用 GPL-2.0-or-later 且已随本项目一起编译链接，这意味着 `lycad` 二进制的分发
 整体受 GPL 约束：分发二进制时需一并提供对应源码（本仓库即是）。许可全文见
 `third-party/libdxfrw-modify/COPYING`。
+
+本项目自身是 Apache-2.0，而 Apache-2.0 与 GPL-2.0 并不兼容；但 libdxfrw 是
+**GPL-2.0-or-later**，因此含它的 `lycad` 二进制可以按 GPL-3.0 这一档分发。
 
 > 早期版本的 README 曾把 libdxfrw 的许可写作 LGPL-2.1，那是**错误的**。
 > 核对 `COPYING`（GPL 第 2 版全文）与其源码文件头的声明后已更正。

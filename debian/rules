@@ -1,0 +1,51 @@
+#!/usr/bin/make -f
+
+# LyCAD 的 Debian 打包规则。
+#
+# 安装内容全部由根 CMakeLists.txt 的安装规则决定（可执行文件、.desktop 条目、
+# hicolor 图标主题里的 PNG），这里不再用 debian/*.install 把同一份清单抄第二遍——
+# 清单只有一处，包内容与 `cmake --install` 的结果必然一致。
+#
+# 构建目录固定为 build/deb（默认 .gitignore 已忽略 build/，debian/clean 负责清理），
+# 而不是让 debhelper 自己取 obj-<triplet>：下面的测试步骤要在这个目录里按名字构建
+# 一个 EXCLUDE_FROM_ALL 的目标，目录名自己拿在手里最省事。
+BUILD_DIR := build/deb
+
+# 出包前是否跑一遍单元测试。跳过：DEB_BUILD_OPTIONS=nocheck
+# 跳过时连测试目标都不配置（LYCAD_BUILD_TESTS=OFF），构建环境因此不需要 Qt6 Test。
+WITH_TESTS := $(if $(filter nocheck,$(DEB_BUILD_OPTIONS)),OFF,ON)
+
+%:
+	dh $@
+
+# 开发工具（lycad_sample_generator / lycad_icon_sheet / lycad_ui_snapshot）只在开发期
+# 用，不随包发布：关掉能少编一堆东西，也不让打包环境为它们多背依赖。
+override_dh_auto_configure:
+	dh_auto_configure --builddirectory=$(BUILD_DIR) -- \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DLYCAD_BUILD_TESTS=$(WITH_TESTS) \
+		-DLYCAD_BUILD_TOOLS=OFF
+
+override_dh_auto_build:
+	dh_auto_build --builddirectory=$(BUILD_DIR)
+
+override_dh_auto_install:
+	dh_auto_install --builddirectory=$(BUILD_DIR)
+
+# 打包时真的跑测试。
+#
+# 为什么不用默认的 dh_auto_test：LyCAD 的测试目标是 EXCLUDE_FROM_ALL 的（日常构建
+# 只编主程序），而 ctest 不会自己编译缺失的二进制——必须先显式构建 lycad_tests，
+# 否则 ctest 会因为找不到可执行文件而失败。构建 chroot 里没有显示服务，每个用例由
+# tests/CMakeLists.txt 注入 QT_QPA_PLATFORM=offscreen；渲染类用例还要求环境里有
+# 可用字体（见 debian/control 的 fonts-dejavu-core）。
+#
+# 注意 else 分支必须有实际命令：没有配方的主体会被 make 当成"目标未定义配方"，转而
+# 匹配上面的 `%:` 规则，于是跑去执行 `dh override_dh_auto_test` 而报错。
+override_dh_auto_test:
+ifeq ($(WITH_TESTS),ON)
+	cmake --build $(BUILD_DIR) --parallel --target lycad_tests
+	dh_auto_test --builddirectory=$(BUILD_DIR)
+else
+	@echo "跳过单元测试（DEB_BUILD_OPTIONS 含 nocheck）"
+endif

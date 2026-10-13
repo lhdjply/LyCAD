@@ -1,0 +1,39 @@
+Source: lycad
+Section: graphics
+Priority: optional
+Maintainer: lhdjply <lhdjply@126.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               ninja-build,
+               qt6-base-dev,
+               qt6-base-dev-tools,
+               qt6-svg-dev,
+               fonts-dejavu-core
+Rules-Requires-Root: no
+Standards-Version: 4.6.0
+Homepage: https://github.com/lhdjply/LyCAD
+Vcs-Browser: https://github.com/lhdjply/LyCAD
+Vcs-Git: https://github.com/lhdjply/LyCAD.git
+
+Package: lycad
+Section: graphics
+Priority: optional
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends}
+Recommends:
+ fonts-wqy-zenhei
+Description: 2D CAD drafting application with native DXF and DWG support
+ LyCAD is a 2D CAD drafting application written in C++20 with Qt 6 and CMake.
+ DXF and DWG are handled by code compiled into the binary itself (a modified
+ libdxfrw for reading, a built-in writer for DWG output), so no external
+ converter, command line tool or library package is needed at run time.
+ .
+ The drawing model covers lines, arcs, circles, ellipses, polylines, splines,
+ hatches, text and multi-line text with inline formatting, blocks and insert
+ references, dimensions, tables and lights. Editing provides object snapping
+ with per-snap priority, ortho and polar tracking, grip editing, undo/redo and
+ a command line, with a ribbon UI in light and dark themes.
+ .
+ DWG can be written in the AutoCAD 2000 through 2018 formats (R2000 - R2018).

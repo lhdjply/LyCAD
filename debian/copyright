@@ -1,0 +1,55 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: LyCAD
+Upstream-Contact: lhdjply <lhdjply@126.com>
+Source: https://github.com/lhdjply/LyCAD
+
+Files: *
+Copyright: 2026 lhdjply <lhdjply@126.com>
+License: Apache-2.0
+
+Files: third-party/libdxfrw-modify/*
+Copyright: 2011-2015 José F. Soriano (Rallaz) <rallazz@gmail.com>
+Comment: libdxfrw 0.6.3 的永久修改版，按「只保留参与编译的源码」裁剪后随本仓库分发，
+ 不再跟随上游。它是 GPL-2.0-or-later，且与主程序一起编译链接进同一个 lycad
+ 可执行文件——因此**分发 lycad 二进制**时，该二进制需按 GPL 条款处理（随二进制
+ 提供对应源码即可，本仓库即是）。上游 README 第 8 节有同一说明，以及对上游源码
+ 的修改清单。
+License: GPL-2+
+
+Files: debian/*
+Copyright: 2026 lhdjply <lhdjply@126.com>
+License: Apache-2.0
+
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ .
+     https://www.apache.org/licenses/LICENSE-2.0
+ .
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ .
+ On Debian systems, the complete text of the Apache License, Version 2.0
+ can be found in "/usr/share/common-licenses/Apache-2.0".
+
+License: GPL-2+
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; either version 2 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License along
+ with this program; if not, write to the Free Software Foundation, Inc.,
+ 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ .
+ On Debian systems, the complete text of the GNU General Public
+ License version 2 can be found in "/usr/share/common-licenses/GPL-2".

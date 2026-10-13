@@ -1,0 +1,5 @@
+version=4
+
+# 本包是 native 包（debian/source/format 为 3.0 (native)，不带 Debian 修订号），
+# 因此不需要下载上游 orig.tar.gz——只跟踪上游 tag 来判断有没有新版本。
+opts="mode=git,pgpmode=none" https://github.com/lhdjply/LyCAD.git HEAD

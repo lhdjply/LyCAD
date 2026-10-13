@@ -7,3 +7,12 @@ compile_commands.json
 *.autosave
 .vscode/
 .idea/
+
+# Debian 打包（debuild / dpkg-buildpackage）的中间产物与安装暂存目录
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/tmp/
+debian/lycad/
+*.deb
