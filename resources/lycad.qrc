@@ -50,4 +50,13 @@
         <file alias="zoom-extents.svg">icons/zoom-extents.svg</file>
         <file alias="zoom-selection.svg">icons/zoom-selection.svg</file>
     </qresource>
+
+    <!-- 应用图标（窗口 / 对话框 / 任务栏）。
+         与界面图标分成两个前缀是刻意的：界面图标要随深色主题换色，
+         应用图标不能换色——它是品牌标识，在浅色与深色桌面上都得是同一副面孔。
+         运行时按需栅格化（见 IconLibrary::applicationIcon）；Windows 的
+         PE 资源图标在 resources/win/lycad.rc，桌面图标见 resources/app/png。 -->
+    <qresource prefix="/app">
+        <file alias="app-icon.svg">app/app-icon.svg</file>
+    </qresource>
 </RCC>

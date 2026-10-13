@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LyCAD
+GenericName=CAD Drawing
+GenericName[zh_CN]=CAD 绘图
+Comment=2D CAD drafting application (DXF / DWG)
+Comment[zh_CN]=基于 Qt 的二维 CAD 绘图软件，支持 DXF / DWG 图形文件
+Exec=lycad %F
+Icon=lycad
+Terminal=false
+Categories=Graphics;Engineering;2DGraphics;
+# 图标与窗口归属：DDE/GNOME 靠 Icon 与桌面图标主题（hicolor）匹配，
+# 靠 StartupWMClass 把任务栏里已经运行的窗口并到本条目上。
+StartupWMClass=lycad
+MimeType=image/vnd.dxf;image/vnd.dwg;

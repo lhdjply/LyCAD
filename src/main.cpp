@@ -6,6 +6,7 @@
 //  任何业务逻辑都不应出现在本文件中——它应当短到无需注释即可读明白。
 // =============================================================================
 #include "io/CadFile.h"
+#include "ui/IconLibrary.h"
 #include "ui/MainWindow.h"
 
 #include <QApplication>
@@ -22,6 +23,10 @@ int main(int argc, char* argv[])
     QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
     QApplication::setOrganizationName(QStringLiteral("LyCAD"));
     QApplication::setOrganizationDomain(QStringLiteral("lycad.local"));
+
+    // 应用图标：窗口标题栏、任务栏、Alt+Tab 与后续弹出的对话框都用它。
+    // 在应用级设置一次即可，不必逐个窗口设置。图标不随主题换色。
+    QApplication::setWindowIcon(lycad::IconLibrary::applicationIcon());
 
     // 编解码器注册是幂等的；在此显式调用一次，
     // 使得 --help 等信息不依赖主窗口的构造顺序。

@@ -3,10 +3,12 @@
 //  图标总览图生成器。
 //
 //  把 resources/icons 下的全部图标在「浅色 / 深色」两种配色、三个尺寸下
-//  渲染到一张 PNG 上。用途有两个：
+//  渲染到一张 PNG 上，末尾再补一段「应用图标」（不随主题换色，两种底色各一排）。
+//  用途有两个：
 //
 //    · 自检——漏画的路径、写错的色值、在某个尺寸下糊成一团的细节，
-//      扫一眼总览图就能发现，比逐个打开 SVG 文件可靠得多；
+//      扫一眼总览图就能发现，比逐个打开 SVG 文件可靠得多；应用图标那一段
+//      同时验证 qrc 的 /app 前缀是否编进程序（前缀错时那一段会是空白）；
 //    · 文档——README 里可以直接引用这张图说明图标集。
 //
 //  用法： lycad_icon_sheet <输出文件.png>
@@ -90,6 +92,33 @@ void paintSection(QPainter& painter, const QStringList& names, const QString& ti
     }
 }
 
+/// 应用图标单独一段。它不随主题换色，所以两种底色各画一排——一眼就能看出
+/// 「同一副面孔在浅色与深色桌面上都立得住」；顺带充当 qrc /app 前缀的自检：
+/// 前缀或 SVG 出问题时这一段会是空白。
+constexpr int kAppIconSectionHeight = kHeaderHeight + 128 + 20;
+
+void paintAppIconSection(QPainter& painter, bool dark, int top, int width)
+{
+    const QColor background = dark ? QColor(0x2b, 0x30, 0x38) : QColor(0xf4, 0xf5, 0xf7);
+    const QColor foreground = dark ? QColor(0xd5, 0xdb, 0xe3) : QColor(0x26, 0x2b, 0x33);
+
+    painter.fillRect(0, top, width, kAppIconSectionHeight, background);
+
+    QFont titleFont = painter.font();
+    titleFont.setBold(true);
+    painter.setFont(titleFont);
+    painter.setPen(foreground);
+    painter.drawText(12, top + 22, QStringLiteral("应用图标（不随主题换色）"));
+
+    const QIcon icon = lycad::IconLibrary::applicationIcon();
+    const int baseline = top + kHeaderHeight + 116;      // 各档底部对齐
+    int x = 16;
+    for (const int size : { 16, 24, 32, 48, 64, 128 }) {
+        painter.drawPixmap(x, baseline - size, icon.pixmap(size));
+        x += size + 18;
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -109,7 +138,8 @@ int main(int argc, char* argv[])
     const int width = kColumns * kCellWidth + 1;
     const int lightHeight = sectionHeight(names.size());
     const int darkHeight = sectionHeight(names.size());
-    const int totalHeight = lightHeight + kSectionGap + darkHeight;
+    const int totalHeight = lightHeight + kSectionGap + darkHeight
+                          + kSectionGap + kAppIconSectionHeight * 2;
 
     QImage sheet(width, totalHeight, QImage::Format_ARGB32_Premultiplied);
     sheet.fill(QColor(0, 0, 0, 0));
@@ -124,6 +154,11 @@ int main(int argc, char* argv[])
     const int darkTop = lightHeight + kSectionGap;
     lycad::IconLibrary::instance().setDarkTheme(true);
     paintSection(painter, names, QStringLiteral("深色主题"), true, darkTop, width);
+
+    // 应用图标：主题无关，两种底色各来一排（见 paintAppIconSection 的说明）
+    const int appTop = darkTop + darkHeight + kSectionGap;
+    paintAppIconSection(painter, false, appTop, width);
+    paintAppIconSection(painter, true, appTop + kAppIconSectionHeight, width);
 
     painter.end();
 

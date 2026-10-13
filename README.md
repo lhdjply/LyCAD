@@ -49,7 +49,7 @@ third-party/
 └── libdxfrw-modify/
               DWG/DXF 原生解析 87,331 行（libdxfrw 修改版，GPL-2.0-or-later，详见第 8 节）
               目录内只保留参与编译的源码（src/）与 COPYING、AUTHORS
-resources/        40 枚 SVG 图标 + 资源清单
+resources/        45 枚界面图标 + 应用图标（SVG 源与位图集）+ 资源清单
 tests/          5,523 行（自带 CMakeLists.txt）
 tools/          3,027 行（自带 CMakeLists.txt）
 ```
@@ -611,6 +611,45 @@ Letter 等、横向纵向、**出图比例**：适应图纸 / 1:1 / 自定义 1:
 ```bash
 QT_QPA_PLATFORM=offscreen build/tools/lycad_icon_sheet icon_sheet.png
 ```
+
+**应用图标**（`resources/app/`）与界面图标是两套东西，不能混在一起：界面图标会被深色主题
+逐色替换，应用图标不能替换——它自带底色，浅色与深色桌面上必须是同一副面孔。因此它走独立的
+qrc 前缀 `/app`，由 `IconLibrary::applicationIcon()` 一次栅格化 16 / 24 / 32 / 48 / 64 / 128 / 256
+七档（标题栏、任务栏、Alt+Tab 要的尺寸不同），并且**不**参与换色。
+
+改图标时只改 SVG，再重新导出各平台要用的位图——**矢量源是唯一真本，位图一律由它导出**，
+否则两者会悄悄跑偏：
+
+```bash
+cd resources/app
+for s in 16 24 32 48 64 128 256 512 1024; do
+    rsvg-convert -w $s -h $s app-icon.svg -o png/lycad-$s.png
+done
+convert png/lycad-{16,24,32,48,64,128,256}.png lycad.ico        # Windows：PE 资源段
+```
+
+macOS 的 `lycad.icns` 是 PNG 承载型 icns（`ic07`~`ic14` 八个槽位，分别放 128 / 256 / 512 /
+1024 / 32 / 64 / 256 / 512），由上面导出的位图拼成，拼完会回读校验长度与元素边界：
+
+```bash
+python3 - <<'PY'
+import struct
+slots = [('ic07', '128'), ('ic08', '256'), ('ic09', '512'), ('ic10', '1024'),
+         ('ic11', '32'),  ('ic12', '64'),  ('ic13', '256'), ('ic14', '512')]
+body = b''
+for tag, size in slots:
+    png = open('png/lycad-%s.png' % size, 'rb').read()
+    body += tag.encode() + struct.pack('>I', len(png) + 8) + png   # 长度含 8 字节元素头
+open('lycad.icns', 'wb').write(b'icns' + struct.pack('>I', len(body) + 8) + body)
+PY
+```
+
+三个平台各自的接线：Windows 走 `resources/win/lycad.rc`（资源管理器与任务栏读的是 PE
+资源段里的图标，看不到 Qt 资源）；macOS 由 CMake 把 `.icns` 放进 bundle 的 Resources 并
+声明 `MACOSX_BUNDLE_ICON_FILE`；Linux 由安装规则把 PNG 装进 hicolor 图标主题的七个尺寸
+目录（文件名统一为 `lycad.png`），同时装上 `packaging/lycad.desktop`——桌面条目的
+`Icon=lycad` 与 `StartupWMClass=lycad` 正是对着这两处名字找的，缺一样就会变成
+「装完只能从终端启动、任务栏没有图标」。
 
 ### 4.4 DWG 实样验证
 

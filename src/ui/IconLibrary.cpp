@@ -105,6 +105,34 @@ QByteArray IconLibrary::sourceOf(const QString& name)
     return svg;
 }
 
+QIcon IconLibrary::applicationIcon()
+{
+    // 一次性栅格化常用档位：窗口标题栏一般取 16/24，任务栏 32/48，
+    // Alt+Tab 与文件管理器会要 128/256。QIcon 内部按请求尺寸取最接近的一档。
+    static const int kSizes[] = { 16, 24, 32, 48, 64, 128, 256 };
+
+    QIcon icon;
+    QSvgRenderer renderer(QStringLiteral(":/app/app-icon.svg"));
+    if (!renderer.isValid()) {
+        // 与应用图标有关的问题（qrc 前缀写错、SVG 语法错、资源没编进来）
+        // 只有一个症状：软件在任务栏里显示成默认的空白图标。这里明确报出来。
+        qWarning("IconLibrary: 无法渲染应用图标 :/app/app-icon.svg");
+        return icon;
+    }
+
+    for (const int size : kSizes) {
+        QPixmap pm(size, size);
+        pm.fill(Qt::transparent);
+        QPainter painter(&pm);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        renderer.render(&painter);
+        painter.end();
+        icon.addPixmap(pm);
+    }
+    return icon;
+}
+
 QPixmap IconLibrary::pixmap(const QString& name, int size)
 {
     const QByteArray svg = sourceOf(name);

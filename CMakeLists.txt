@@ -141,6 +141,27 @@ set_target_properties(lycad PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# 应用图标（各平台的「系统层面」）
+#
+# 窗口与对话框的图标来自 qrc（resources/lycad.qrc 的 /app 前缀，见
+# ui/IconLibrary::applicationIcon）。但系统层面看不到 Qt 资源，各平台各要一份：
+#   · Windows 读 PE 资源段里的图标 → .rc；
+#   · macOS  读 bundle 内的 .icns；
+#   · Linux  读图标主题目录里的 PNG 与 .desktop 条目（见下方安装规则）。
+# 图标源文件与环境无关的那份 SVG 在 resources/app/app-icon.svg，
+# 位图集（16~1024）在 resources/app/png，改图标时以 SVG 为准再重新导出。
+# ---------------------------------------------------------------------------
+if(WIN32)
+    target_sources(lycad PRIVATE resources/win/lycad.rc)
+elseif(APPLE)
+    set(LYCAD_MACOS_ICON "${PROJECT_SOURCE_DIR}/resources/app/lycad.icns")
+    set_source_files_properties("${LYCAD_MACOS_ICON}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources")
+    target_sources(lycad PRIVATE "${LYCAD_MACOS_ICON}")
+    set_target_properties(lycad PROPERTIES MACOSX_BUNDLE_ICON_FILE lycad.icns)
+endif()
+
+# ---------------------------------------------------------------------------
 # 安装 / 子目录 / 构建摘要
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
@@ -148,6 +169,19 @@ install(TARGETS lycad
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
     BUNDLE  DESTINATION "."
 )
+
+# Linux 桌面集成：菜单 / 任务栏 / 文件管理器按图标名 "lycad" 到图标主题里找，
+# 因此文件名必须是 lycad.png 并落在 hicolor 的标准尺寸目录下（.desktop 的
+# Icon=lycad 与之对应）。缺了这些，装完只能从终端启动，且任务栏没有图标。
+if(UNIX AND NOT APPLE)
+    install(FILES "${PROJECT_SOURCE_DIR}/packaging/lycad.desktop"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+    foreach(size 16 24 32 48 64 128 256 512)
+        install(FILES "${PROJECT_SOURCE_DIR}/resources/app/png/lycad-${size}.png"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/${size}x${size}/apps"
+            RENAME lycad.png)
+    endforeach()
+endif()
 
 if(LYCAD_BUILD_TOOLS)
     add_subdirectory(tools)
