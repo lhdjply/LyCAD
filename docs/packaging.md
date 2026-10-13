@@ -53,3 +53,19 @@ iconv 可链接，MinGW 侧由 MSYS2 的 libiconv 提供（链接期 `-liconv`�
 解压即用；`setup.exe` 由 Inno Setup 6 编译 `resources/win/lycad.iss` 得到（带
 `resources/win/ChineseSimplified.isl` 简体中文语言包，要求 Inno Setup 6.5.0+；
 CI 里若缺 Inno 会自行安装）。
+
+Windows 侧踩过的坑（这几条**只在 Windows 上出现**，Linux/macOS 的测试覆盖不到）：
+
+- **测试步骤必须在 msys2 shell 里跑，不要给它加 `shell: bash`**。Git Bash 启动时会
+  把 Git for Windows 自带的 `/mingw64/bin` 插到 PATH 前面，那里有 `libstdc++-6.dll`、
+  `libgcc_s_seh-1.dll`、`libwinpthread-1.dll`；但那套是 **msvcrt** 运行时，而测试是
+  **MSYS2 UCRT64** 编的。加载到另一套运行时上属于未定义行为：实测 11 条用例全部挂死、
+  零输出（ctest 只报 8 秒超时），而同一个二进制在 msys2 shell 里 `-functions` 正常
+  退出 0、逐条 slot 也跑得动。`运行测试` 那一步现在会先打印 PATH 与 `ldd` 解析到的
+  运行时 DLL 路径，若它们指向 Git 的 `mingw64` 就说明又踩回来了。
+- **iconv 的编码名也只有 Windows 会踩**：glibc 认 `"UTF8"`、GNU libiconv 只认
+  `"UTF-8"`，传错名字时上游会把 `(iconv_t)-1` 当描述符用而段错误。见
+  [libdxfrw-modify.md](libdxfrw-modify.md) 里 `DRW_ExtConverter` 那条。
+- **用例设了 `TIMEOUT`**（`tests/CMakeLists.txt`）：挂死必须变成失败，不能一路拖到
+  作业的 6 小时上限。失败时 `定位挂死的用例` 那一步会逐条 slot、再逐个参数
+  （`-o`、环境变量）重跑，把「卡在哪一步」直接打进日志。

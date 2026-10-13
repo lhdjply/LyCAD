@@ -500,25 +500,40 @@ std::string DRW_ExtConverter::convertByiconv(const char *in_encode,
     const int BUF_SIZE = 1000;
     static char in_buf[BUF_SIZE], out_buf[BUF_SIZE];
 
-	char *in_ptr = in_buf;
-	char *out_ptr = out_buf;
-    strncpy(in_buf, s->c_str(), BUF_SIZE);
+    // 复制前先按长度截断并补上终结符：原来的 strncpy(in_buf, c_str(), BUF_SIZE)
+    // 在字符串达到 BUF_SIZE 时不留 0。
+    const size_t in_len = std::min(s->size(), size_t(BUF_SIZE - 1));
+    memcpy(in_buf, s->c_str(), in_len);
+    in_buf[in_len] = '\0';
 
-    iconv_t ic;
-    ic = iconv_open(out_encode, in_encode);
-    size_t il = BUF_SIZE-1, ol = BUF_SIZE-1;
-    iconv(ic , (char**)&in_ptr, &il, &out_ptr, &ol);
+    iconv_t ic = iconv_open(out_encode, in_encode);
+    if (ic == (iconv_t)-1) {
+        // 编码名不被这套 iconv 认识时原样返回，**绝不**把 -1 当描述符继续用：
+        // glibc 的 iconv()/iconv_close() 会检查它，GNU libiconv 不会——直接把它
+        // 当 conv_struct* 解引用（iconv）或 free（iconv_close），结果是段错误。
+        // 两套实现的别名集合并不相同，所以这里必须假定 iconv_open 可能失败。
+        return *s;
+    }
+
+    char *in_ptr = in_buf;
+    char *out_ptr = out_buf;
+    size_t il = in_len, ol = BUF_SIZE - 1;
+    iconv(ic, (char **)&in_ptr, &il, &out_ptr, &ol);
     iconv_close(ic);
 
-    return std::string(out_buf);
+    // 只取这次真正写进去的字节数。out_buf 是 static：上一次转换更长的尾巴还留在
+    // 里面，用 std::string(out_buf) 会捎带陈旧字节，且它未必有终结符。
+    return std::string(out_buf, size_t(BUF_SIZE - 1) - ol);
 }
 
 std::string DRW_ExtConverter::fromUtf8(std::string *s){
-    return convertByiconv("UTF8", this->encoding, s);
+    // "UTF-8" 而不是 "UTF8"：后者只有 glibc 认，GNU libiconv（Windows/MSYS2）
+    // 的别名表里没有它，iconv_open 会失败（见上面 convertByiconv 的说明）。
+    return convertByiconv("UTF-8", this->encoding, s);
 }
 
 std::string DRW_ExtConverter::toUtf8(std::string *s){
-    return convertByiconv(this->encoding, "UTF8", s);
+    return convertByiconv(this->encoding, "UTF-8", s);
 }
 
 std::string DRW_TextCodec::correctCodePage(const std::string& s) {

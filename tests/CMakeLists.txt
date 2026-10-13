@@ -19,9 +19,18 @@ function(lycad_add_test target source)
     target_link_libraries(${target}
         PRIVATE lycad_headless lycad_dxfrw
                 Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test LyCAD::Warnings)
-    add_test(NAME ${target} COMMAND ${target})
+    # -o 文件：每条消息都 fflush，ctest 超时强杀时文件里最后一行就是卡住的位置。
+    # -o -,txt：同时保留 stdout，给 --output-on-failure 用。
+    add_test(NAME ${target} COMMAND ${target}
+        -o "${CMAKE_BINARY_DIR}/tests/${target}.qtest.txt,txt"
+        -o -,txt)
     set_tests_properties(${target} PROPERTIES
-        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        # QT_FORCE_STDERR_LOGGING：Windows 上 ctest 拉起的子进程没有控制台，Qt 会把
+        # QtTest 的输出丢进调试器（OutputDebugString），日志里什么都看不到。Linux 无害。
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_FORCE_STDERR_LOGGING=1"
+        # 用例必须能挂死失败：Windows 上 test_block_insert 曾卡住 15 分钟以上，ctest
+        # 默认不设超时会一路挂到 job 的 6 小时上限。正常一条只要几十毫秒。
+        TIMEOUT 8)
 endfunction()
 
 file(GLOB LYCAD_TEST_SOURCES CONFIGURE_DEPENDS "test_*.cpp")

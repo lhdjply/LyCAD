@@ -118,7 +118,7 @@ bool dxfRW::write(DRW_Interface *interface_, DRW::Version ver, bool bin){
         writer = new dxfWriterBinary(&filestr);
         DRW_DBG("dxfRW::read binary file\n");
     } else {
-        filestr.open (fileName.c_str(), std::ios_base::out | std::ios::trunc);
+        filestr.open (fileName.c_str(), std::ios_base::out | std::ios::binary | std::ios::trunc);
         writer = new dxfWriterAscii(&filestr);
         std::string comm = std::string("dxfrw ") + std::string(DRW_VERSION);
         writer->writeString(999, comm);

@@ -10,6 +10,7 @@
 | `drw_entities.cpp` | DXF 的 60 组码按规范取反；DWG 的 invisibleFlag 赋给 visible | 上游 DXF 路径把 60=1（不可见）当 visible 用、DWG 路径读出标志后丢弃，隐藏图元一律被读成可见 |
 | `intern/dxfreader.cpp` | 二进制 DXF 组码按规范 1 字节读取（255 为转义符） | 上游按 2 字节读组码，任何合法二进制 DXF 都解析失败（最小样例读出 0 个图元） |
 | `intern/drw_textcodec.cpp` | 双字节代码页（936/949/950/932）改为直接在码表上二分查找，不再按引导字节表划区间 | 引导字节表（`DRW_LeadTable*`）是手工维护的前缀和，与码表对不上：实测 936 有 3 处、932 有 29 处、949/950 各有几处错位。整段码位因此被划到邻居名下：落在缝里的字查不到，退化成 `?`（实测某张中文图纸里有 20 个字中招，如「个」「更」「各」；解码按完整码位比对，因此只会变 `?`、不会误命中别的字）。四张码表本身按码位严格升序且无重复，二分查找既准确又不依赖那份表 |
+| `intern/drw_textcodec.cpp`（`DRW_ExtConverter`） | 编码名改用 `"UTF-8"`（原来是 `"UTF8"`）；`iconv_open` 返回 `-1` 时**原样返回、不再把它当描述符用**；转换结果按实际写出的字节数取（不再用 `std::string(out_buf)` 去扫静态缓冲区里上一次的陈旧尾巴） | `"UTF8"` 只是 glibc 的别名，GNU libiconv（Windows/MSYS2）的别名表里只有 `"UTF-8"`：查不到即返回 `(iconv_t)-1`，而上游拿它直接调 `iconv()` / `iconv_close()`——glibc 这两处有校验（只是失败返回），libiconv 没有，直接解引用/`free` 这个指针就是段错误。实测 Windows 上所有 R12~R2000 DXF 的读写用例全部 139 崩溃（2007+ 走 UTF-8/UTF-16、DWG 走代码页表或 UTF-16，都不碰 iconv，所以那些用例正常） |
 | `drw_interface.h` / `libdxfrw.cpp` | 新增 `addUnknownEntity` 回调 | 上游对不认识的实体类型（MLINE、MESH 等）静默跳过，应用层无从计数上报 |
 | `libdxfrw.cpp` | 写出侧补齐：隐藏图元的 60 组码、填充的多段线路径边界、R12 的 DIMENSION 实体（本项目的 R12 写出已移除，这条分支不再被走到，保留是为了不偏离上游过远） | 上游写出路径分别是空实现/缺失，导致隐藏图元重现、多段线边界填充丢失、R12 标注被静默丢弃 |
 | `drw_entities.h` / `libdxfrw.cpp` | DIMENSION 支持 42 组码（实测值） | 上游不写该组码，不具备标注重绘能力的旧软件无法显示测量值 |
@@ -58,3 +59,8 @@
 `test_libdxfrw` 里由 DWG 实样驱动的
 `dwgAndDxfAgree`（同一张图纸的两种格式必须读出同一份文字几何）——这些行为一旦
 回退，测试会失败。
+
+其中 iconv 那条属于**只有 Windows 才会暴露**的一类：它取决于 iconv 实现认识哪些
+编码名，而 Linux/macOS 用的是 glibc 自己的 iconv，别名集合更宽，本地测试天然覆盖不到。
+改 `intern/drw_textcodec.cpp` 里这两个编码名或那段失败处理时，记得看 Windows 的
+「测试 (Windows / MinGW)」工作流。

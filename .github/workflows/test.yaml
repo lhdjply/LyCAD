@@ -10,8 +10,6 @@ concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
 
-# 用例逐条设了 QT_QPA_PLATFORM=offscreen（tests/CMakeLists.txt 里的 ctest 属性），
-# 这里再兜一层：构建机没有显示服务。
 env:
   QT_QPA_PLATFORM: offscreen
 
@@ -37,10 +35,7 @@ jobs:
             fonts-dejavu-core
 
       - name: 打印实际使用的 Qt 版本
-        run: |
-          dpkg-query -W -f='${Package} ${Version}\n' qt6-base-dev qt6-svg-dev
-          # fonts-dejavu-core：MTEXT 与光源两个用例把渲染结果画到离屏图上再数像素，
-          # 环境里一个字体都没有的话，断言就没有东西可量。
+        run: dpkg-query -W -f='${Package} ${Version}\n' qt6-base-dev qt6-svg-dev
 
       - name: 配置
         run: >
@@ -49,8 +44,7 @@ jobs:
           -DLYCAD_BUILD_TESTS=ON
           -DLYCAD_BUILD_TOOLS=OFF
 
-      # 测试目标是 EXCLUDE_FROM_ALL 的（日常构建只编主程序），而 ctest 不会自己
-      # 编译缺失的二进制——必须先显式构建 lycad_tests。
+      # 测试目标是 EXCLUDE_FROM_ALL 的，ctest 不会自己编译缺失的二进制。
       - name: 构建测试目标
         run: cmake --build build --parallel --target lycad_tests
 
@@ -64,16 +58,12 @@ jobs:
           if [ "$status" -ne 0 ]; then
             echo
             echo "########## 测试失败：失败用例的完整输出 ##########"
-            # QtTest 的输出有时抓不到，--output-on-failure 只剩一句 Failed。ctest
-            # 记得哪些用例失败，这里用 --rerun-failed -V 把它们的完整输出重新打进
-            # CI 日志，不必再去下载 artifact。
             ctest --test-dir build --rerun-failed -V || true
             echo "###################################################"
             exit "$status"
           fi
 
-  # 与 build.yaml 同理：Windows 走 MSYS2 / MinGW，因为 DWG 解析依赖 iconv。
-  # 见 build.yaml 顶部关于工具链选择的说明。
+  # Windows 走 MSYS2 / MinGW，理由见 build.yaml 顶部。
   test-windows:
     name: 测试 (Windows / MinGW)
     runs-on: windows-latest
@@ -106,16 +96,137 @@ jobs:
         run: cmake --build build --parallel --target lycad_tests
 
       - name: 运行测试
-        shell: bash
         run: |
+          echo "=== PATH ==="
+          echo "$PATH"
+
+          # 运行时 DLL 必须来自 MSYS2 自己的前缀，否则直接失败。
+          prefix="${MINGW_PREFIX:-/ucrt64}/bin/"
+          echo "=== 运行时 DLL 来源（应全部在 $prefix 下）==="
+          checked=0
+          bad=0
+          dirs=""
+          for exe in build/tests/test_*; do
+            [ -f "$exe" ] || continue
+            case "$exe" in *.txt|*.log) continue ;; esac
+            runtime=$(ldd "$exe" 2>/dev/null | grep -iE "libstdc|libgcc|libwinpthread" || true)
+            # ldd 无输出（ldd 不可用等）不等于"路径不对"，跳过而非判红。
+            [ -n "$runtime" ] || continue
+            checked=$((checked + 1))
+            dirs="$dirs $(echo "$runtime" | awk '{print $3}' | sed 's|/[^/]*$||')"
+            if echo "$runtime" | grep -qv "$prefix"; then
+              if [ "$bad" -eq 0 ]; then
+                echo "::error::$(basename "$exe") 的运行时 DLL 不在 $prefix 下——PATH 被别的环境抢先了"
+                echo "$runtime"
+              fi
+              bad=$((bad + 1))
+            fi
+          done
+          if [ "$checked" -eq 0 ]; then
+            echo "  （没解析出运行时 DLL：build/tests 下可能没有测试二进制）"
+          else
+            echo "  检查 $checked 个二进制，DLL 目录：$(printf '%s' "$dirs" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$bad / $checked 个二进制的运行时 DLL 来自别处"
+            exit 1
+          fi
+
           set +e
           ctest --test-dir build --output-on-failure 2>&1 | tee build/ctest-run.log
           status=${PIPESTATUS[0]}
           set -e
           if [ "$status" -ne 0 ]; then
             echo
-            echo "########## 测试失败：失败用例的完整输出 ##########"
-            ctest --test-dir build --rerun-failed -V || true
+            echo "########## 各用例的 QtTest 落盘日志（超时强杀也留得下最后一行）##########"
+            for exe in build/tests/test_*; do
+              [ -f "$exe" ] || continue
+              case "$exe" in *.txt|*.log) continue ;; esac
+              base=${exe##*/}
+              log="build/tests/${base%.*}.qtest.txt"
+              if [ -s "$log" ]; then
+                echo "---------- $(basename "$log") ----------"
+                cat "$log"
+              else
+                echo "---------- $(basename "$log") ---------- 空：卡在日志器之前"
+              fi
+            done
             echo "###################################################"
             exit "$status"
           fi
+
+      # 把 ctest 的参数/环境逐个加到第一个测试二进制上，定位从哪一步开始挂。
+      # MSYS2 的 timeout 杀不掉原生 Windows 进程，硬超时用 PowerShell 计时。
+      - name: 定位挂死的用例（仅失败时）
+        if: failure()
+        run: |
+          echo "=== PATH ===" >&2
+          echo "$PATH" >&2
+
+          echo "=== 平台插件目录 ===" >&2
+          for d in "${MINGW_PREFIX:-/ucrt64}/share/qt6/plugins" "$HOME"/Qt/6.*/*/plugins; do
+            if [ -d "$d/platforms" ]; then ls "$d/platforms" >&2; break; fi
+          done
+
+          # 不写死用例名：用例会增删。
+          exe=""
+          for f in build/tests/test_*; do
+            case "$f" in *.txt|*.log) continue ;; esac
+            if [ -f "$f" ]; then exe="$f"; break; fi
+          done
+          if [ -z "$exe" ]; then echo "build/tests 下没有测试二进制，跳过" >&2; exit 0; fi
+          name=$(basename "$exe"); name=${name%.*}
+          echo "=== 用于逐步排除的用例：$name ===" >&2
+
+          echo "=== 依赖解析 ===" >&2
+          for f in build/tests/test_*; do
+            case "$f" in *.txt|*.log) continue ;; esac
+            [ -f "$f" ] || continue
+            ldd "$f" 2>/dev/null | grep -i 'not found' \
+              && echo "::error::$(basename "$f") 有找不到的依赖（见上）" >&2 || true
+          done
+          echo "=== 平台插件自身的依赖 ===" >&2
+          for d in "${MINGW_PREFIX:-/ucrt64}/share/qt6/plugins" "$HOME"/Qt/6.*/*/plugins; do
+            if [ -f "$d/platforms/qoffscreen.dll" ]; then
+              ldd "$d/platforms/qoffscreen.dll" 2>/dev/null | grep -i 'not found' >&2 || true
+              break
+            fi
+          done
+
+          win=$(cygpath -w "$exe" 2>/dev/null || echo "$exe")
+          bin=$(cygpath -w "$PWD" 2>/dev/null || echo "$PWD")
+          out="$bin\\build\\tests\\diag-out.txt"; err="$bin\\build\\tests\\diag-err.txt"
+          log_arg="$bin\\build\\tests\\diag.qtest.txt,txt"
+
+          probe () {   # $1=说明；$2=参数串（空 = 不带参数）
+            local label="$1" argstr="$2" rc=0 ps
+            : > build/tests/diag-out.txt 2>/dev/null || true
+            : > build/tests/diag-err.txt 2>/dev/null || true
+            ps="\$p = Start-Process -FilePath '$win'"
+            [ -n "$argstr" ] && ps="$ps -ArgumentList '$argstr'"
+            ps="$ps -PassThru -NoNewWindow -RedirectStandardOutput '$out' -RedirectStandardError '$err'; if (\$p.WaitForExit(15000)) { exit \$p.ExitCode } else { \$p.Kill(); exit 124 }"
+            env "${ENVP[@]}" powershell -NoProfile -Command "$ps" || rc=$?
+            echo "--- $label → $rc（0=通过，124=卡死，其它=错误码）" >&2
+            [ -s build/tests/diag-out.txt ] && echo "    stdout: $(head -2 build/tests/diag-out.txt | tr '\n' '|')" >&2
+            [ -s build/tests/diag-err.txt ] && echo "    stderr: $(head -4 build/tests/diag-err.txt | tr '\n' '|')" >&2
+            return 0
+          }
+
+          echo "=== 逐步加参数/环境（都在 $name 上） ===" >&2
+          ENVP=(QT_QPA_PLATFORM=offscreen)
+          probe "A 光跑" ""
+          probe "B 加 -o 文件" "-o $log_arg"
+          probe "C 加 -o - stdout" "-o $log_arg -o -,txt"
+          ENVP=(QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1)
+          probe "D 再加 QT_FORCE_STDERR_LOGGING" "-o $log_arg -o -,txt"
+
+          # E 经 ctest 单跑这一条（用的就是 ctest 自己的环境与参数）
+          echo "=== E 经 ctest 单跑 $name（-V，20s 硬超时） ===" >&2
+          ctest_win=$(cygpath -w "$(command -v ctest)" 2>/dev/null || command -v ctest)
+          rc=0
+          powershell -NoProfile -Command \
+            "\$p = Start-Process -FilePath '$ctest_win' -ArgumentList '--test-dir build -R ^$name\$ -V' -WorkingDirectory '$bin' -PassThru -NoNewWindow -RedirectStandardOutput '$out' -RedirectStandardError '$err'; if (\$p.WaitForExit(20000)) { exit \$p.ExitCode } else { \$p.Kill(); exit 124 }" || rc=$?
+          echo "--- E ctest → $rc（0=通过，124=卡死）" >&2
+          tail -25 build/tests/diag-out.txt >&2 2>/dev/null || true
+          [ -s build/tests/diag-err.txt ] && { echo "    stderr:" >&2; tail -10 build/tests/diag-err.txt >&2; } || true
+          echo "定位结束" >&2
