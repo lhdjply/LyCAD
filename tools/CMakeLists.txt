@@ -19,12 +19,12 @@ target_compile_definitions(lycad_sample_generator PRIVATE
 
 add_executable(lycad_icon_sheet EXCLUDE_FROM_ALL
     icon_sheet.cpp
-    ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
 )
 target_include_directories(lycad_icon_sheet PRIVATE "${LYCAD_SRC_ROOT}")
 target_include_directories(lycad_icon_sheet SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
-target_link_libraries(lycad_icon_sheet PRIVATE lycad_dxfrw ${LYCAD_QT_LIBS} LyCAD::Warnings)
+target_link_libraries(lycad_icon_sheet
+    PRIVATE lycad_ui lycad_headless lycad_dxfrw ${LYCAD_QT_LIBS} LyCAD::Warnings)
 set_target_properties(lycad_icon_sheet PROPERTIES AUTORCC ON)
 
 # 界面快照需要 QTest 注入鼠标事件
@@ -33,13 +33,13 @@ find_package(Qt6 QUIET COMPONENTS Test)
 if(TARGET Qt6::Test)
     add_executable(lycad_ui_snapshot EXCLUDE_FROM_ALL
         ui_snapshot.cpp
-        ${LYCAD_SOURCES}
         ${LYCAD_RESOURCES}
     )
     target_include_directories(lycad_ui_snapshot PRIVATE "${LYCAD_SRC_ROOT}")
     target_include_directories(lycad_ui_snapshot SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
     target_link_libraries(lycad_ui_snapshot
-        PRIVATE lycad_dxfrw ${LYCAD_QT_LIBS} Qt6::Test LyCAD::Warnings)
+        PRIVATE lycad_ui lycad_headless lycad_dxfrw
+                ${LYCAD_QT_LIBS} Qt6::Test LyCAD::Warnings)
     set_target_properties(lycad_ui_snapshot PROPERTIES AUTORCC ON)
 endif()
 

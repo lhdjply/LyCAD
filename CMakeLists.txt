@@ -72,6 +72,8 @@ add_compile_definitions(QT_DISABLE_DEPRECATED_UP_TO=0x060500)
 # tests 都会编同一批源码（这个宏只是常量，多一份不会有副作用）。
 add_compile_definitions(LYCAD_VERSION="${PROJECT_VERSION}")
 
+set(LYCAD_QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::PrintSupport)
+
 # ---------------------------------------------------------------------------
 # 统一编译告警
 # ---------------------------------------------------------------------------
@@ -166,19 +168,40 @@ set(LYCAD_DXFRW_INCLUDES
     "${PROJECT_SOURCE_DIR}/third-party/libdxfrw-modify/src/intern")
 
 # ---------------------------------------------------------------------------
+# 本项目源码的共享对象库
+#
+# 分两层对应模块依赖链 core → io → render → interact → ui：
+#   lycad_headless   core + io + render + interact（不含 ui，单元测试用）
+#   lycad_ui         ui 层，被主程序与界面类工具共用
+#
+# 抽成库是为了让源码只编一次，否则每个消费者都会把源码列表当成自己的源码重编一遍。
+# 消费方式同 lycad_dxfrw：用 target_link_libraries 链接目标，别用 $<TARGET_OBJECTS>。
+# ---------------------------------------------------------------------------
+add_library(lycad_headless OBJECT ${LYCAD_HEADLESS_SOURCES})
+target_include_directories(lycad_headless PRIVATE "${LYCAD_SRC_ROOT}")
+target_include_directories(lycad_headless SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
+target_link_libraries(lycad_headless PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
+
+set(LYCAD_UI_SOURCES ${LYCAD_SOURCES})
+list(FILTER LYCAD_UI_SOURCES INCLUDE REGEX "/ui/")
+
+add_library(lycad_ui OBJECT ${LYCAD_UI_SOURCES})
+target_include_directories(lycad_ui PRIVATE "${LYCAD_SRC_ROOT}")
+target_include_directories(lycad_ui SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
+target_link_libraries(lycad_ui PRIVATE ${LYCAD_QT_LIBS} LyCAD::Warnings)
+
+# ---------------------------------------------------------------------------
 # 主程序
 # ---------------------------------------------------------------------------
-set(LYCAD_QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::PrintSupport)
-
 add_executable(lycad
     src/main.cpp
-    ${LYCAD_SOURCES}
     ${LYCAD_RESOURCES}
 )
 target_include_directories(lycad PRIVATE "${LYCAD_SRC_ROOT}")
 # libdxfrw 头文件以 SYSTEM 引入：其自带告警与本项目无关，交给编译器忽略
 target_include_directories(lycad SYSTEM PRIVATE ${LYCAD_DXFRW_INCLUDES})
-target_link_libraries(lycad PRIVATE lycad_dxfrw ${LYCAD_QT_LIBS} LyCAD::Warnings)
+target_link_libraries(lycad
+    PRIVATE lycad_ui lycad_headless lycad_dxfrw ${LYCAD_QT_LIBS} LyCAD::Warnings)
 
 set_target_properties(lycad PROPERTIES
     AUTORCC          ON
