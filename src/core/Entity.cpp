@@ -163,6 +163,12 @@ bool Entity::crosses(const Box2D& box) const
     return detail::pointsCrossBox(flatten(detail::sagittaForBox(box)), isClosed(), box);
 }
 
+QString Entity::gripLabel(std::size_t index) const
+{
+    Q_UNUSED(index);
+    return QString();
+}
+
 bool Entity::moveGrip(std::size_t index, const Point2D& newPos)
 {
     Q_UNUSED(index);

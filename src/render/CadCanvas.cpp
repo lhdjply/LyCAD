@@ -644,6 +644,11 @@ void CadCanvas::mouseMoveEvent(QMouseEvent* event)
     if (m_handler) {
         m_handler->handleMouseMove(makeEvent(pos, Qt::NoButton,
                                              event->buttons(), event->modifiers()));
+
+        // 悬停光标：压在表格的行列界线上时要换成调整光标（「可直接拖」的唯一提示）。
+        // 每帧都 setCursor 会让画布不停地重设光标，所以只在形状变了才下发。
+        const Qt::CursorShape shape = m_handler->cursorShape();
+        if (cursor().shape() != shape) setCursor(shape);
     }
 
     update();      // 十字光标与捕捉标记需要跟随

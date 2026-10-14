@@ -109,12 +109,13 @@ struct ToolContext {
     ///   multiLine      true = 多行编辑框（可换行），false = 单行输入框
     ///   initialContent 初值（工具允许命令行预输入内容）
     ///   initialFont    图元当前字体（新建时为空）
+    ///   textHeight     进：新建时的默认字高，出：用户填写的字高（世界单位，> 0）
     ///   content        输出：用户确认后的内容（换行为 '\n'）
     ///   fontFamily     输出：用户选定的字体族名（空串 = 默认）
     /// 返回 false 表示用户取消。未装配时工具按"取消"处理。
     std::function<bool(bool multiLine, const QString& initialContent,
-                       const QString& initialFont, QString& content,
-                       QString& fontFamily)> editText;
+                       const QString& initialFont, double& textHeight,
+                       QString& content, QString& fontFamily)> editText;
 };
 
 } // namespace lycad

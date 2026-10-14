@@ -48,6 +48,7 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QPageLayout>
 #include <QPageSize>
 #include <QPainter>
@@ -1162,6 +1163,11 @@ int main(int argc, char* argv[])
                        ? static_cast<const TextEntity*>(e)->lineCount()
                        : static_cast<const MTextEntity*>(e)->paragraphCount();
         };
+        const auto textHeightOf = [](const Entity* e) {
+            return e->type() == EntityType::Text
+                       ? static_cast<const TextEntity*>(e)->height()
+                       : static_cast<const MTextEntity*>(e)->height();
+        };
 
         const EntityId textId = [doc, &isTextEntity, &textLineCount]() -> EntityId {
             if (!doc) return kInvalidEntityId;
@@ -1190,24 +1196,36 @@ int main(int argc, char* argv[])
             QObject::connect(tools, &ToolManager::textEditRequested,
                              [&editTarget](EntityId id) { editTarget = id; });
 
-            // 编辑前记录全部文字内容（命中对象在双击前不可预知）
+            // 编辑前记录全部文字内容与字高（命中对象在双击前不可预知）
             QHash<EntityId, QString> contentsBefore;
+            QHash<EntityId, double> heightsBefore;
             for (EntityId id : doc->drawOrder()) {
                 const Entity* entity = doc->entity(id);
-                if (isTextEntity(entity)) contentsBefore[id] = textContent(entity);
+                if (!isTextEntity(entity)) continue;
+                contentsBefore[id] = textContent(entity);
+                heightsBefore[id] = textHeightOf(entity);
             }
 
             // 预约自动应答：先把「刚打开的样子」截下来，再追加后缀 → Alt+Enter 换行
             // → 写第二行 → 再截一张 → 回车确认。截图是必需的：多行文字双击后必须
             // **看得见多行**、Alt+Enter 必须**看得见换行**，这两点无法从文档内容断言
             // 出来，只能看图。
+            //
+            // 字高也在同一个框里改（双击文字顺手改字号）：先记下数值框的初值（应当
+            // 等于图元当前字高，否则就是"打开就跳成别的数"），再改成 kEditedHeight。
+            constexpr double kEditedHeight = 7.5;
             const QString dialogShot = dir.filePath(QStringLiteral("ui_text_dialog.png"));
             const QString editedShot = dir.filePath(QStringLiteral("ui_text_dialog_edit.png"));
             // 这一次双击弹出的是哪种编辑框，决定了后面怎么拼期望值：
             //   多行框 -> 追加内容 + Alt+Enter 换行 + 第二行
             //   单行框 -> 只追加内容（单行文字没有换行入口）
             bool usedMultiLine = false;
-            QTimer::singleShot(250, [&usedMultiLine, dialogShot, editedShot]() {
+            bool contentEdited = false;
+            bool sawHeightBox = false;
+            double spinInitialHeight = 0.0;
+            QTimer::singleShot(250, [&usedMultiLine, &contentEdited, &sawHeightBox,
+                                     &spinInitialHeight, kEditedHeight,
+                                     dialogShot, editedShot]() {
                 auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
                 if (!modal) return;
 
@@ -1223,12 +1241,21 @@ int main(int argc, char* argv[])
 
                 saveShot(*modal, dialogShot);
 
+                if (auto* spin = modal->findChild<QDoubleSpinBox*>(
+                        QStringLiteral("textEditDialog.height"))) {
+                    sawHeightBox = true;
+                    spinInitialHeight = spin->value();
+                    spin->setValue(kEditedHeight);
+                    QApplication::processEvents();
+                }
+
                 // 两种文字走两种编辑框（多行文字 = 可换行的 QPlainTextEdit，
                 // 单行文字 = QLineEdit）。按 objectName 取实际弹出的那一个，
                 // 不猜类型——猜错会让模态框一直开着，把测试卡死。
                 if (auto* multi = modal->findChild<QPlainTextEdit*>(
                         QStringLiteral("textEditDialog.multiLine"))) {
                     usedMultiLine = true;
+                    contentEdited = true;
                     multi->setPlainText(multi->toPlainText() + QStringLiteral("-已编辑"));
                     multi->moveCursor(QTextCursor::End);
                     QTest::keyClick(multi, Qt::Key_Return, Qt::AltModifier);   // 换行
@@ -1238,6 +1265,7 @@ int main(int argc, char* argv[])
                     QTest::keyClick(multi, Qt::Key_Return, Qt::NoModifier);    // 确认
                 } else if (auto* single = modal->findChild<QLineEdit*>(
                                QStringLiteral("textEditDialog.singleLine"))) {
+                    contentEdited = true;
                     single->setText(single->text() + QStringLiteral("-已编辑"));
                     single->setCursorPosition(single->text().size());
                     QApplication::processEvents();
@@ -1271,6 +1299,29 @@ int main(int argc, char* argv[])
                         : before + QStringLiteral("-已编辑");
                 const QString after = edited ? textContent(edited) : QString();
 
+                // 字高：编辑框初值必须就是图元当前字高（数值框按 2 位小数显示，
+                // 容差取半个刻度），确认后必须写回成框里的值
+                const double beforeHeight = heightsBefore.value(editTarget);
+                const double afterHeight = edited ? textHeightOf(edited) : 0.0;
+                const bool heightInitOk = sawHeightBox
+                                          && std::abs(spinInitialHeight - beforeHeight) <= 0.005;
+                const bool heightOk = contentEdited
+                                      && std::abs(afterHeight - kEditedHeight) < 1e-9;
+                out() << QStringLiteral("  字高：数值框 %1 / 初值 %2（图元原值 %3）/ "
+                                        "改为 %4 → 读回 %5")
+                             .arg(sawHeightBox ? QStringLiteral("在") : QStringLiteral("缺失"),
+                                  QString::number(spinInitialHeight, 'f', 2),
+                                  QString::number(beforeHeight, 'f', 2),
+                                  QString::number(kEditedHeight, 'f', 2),
+                                  QString::number(afterHeight, 'f', 2))
+                      << Qt::endl;
+                if (!heightInitOk || !heightOk) {
+                    out() << QStringLiteral("    期望编辑框带当前字高、确认后写回 %1")
+                                 .arg(kEditedHeight)
+                          << Qt::endl;
+                    ++failures;
+                }
+
                 if (after == expected) {
                     out() << QStringLiteral("  双击编辑链路：命中文字 #%1，"
                                             "原文 %2 行 → 编辑后 %3 行")
@@ -1279,13 +1330,15 @@ int main(int argc, char* argv[])
                                  .arg(edited ? textLineCount(edited) : 0)
                           << Qt::endl;
 
-                    // 撤销应还原原文，重做应再次生效
+                    // 撤销应还原原文与字高，重做应再次生效
                     doc->undoStack()->undo();
                     const Entity* undone = doc->entity(editTarget);
-                    const bool undoOk = undone && textContent(undone) == before;
+                    const bool undoOk = undone && textContent(undone) == before
+                                        && std::abs(textHeightOf(undone) - beforeHeight) < 1e-9;
                     doc->undoStack()->redo();
                     const Entity* redone = doc->entity(editTarget);
-                    const bool redoOk = redone && textContent(redone) == expected;
+                    const bool redoOk = redone && textContent(redone) == expected
+                                        && std::abs(textHeightOf(redone) - kEditedHeight) < 1e-9;
                     out() << QStringLiteral("  撤销/重做: %1 / %2")
                                  .arg(undoOk ? QStringLiteral("通过")
                                              : QStringLiteral("失败"),
@@ -1335,17 +1388,31 @@ int main(int argc, char* argv[])
                 { "MTEXT", true, true, QStringLiteral("多行第一段\n多行第二段") },
             };
 
+            // 新建时的默认字高由工具传进编辑框；这里既验初值，也验改完的值真的
+            // 落到了新图元上（否则那个数值框就是个摆设）。
+            constexpr double kDefaultTextHeight = 3.5;
+            constexpr double kNewTextHeight = 8.0;
+
             for (const NewTextCase& one : cases) {
                 const QString command = QString::fromLatin1(one.command);
                 bool sawMultiLine = false;
                 bool sawSingleLine = false;
+                bool sawHeightBox = false;
+                double spinInitialHeight = 0.0;
                 const QString typed = one.typed;
 
                 // 预约应答：模态框弹出后按 objectName 认出是哪一种编辑框，
-                // 输入内容再回车确认。
-                QTimer::singleShot(200, [&sawMultiLine, &sawSingleLine, typed]() {
+                // 输入内容（并把字高改掉）再回车确认。
+                QTimer::singleShot(200, [&sawMultiLine, &sawSingleLine, &sawHeightBox,
+                                         &spinInitialHeight, typed, kNewTextHeight]() {
                     auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
                     if (!modal) return;
+                    if (auto* spin = modal->findChild<QDoubleSpinBox*>(
+                            QStringLiteral("textEditDialog.height"))) {
+                        sawHeightBox = true;
+                        spinInitialHeight = spin->value();
+                        spin->setValue(kNewTextHeight);
+                    }
                     if (auto* multi = modal->findChild<QPlainTextEdit*>(
                             QStringLiteral("textEditDialog.multiLine"))) {
                         sawMultiLine = true;
@@ -1398,8 +1465,14 @@ int main(int argc, char* argv[])
                 const bool contentOk = (actual == expected);
                 const bool dialogOk = one.expectMultiLine ? (sawMultiLine && !sawSingleLine)
                                                           : (sawSingleLine && !sawMultiLine);
+                // 字高：初值应是工具给的默认值，改成框里的值后要落到新图元上
+                const double createdHeight = created ? textHeightOf(created) : 0.0;
+                const bool heightBoxOk = sawHeightBox
+                                         && std::abs(spinInitialHeight - kDefaultTextHeight) < 1e-9;
+                const bool heightOk = std::abs(createdHeight - kNewTextHeight) < 1e-9;
 
-                out() << QStringLiteral("  新建%1：编辑框 %2 / 图元类型 %3 / 内容 %4")
+                out() << QStringLiteral("  新建%1：编辑框 %2 / 图元类型 %3 / 内容 %4 / "
+                                        "字高 %5 → %6")
                              .arg(one.expectMText ? QStringLiteral("多行文字")
                                                   : QStringLiteral("单行文字"),
                                   dialogOk ? (sawMultiLine ? QStringLiteral("多行框")
@@ -1409,17 +1482,523 @@ int main(int argc, char* argv[])
                                                             : QStringLiteral("TEXT"))
                                          : QStringLiteral("不符"),
                                   contentOk ? QStringLiteral("一致")
-                                            : QStringLiteral("不一致"))
+                                            : QStringLiteral("不一致"),
+                                  QString::number(spinInitialHeight, 'f', 2),
+                                  QString::number(createdHeight, 'f', 2))
                       << Qt::endl;
-                if (!typeOk || !contentOk || !dialogOk) {
-                    out() << QStringLiteral("    期望 %1，实际 %2")
+                if (!typeOk || !contentOk || !dialogOk || !heightBoxOk || !heightOk) {
+                    out() << QStringLiteral("    期望 %1，实际 %2；字高期望初值 %3 → %4")
                                  .arg(expected, actual)
+                                 .arg(kDefaultTextHeight)
+                                 .arg(kNewTextHeight)
                           << Qt::endl;
                     ++failures;
                 }
 
                 // 撤掉刚建的文字，别让它影响后面的快照（特性面板会挑到它）
                 if (createdId != kInvalidEntityId) toolDoc->undoStack()->undo();
+            }
+        }
+
+        // ---- 快照 4c：双击表格单元格 → 只改那一格的文字（可撤销）----------------
+        //
+        // 表格是**单一图元**，双击必须落到「哪一格」上，因此这一段盯五件事：
+        //   · 命中——点在格内就编辑那一格，行列号要准（合并区归左上角的规则在 core 单测里）；
+        //   · 范围——只有那一格的文字变，同表其它格一个字都不能动；
+        //   · 撤销——编辑走替换图元那条既有链路，撤销要还原原文、重做要再次生效；
+        //   · 对话框——单元格的字体与字高是**这一格自己的**，框里两者都要能用（不是藏
+        //     起来），并且有一行小字说明作用范围；改完只落到这一格上；
+        //   · 多行格——单元格内容本来就有换行时（同格多行读入即为 '\n'）必须开多行框，
+        //     否则单行框只看得到第一行，回车确认就把它后面的行丢了。
+        if (canvas->document()) {
+            Document* cellDoc = canvas->document();
+            const int undoBeforeTable = cellDoc->undoStack()->index();
+
+            // 样表建在哪不重要——随后用 zoomToBox 把它铺满视口。双击打的是真实屏幕
+            // 坐标，表格在屏幕上必须够大：格子只有几个像素宽时，取整会把点推到邻格。
+            auto table = std::make_unique<TableEntity>(3, 3);
+            table->setInsertionPoint(Point2D(0.0, 0.0));
+            table->setCellText(0, 0, QStringLiteral("序号"));
+            table->setCellText(0, 1, QStringLiteral("名称"));
+            table->setCellText(1, 1, QStringLiteral("轴承座"));
+            // 第 2 行第 1 列先放一个**多行**单元格：同格多行在读入时就会拼成 '\n'，
+            // 双击它必须开多行框，否则单行框只看得到第一行
+            table->setCellText(2, 1, QStringLiteral("第一行\n第二行"));
+            const EntityId tableId = cellDoc->addEntity(std::move(table));
+
+            if (tableId == kInvalidEntityId) {
+                out() << QStringLiteral("  没能造出用于双击的样表。") << Qt::endl;
+                ++failures;
+            } else {
+                const auto* fixture = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                canvas->zoomToBox(fixture->boundingBox());
+                settle(application, 150);
+
+                // 第 1 行第 1 列（0 基）格的中心
+                const std::vector<double> rows = fixture->rowBoundaries();
+                const std::vector<double> cols = fixture->columnBoundaries();
+                const Point2D cellCenter = fixture->toWorld(
+                    Point2D(0.5 * (cols[1] + cols[2]), 0.5 * (rows[1] + rows[2])));
+                const Point2D device = canvas->view().toDevice(cellCenter);
+                const QPoint spot(static_cast<int>(device.x), static_cast<int>(device.y));
+
+                // 双击实际请求编辑的那一格：由工具层按落点算出，不能靠猜
+                EntityId editedId = kInvalidEntityId;
+                int editedRow = -1;
+                int editedCol = -1;
+                QObject::connect(tools, &ToolManager::tableCellEditRequested,
+                                 [&editedId, &editedRow, &editedCol](EntityId id,
+                                                                     int row, int col) {
+                                     editedId = id;
+                                     editedRow = row;
+                                     editedCol = col;
+                                 });
+
+                bool sawSingleLine = false;
+                bool sawMultiLine = false;
+                bool styleSelectorsShown = false;
+                bool styleNoteShown = false;
+                double heightSpinInitial = 0.0;
+                QString fontInitial;
+                QString fontPicked;
+                QString dialogTitle;
+                const QString typed = QStringLiteral("端盖");
+                // 字体与字高都是**这一格自己的**：改完只该影响这一格
+                constexpr double kEditedCellHeight = 9.0;
+                const QString dialogShot = dir.filePath(QStringLiteral("ui_table_cell_dialog.png"));
+                QTimer::singleShot(250, [&sawSingleLine, &sawMultiLine, &styleSelectorsShown,
+                                         &styleNoteShown, &heightSpinInitial, &fontInitial,
+                                         &fontPicked, &dialogTitle, typed, kEditedCellHeight,
+                                         dialogShot]() {
+                    auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                    if (!modal) return;
+                    dialogTitle = modal->windowTitle();
+
+                    const QPixmap pixmap = modal->grab();
+                    if (!pixmap.isNull() && pixmap.save(dialogShot)) {
+                        out() << QStringLiteral("  已保存 %1  (%2×%3)")
+                                     .arg(QFileInfo(dialogShot).fileName())
+                                     .arg(pixmap.width())
+                                     .arg(pixmap.height())
+                              << Qt::endl;
+                    }
+
+                    // 字体与字高都属于整张表（单元格没有独立字体与字号），所以两个控件
+                    // 都得**能用**，并带一行小字说明作用范围
+                    if (auto* font = modal->findChild<QComboBox*>(
+                            QStringLiteral("textEditDialog.font"))) {
+                        fontInitial = font->currentData().toString();
+                        bool visible = font->isVisible();
+                        if (auto* label = font->parentWidget()) visible = visible && label->isVisible();
+                        // 选一项真字体（第 0 项是「（默认）」，不改动就等于没测）
+                        if (font->count() > 1) {
+                            font->setCurrentIndex(1);
+                            fontPicked = font->currentData().toString();
+                        }
+                        styleSelectorsShown = visible && !fontPicked.isEmpty();
+                    }
+                    if (auto* spin = modal->findChild<QDoubleSpinBox*>(
+                            QStringLiteral("textEditDialog.height"))) {
+                        heightSpinInitial = spin->value();
+                        spin->setValue(kEditedCellHeight);
+                        bool visible = spin->isVisible();
+                        if (auto* label = spin->parentWidget()) visible = visible && label->isVisible();
+                        styleSelectorsShown = styleSelectorsShown && visible;
+                    }
+                    if (auto* note = modal->findChild<QLabel*>(
+                            QStringLiteral("textEditDialog.styleNote"))) {
+                        styleNoteShown = note->isVisible()
+                                         && note->text().contains(QStringLiteral("只作用于这一格"));
+                    }
+
+                    // 按 objectName 认实际弹出的编辑框，不猜类型（猜错会把模态框一直开着）
+                    if (auto* multi = modal->findChild<QPlainTextEdit*>(
+                            QStringLiteral("textEditDialog.multiLine"))) {
+                        sawMultiLine = true;
+                        multi->setPlainText(typed);
+                        QTest::keyClick(multi, Qt::Key_Return, Qt::NoModifier);
+                        return;
+                    }
+                    if (auto* single = modal->findChild<QLineEdit*>(
+                            QStringLiteral("textEditDialog.singleLine"))) {
+                        sawSingleLine = true;
+                        single->setText(typed);
+                        QTest::keyClick(single, Qt::Key_Return, Qt::NoModifier);   // 确认
+                        return;
+                    }
+                    modal->reject();    // 兜底：别让模态框把后续测试挂住
+                });
+
+                const auto* cellBefore = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                const double cellHeightBefore = cellBefore ? cellBefore->cellHeightOr(1, 1) : 0.0;
+                const QString cellFontBefore = cellBefore ? cellBefore->cell(1, 1).fontStyle
+                                                          : QString();
+                // 同表另一格（第 1 行第 1 列）的样式：改了被双击的那一格之后，它必须原封不动
+                const double neighborHeightBefore = cellBefore ? cellBefore->cellHeightOr(0, 0) : 0.0;
+                const QString neighborFontBefore = cellBefore ? cellBefore->cell(0, 0).fontStyle
+                                                              : QString();
+
+                QTest::mouseDClick(canvas, Qt::LeftButton, Qt::NoModifier, spot);
+                settle(application, 300);
+
+                const auto* after = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                const QString cellText = after ? after->cell(1, 1).text : QString();
+                const bool hitOk = (editedId == tableId && editedRow == 1 && editedCol == 1);
+                const bool contentOk = (cellText == typed);
+                const bool dialogOk = sawSingleLine && !sawMultiLine;
+                // 同一张表的其它格必须一个字都没动
+                const bool othersOk = after
+                    && after->cell(0, 0).text == QStringLiteral("序号")
+                    && after->cell(0, 1).text == QStringLiteral("名称")
+                    && after->cell(1, 0).text.isEmpty()
+                    && after->cell(2, 2).text.isEmpty();
+                // 标题要说清改的是哪一格：多格表格里"正在编辑哪一格"不能靠猜
+                const bool titleOk = dialogTitle.contains(QStringLiteral("第 2 行"))
+                                     && dialogTitle.contains(QStringLiteral("第 2 列"));
+                // 样式项：字体与字高都可用、初值就是**这一格**当前的值、确认后落到这一格；
+                // 同表另一格的字高与字体必须原封不动（逐格语义最容易在这里踩错）
+                const double cellHeightAfter = after ? after->cellHeightOr(1, 1) : 0.0;
+                const QString cellFontAfter = after ? after->cell(1, 1).fontStyle : QString();
+                const double neighborHeightAfter = after ? after->cellHeightOr(0, 0) : 0.0;
+                const QString neighborFontAfter = after ? after->cell(0, 0).fontStyle : QString();
+                const bool styleUiOk = styleSelectorsShown && styleNoteShown;
+                const bool heightInitOk = std::abs(heightSpinInitial - cellHeightBefore) <= 0.005;
+                const bool heightOk = std::abs(cellHeightAfter - kEditedCellHeight) < 1e-9;
+                const bool fontInitOk = (fontInitial == cellFontBefore);
+                const bool fontOk = !fontPicked.isEmpty() && cellFontAfter == fontPicked;
+                const bool neighborOk = std::abs(neighborHeightAfter - neighborHeightBefore) < 1e-9
+                                        && neighborFontAfter == neighborFontBefore;
+
+                out() << QStringLiteral("  双击单元格：命中 %1 / 编辑框 %2 / 样式项 %3 / "
+                                        "本格字高 %4 → %5 / 本格字体「%6」→「%7」 / "
+                                        "本格内容 %8 / 邻格样式 %9 / 同表其它格内容 %10")
+                             .arg(hitOk ? QStringLiteral("第 2 行第 2 列")
+                                        : QStringLiteral("不符（%1,%2）")
+                                              .arg(editedRow)
+                                              .arg(editedCol),
+                                  dialogOk ? (sawMultiLine ? QStringLiteral("多行框")
+                                                           : QStringLiteral("单行框"))
+                                           : QStringLiteral("不符"),
+                                  styleUiOk ? QStringLiteral("字体+字高 可用（含说明行）")
+                                            : QStringLiteral("不符"),
+                                  QString::number(cellHeightBefore, 'f', 2),
+                                  QString::number(cellHeightAfter, 'f', 2),
+                                  cellFontBefore.isEmpty() ? QStringLiteral("（默认）")
+                                                           : cellFontBefore,
+                                  cellFontAfter.isEmpty() ? QStringLiteral("（默认）")
+                                                          : cellFontAfter,
+                                  contentOk ? QStringLiteral("已更新")
+                                            : QStringLiteral("未更新"),
+                                  neighborOk ? QStringLiteral("未受影响")
+                                             : QStringLiteral("被改动"),
+                                  othersOk ? QStringLiteral("未受影响")
+                                           : QStringLiteral("被改动"))
+                      << Qt::endl;
+                if (!hitOk || !contentOk || !dialogOk || !othersOk || !titleOk || !styleUiOk
+                    || !heightInitOk || !heightOk || !fontInitOk || !fontOk || !neighborOk) {
+                    out() << QStringLiteral("    期望该格为「%1」，实际「%2」；"
+                                            "对话框标题「%3」；字高初值 %4（本格 %5）、"
+                                            "字体初值「%6」（本格「%7」）；"
+                                            "邻格字高 %8（原 %9）")
+                                 .arg(typed, cellText, dialogTitle)
+                                 .arg(heightSpinInitial)
+                                 .arg(cellHeightBefore)
+                                 .arg(fontInitial, cellFontBefore)
+                                 .arg(neighborHeightAfter)
+                                 .arg(neighborHeightBefore)
+                          << Qt::endl;
+                    ++failures;
+                }
+
+                // 撤销应还原原文与本格样式，重做应再次生效
+                cellDoc->undoStack()->undo();
+                const auto* undone = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                const bool undoOk = undone
+                    && undone->cell(1, 1).text == QStringLiteral("轴承座")
+                    && std::abs(undone->cellHeightOr(1, 1) - cellHeightBefore) < 1e-9
+                    && undone->cell(1, 1).fontStyle == cellFontBefore;
+                cellDoc->undoStack()->redo();
+                const auto* redone = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                const bool redoOk = redone && redone->cell(1, 1).text == typed
+                                    && std::abs(redone->cellHeightOr(1, 1) - kEditedCellHeight) < 1e-9
+                                    && redone->cell(1, 1).fontStyle == fontPicked;
+                out() << QStringLiteral("  单元格编辑 撤销/重做：%1 / %2")
+                             .arg(undoOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                  redoOk ? QStringLiteral("通过") : QStringLiteral("失败"))
+                      << Qt::endl;
+                if (!undoOk || !redoOk) ++failures;
+
+                // 第二条链路：单元格内容**本身是多行**时（同格多行在读入时就会拼成
+                // '\n'），编辑框必须是多行框——单行框只看得到第一行，回车确认就把
+                // 后面的行悄悄丢了。与双击单行文字那条既有约定同一个道理。
+                {
+                    bool multiSeen = false;
+                    bool singleSeen = false;
+                    const QString suffix = QStringLiteral("-已改");
+                    const QString shot = dir.filePath(QStringLiteral("ui_table_cell_multiline.png"));
+                    QTimer::singleShot(250, [&multiSeen, &singleSeen, suffix, shot]() {
+                        auto* modal = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                        if (!modal) return;
+
+                        const QPixmap pixmap = modal->grab();
+                        if (!pixmap.isNull() && pixmap.save(shot)) {
+                            out() << QStringLiteral("  已保存 %1  (%2×%3)")
+                                         .arg(QFileInfo(shot).fileName())
+                                         .arg(pixmap.width())
+                                         .arg(pixmap.height())
+                                  << Qt::endl;
+                        }
+
+                        if (auto* multi = modal->findChild<QPlainTextEdit*>(
+                                QStringLiteral("textEditDialog.multiLine"))) {
+                            multiSeen = true;
+                            multi->setPlainText(multi->toPlainText() + suffix);
+                            multi->moveCursor(QTextCursor::End);
+                            QTest::keyClick(multi, Qt::Key_Return, Qt::NoModifier);   // 确认
+                            return;
+                        }
+                        if (auto* single = modal->findChild<QLineEdit*>(
+                                QStringLiteral("textEditDialog.singleLine"))) {
+                            singleSeen = true;
+                            single->setText(single->text() + suffix);
+                            QTest::keyClick(single, Qt::Key_Return, Qt::NoModifier);
+                            return;
+                        }
+                        modal->reject();
+                    });
+
+                    // 第 2 行第 1 列（0 基）格的中心。注意重新取一次图元：上一条链路
+                    // 编辑过表格，replaceEntity 已经把原来那个对象换掉了，旧指针是悬空的。
+                    const auto* live = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                    const std::vector<double> rows2 = live->rowBoundaries();
+                    const std::vector<double> cols2 = live->columnBoundaries();
+                    const Point2D center2 = live->toWorld(
+                        Point2D(0.5 * (cols2[1] + cols2[2]), 0.5 * (rows2[2] + rows2[3])));
+                    const Point2D device2 = canvas->view().toDevice(center2);
+                    QTest::mouseDClick(canvas, Qt::LeftButton, Qt::NoModifier,
+                                       QPoint(static_cast<int>(device2.x),
+                                              static_cast<int>(device2.y)));
+                    settle(application, 300);
+
+                    const auto* cell2 = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                    const QString text2 = cell2 ? cell2->cell(2, 1).text : QString();
+                    const QString expected2 = QStringLiteral("第一行\n第二行") + suffix;
+                    const bool multiOk = multiSeen && !singleSeen;
+                    const bool keptOk = (text2 == expected2);
+                    const bool hit2Ok = (editedRow == 2 && editedCol == 1);
+                    out() << QStringLiteral("  多行单元格：命中 %1 / 编辑框 %2 / 换行保留 %3")
+                                 .arg(hit2Ok ? QStringLiteral("第 3 行第 2 列")
+                                             : QStringLiteral("不符（%1,%2）")
+                                                   .arg(editedRow)
+                                                   .arg(editedCol),
+                                      multiOk ? QStringLiteral("多行框")
+                                              : QStringLiteral("不符"),
+                                      keptOk ? QStringLiteral("通过") : QStringLiteral("失败"))
+                          << Qt::endl;
+                    if (!multiOk || !keptOk || !hit2Ok) {
+                        out() << QStringLiteral("    期望「%1」，实际「%2」")
+                                     .arg(QString(expected2).replace(QLatin1Char('\n'),
+                                                                     QStringLiteral("\\n")),
+                                          QString(text2).replace(QLatin1Char('\n'),
+                                                                 QStringLiteral("\\n")))
+                              << Qt::endl;
+                        ++failures;
+                    }
+                }
+
+                if (!capture(application, window,
+                             dir.filePath(QStringLiteral("ui_table_cell_edit.png")))) {
+                    ++failures;
+                }
+
+                // 第三条链路：**直接把线拖走**改行高 / 列宽（Excel 的习惯）-------------
+                //
+                // 关键在"不必先选中表格"：光标压到行列界线上按下就能拖，光标还会变成
+                // 调整形状（这条操作没有别的可见提示，光标是唯一的可发现性来源）。
+                // 落点特意**不取界线中点**——中点那儿有夹点方块，取中点就分不清是
+                // "抓到了方块"还是"抓到了整条线"。
+                {
+                    const SnapSettings savedSnap = tools->snapSettings();
+                    tools->snapSettings().enabled = false;
+                    cellDoc->selection().clear();       // 故意不选中：证明点线即可拖
+
+                    const auto* liveTable = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+
+                    // 移动走画布的真实事件处理：QTest::mouseMove 在离屏平台下会被
+                    // 合并/丢弃（实测三次里只有一次到达），而这里要验的正是画布在
+                    // 悬停时换不换光标。按下与松开仍用 QTest 投递。
+                    const auto hoverAt = [&](const QPoint& p) {
+                        QMouseEvent move(QEvent::MouseMove, QPointF(p), QPointF(p),
+                                         Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+                        QApplication::sendEvent(canvas, &move);
+                    };
+
+                    // 第 1 列界线上的一点（x=30），离中点（y=-12）有一段距离
+                    const Point2D onLineWorld = liveTable->toWorld(Point2D(30.0, -3.0));
+                    const Point2D targetWorld = liveTable->toWorld(Point2D(45.0, -3.0));
+                    const Point2D offLineWorld = liveTable->toWorld(Point2D(14.0, -5.0));
+                    const auto toPoint = [&canvas](const Point2D& w) {
+                        const Point2D d = canvas->view().toDevice(w);
+                        return QPoint(static_cast<int>(d.x), static_cast<int>(d.y));
+                    };
+                    const QPoint onLinePoint = toPoint(onLineWorld);
+                    const QPoint targetPoint = toPoint(targetWorld);
+                    const QPoint offLinePoint = toPoint(offLineWorld);
+
+                    // 悬停在线上 → 横向调整光标；移开 → 恢复
+                    hoverAt(onLinePoint);
+                    settle(application, 80);
+                    const Qt::CursorShape hoverShape = canvas->cursor().shape();
+                    const bool hoverOk = hoverShape == Qt::SizeHorCursor;
+                    hoverAt(offLinePoint);
+                    settle(application, 80);
+                    const bool hoverOffOk = canvas->cursor().shape() != Qt::SizeHorCursor;
+                    hoverAt(onLinePoint);
+                    settle(application, 80);
+
+                    // 只在线上点一下（不拖）不该改任何东西。这条踩过：按下即进入
+                    // 拖拽，手抖几个像素就把列宽改了——所以按下与拖动之间要有阈值。
+                    const int undoBeforeClick = cellDoc->undoStack()->index();
+                    QTest::mousePress(canvas, Qt::LeftButton, Qt::NoModifier, onLinePoint);
+                    QTest::mouseRelease(canvas, Qt::LeftButton, Qt::NoModifier, onLinePoint);
+                    settle(application, 150);
+                    const auto* afterClick = static_cast<const TableEntity*>(
+                        cellDoc->entity(tableId));
+                    const bool clickSafe = afterClick
+                        && std::abs(afterClick->columnWidth(0) - 30.0) < 1e-9
+                        && std::abs(afterClick->totalWidth() - 90.0) < 1e-9
+                        && cellDoc->undoStack()->index() == undoBeforeClick;
+                    const bool clickSelects = cellDoc->selection().contains(tableId);
+
+                    QTest::mousePress(canvas, Qt::LeftButton, Qt::NoModifier, onLinePoint);
+                    settle(application, 120);
+                    const QString draggedLabel = tools->promptText();
+                    const bool labelOk = draggedLabel.contains(QStringLiteral("第 1 列的右界线"));
+                    hoverAt(targetPoint);
+                    settle(application, 120);
+                    if (!capture(application, window,
+                                 dir.filePath(QStringLiteral("ui_table_grip_drag.png")))) {
+                        ++failures;
+                    }
+                    QTest::mouseRelease(canvas, Qt::LeftButton, Qt::NoModifier, targetPoint);
+                    settle(application, 150);
+
+                    const auto* dragged = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                    const double widthAfter = dragged ? dragged->columnWidth(0) : 0.0;
+                    const bool widthOk = std::abs(widthAfter - 45.0) < 0.5;
+                    // 内部界线只挪线：左格长多少、右格就短多少，总宽不变
+                    const bool neighborOk = dragged
+                        && std::abs(dragged->columnWidth(1) - 15.0) < 0.5;
+                    const bool thirdColOk = dragged
+                        && std::abs(dragged->columnWidth(2) - 30.0) < 0.5;
+                    const bool totalOk = dragged && std::abs(dragged->totalWidth() - 90.0) < 0.5;
+
+                    out() << QStringLiteral("  直接拖列界线（未选中表格）：光标 %1 / 移开 %2 / "
+                                            "只点一下 %3 / 提示 %4 / 第 1 列 30 → 45 / "
+                                            "相邻列 30 → 15 / 总宽 %5")
+                                 .arg(hoverOk ? QStringLiteral("已变调整形状")
+                                              : QStringLiteral("未变（%1）")
+                                                    .arg(static_cast<int>(hoverShape)),
+                                      hoverOffOk ? QStringLiteral("已恢复")
+                                                 : QStringLiteral("未恢复"),
+                                      clickSafe ? (clickSelects
+                                                       ? QStringLiteral("未改动（仅选中）")
+                                                       : QStringLiteral("未改动（也没选中）"))
+                                                : QStringLiteral("把尺寸改了"),
+                                      labelOk ? QStringLiteral("「第 1 列的右界线」")
+                                              : QStringLiteral("未说明（%1）").arg(draggedLabel),
+                                      totalOk ? QStringLiteral("不变（90）")
+                                              : QStringLiteral("被改动"))
+                          << Qt::endl;
+                    if (!hoverOk || !hoverOffOk || !clickSafe || !labelOk || !widthOk
+                        || !neighborOk || !thirdColOk || !totalOk) {
+                        out() << QStringLiteral("    第 1 列 %1 / 第 2 列 %2 / 第 3 列 %3 / 总宽 %4")
+                                     .arg(dragged ? dragged->columnWidth(0) : -1.0)
+                                     .arg(dragged ? dragged->columnWidth(1) : -1.0)
+                                     .arg(dragged ? dragged->columnWidth(2) : -1.0)
+                                     .arg(dragged ? dragged->totalWidth() : -1.0)
+                              << Qt::endl;
+                        ++failures;
+                    }
+
+                    // 撤销应还原行高列宽
+                    cellDoc->undoStack()->undo();
+                    const auto* undone = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                    const bool undoOk = undone && std::abs(undone->columnWidth(0) - 30.0) < 1e-9
+                                        && std::abs(undone->totalWidth() - 90.0) < 1e-9;
+                    cellDoc->undoStack()->redo();
+                    const auto* redone = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                    // 重做要与**拖拽实际得到的那一列宽**逐位一致：拖拽目标经屏幕像素
+                    // 取整，不会是整数 45（那是坐标反算，不是功能）
+                    const bool redoOk = redone
+                                        && std::abs(redone->columnWidth(0) - widthAfter) < 1e-9;
+                    out() << QStringLiteral("  拖动后 撤销/重做：%1 / %2")
+                                 .arg(undoOk ? QStringLiteral("通过") : QStringLiteral("失败"),
+                                      redoOk ? QStringLiteral("通过") : QStringLiteral("失败"))
+                          << Qt::endl;
+                    if (!undoOk || !redoOk) ++failures;
+
+                    // 行界线同样只挪线，而且**各格字高一个都不许变**（拖线不该改字的大小）。
+                    // 这里量不了像素，但属性 + 截图足以看住回归；像素级断言在
+                    // tests/test_table.cpp 的 cellTextHeightIsPerCell 里。
+                    const auto* beforeRow = static_cast<const TableEntity*>(
+                        cellDoc->entity(tableId));
+                    // 拿两格的逐格字高来比：只有逐格存的值都稳住了，才算真的没改字
+                    const double textHeightBefore = beforeRow->cellHeightOr(0, 0);
+                    const double otherHeightBefore = beforeRow->cellHeightOr(1, 1);
+                    const double totalHeightBefore = beforeRow->totalHeight();
+                    const double row0Before = beforeRow->rowHeight(0);
+
+                    // 第 1 行的下界线（局部 y=-8）往下拖 4：只挪线，总高不变
+                    const QPoint rowLinePoint = toPoint(beforeRow->toWorld(Point2D(15.0, -8.0)));
+                    const QPoint rowTargetPoint = toPoint(beforeRow->toWorld(Point2D(15.0, -12.0)));
+                    QTest::mousePress(canvas, Qt::LeftButton, Qt::NoModifier, rowLinePoint);
+                    hoverAt(rowTargetPoint);
+                    settle(application, 150);
+                    QTest::mouseRelease(canvas, Qt::LeftButton, Qt::NoModifier, rowTargetPoint);
+                    settle(application, 150);
+
+                    const auto* afterRow = static_cast<const TableEntity*>(cellDoc->entity(tableId));
+                    const bool rowResized = afterRow && std::abs(afterRow->rowHeight(0) - 12.0) < 0.5
+                                            && afterRow->rowHeight(0) > row0Before;
+                    const bool totalKept = afterRow
+                        && std::abs(afterRow->totalHeight() - totalHeightBefore) < 0.5;
+                    const bool textKept = afterRow
+                        && std::abs(afterRow->cellHeightOr(0, 0) - textHeightBefore) < 1e-9
+                        && std::abs(afterRow->cellHeightOr(1, 1) - otherHeightBefore) < 1e-9;
+                    const bool cellKept = afterRow
+                        && afterRow->cell(0, 0).text == QStringLiteral("序号");
+
+                    if (!capture(application, window,
+                                 dir.filePath(QStringLiteral("ui_table_row_drag.png")))) {
+                        ++failures;
+                    }
+                    out() << QStringLiteral("  拖行界线：第 1 行 %1 → %2 / 总高 %3 / 各格字高 %4 / 单元格文字 %5")
+                                 .arg(row0Before)
+                                 .arg(afterRow ? afterRow->rowHeight(0) : -1.0)
+                                 .arg(totalKept ? QStringLiteral("不变") : QStringLiteral("变了"),
+                                      textKept ? QStringLiteral("不变")
+                                               : QStringLiteral("被改了（%1）")
+                                                     .arg(afterRow
+                                                              ? afterRow->cellHeightOr(0, 0)
+                                                              : -1.0),
+                                      cellKept ? QStringLiteral("未受影响")
+                                               : QStringLiteral("被改动"))
+                          << Qt::endl;
+                    if (!rowResized || !totalKept || !textKept || !cellKept) ++failures;
+
+                    cellDoc->selection().clear();
+                    tools->snapSettings() = savedSnap;
+                    settle(application, 120);
+                }
+
+                QObject::disconnect(tools, &ToolManager::tableCellEditRequested, nullptr, nullptr);
+
+                // 收尾：把这次编辑与样表一并撤掉，后面的快照（特性面板等）不该看见它
+                while (cellDoc->undoStack()->index() > undoBeforeTable) {
+                    cellDoc->undoStack()->undo();
+                }
+                settle(application, 120);
             }
         }
 

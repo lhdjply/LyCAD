@@ -44,6 +44,7 @@ void TableEntity::reset(std::size_t rowCount, std::size_t columnCount,
 
     m_rowHeights.assign(rowCount, std::max(rowHeight, kMinSize));
     m_columnWidths.assign(columnCount, std::max(columnWidth, kMinSize));
+    // 没有整表字高可取：单元格为空时也就没有样式，字高在写入文字时按行高冻一个初值
     m_cells.clear();
     m_merges.clear();
 }
@@ -155,6 +156,27 @@ TableCell TableEntity::cell(std::size_t row, std::size_t col) const
     return it == m_cells.end() ? TableCell() : it->second;
 }
 
+double TableEntity::defaultCellTextHeight(std::size_t row) const
+{
+    return std::max(rowHeight(row) * 0.5, kMinSize);
+}
+
+void TableEntity::assignMissingCellHeights()
+{
+    for (auto& [key, value] : m_cells) {
+        if (value.text.isEmpty()) continue;
+        if (!(value.height > 0.0)) {
+            value.height = defaultCellTextHeight(static_cast<std::size_t>(key.first));
+        }
+    }
+}
+
+double TableEntity::cellHeightOr(std::size_t row, std::size_t col) const
+{
+    const TableCell c = cell(row, col);
+    return (c.height > 0.0) ? c.height : defaultCellTextHeight(row);
+}
+
 void TableEntity::setCell(std::size_t row, std::size_t col, const TableCell& c)
 {
     if (row >= rowCount() || col >= columnCount()) return;
@@ -162,7 +184,13 @@ void TableEntity::setCell(std::size_t row, std::size_t col, const TableCell& c)
         m_cells.erase({ static_cast<int>(row), static_cast<int>(col) });
         return;
     }
-    m_cells[{ static_cast<int>(row), static_cast<int>(col) }] = c;
+    // 有文字却没有字高（调用方只填了内容）：按该行行高冻一个初值。**必须在写入时冻**，
+    // 不能在渲染/写出时实时算——那样拖一下行界线，格里的字就会跟着变大变小。
+    TableCell stored = c;
+    if (!stored.text.isEmpty() && !(stored.height > 0.0)) {
+        stored.height = defaultCellTextHeight(row);
+    }
+    m_cells[{ static_cast<int>(row), static_cast<int>(col) }] = stored;
 }
 
 void TableEntity::setCellText(std::size_t row, std::size_t col, const QString& text)
@@ -179,6 +207,7 @@ void TableEntity::setCellAlign(std::size_t row, std::size_t col, TableCellAlign 
     setCell(row, col, c);
 }
 
+
 std::vector<std::tuple<int, int, TableCell>> TableEntity::nonEmptyCells() const
 {
     std::vector<std::tuple<int, int, TableCell>> out;
@@ -188,6 +217,34 @@ std::vector<std::tuple<int, int, TableCell>> TableEntity::nonEmptyCells() const
         out.emplace_back(key.first, key.second, value);
     }
     return out;
+}
+
+std::optional<std::pair<int, int>> TableEntity::cellAtWorld(const Point2D& world) const
+{
+    const std::size_t rows = rowCount();
+    const std::size_t cols = columnCount();
+    if (rows == 0 || cols == 0) return std::nullopt;
+
+    const Point2D local = toLocal(world);
+    const std::vector<double> rowYs = rowBoundaries();      // 上边界 0，向下为负
+    const std::vector<double> colXs = columnBoundaries();   // 左边界 0，向右为正
+
+    // 容差与 distanceTo 的外接矩形判定同一口径：外接矩形内的点一定能落到某一格。
+    // 点正好压在格线上时归给左侧 / 上方那一格（下标的推进条件是严格大于），
+    // 这样既不会因浮点误差落到格外，也不需要调用方自己加容差。
+    if (local.x < -kGeomTol || local.x > colXs.back() + kGeomTol) return std::nullopt;
+    if (local.y > kGeomTol || local.y < rowYs.back() - kGeomTol) return std::nullopt;
+
+    std::size_t col = 0;
+    while (col + 1 < cols && local.x > colXs[col + 1]) ++col;
+    std::size_t row = 0;
+    while (row + 1 < rows && local.y < rowYs[row + 1]) ++row;
+
+    // 合并区：文字归属左上角（见头文件说明）
+    if (const auto merge = mergeContaining(row, col)) {
+        return std::make_pair(merge->row, merge->col);
+    }
+    return std::make_pair(static_cast<int>(row), static_cast<int>(col));
 }
 
 void TableEntity::addMerge(const TableMergeRange& range)
@@ -456,30 +513,152 @@ std::vector<Point2D> TableEntity::snapPoints() const
     return points;
 }
 
-std::vector<Point2D> TableEntity::gripPoints() const
+TableEntity::EdgeHit TableEntity::edgeAtWorld(const Point2D& world, double tolerance) const
 {
-    // 夹点只取四角：单元格角点太多，拖拽意义不明确
+    EdgeHit result;
+    const std::size_t rows = rowCount();
+    const std::size_t cols = columnCount();
+    if (rows == 0 || cols == 0 || tolerance <= 0.0) return result;
+
+    const Point2D local = toLocal(world);
+    const std::vector<double> rB = rowBoundaries();      // 上 0，向下为负
+    const std::vector<double> cB = columnBoundaries();   // 左 0，向右为正
+    const double w = cB.back();
+    const double h = -rB.back();                         // 表格总高（正数）
+
+    // 取垂距最近的一条：交点（距离相等）时列界线先算、且用严格小于，结果确定
+    double best = tolerance;
+
+    // 列界线 j = 1..cols（第 j 列的右边界）：只在表格纵向跨度内可抓
+    if (local.y <= tolerance && local.y >= -h - tolerance) {
+        for (std::size_t j = 1; j <= cols; ++j) {
+            const double d = std::abs(local.x - cB[j]);
+            if (d < best) {
+                best = d;
+                result.hit = true;
+                result.vertical = true;
+                result.index = j;
+                result.label = QStringLiteral("第 %1 列的右界线").arg(j);
+            }
+        }
+    }
+
+    // 行界线 i = 1..rows（第 i 行的下边界）：只在表格横向跨度内可抓
+    if (local.x >= -tolerance && local.x <= w + tolerance) {
+        for (std::size_t i = 1; i <= rows; ++i) {
+            const double d = std::abs(local.y - rB[i]);
+            if (d < best) {
+                best = d;
+                result.hit = true;
+                result.vertical = false;
+                result.index = i;
+                result.label = QStringLiteral("第 %1 行的下界线").arg(i);
+            }
+        }
+    }
+
+    return result;
+}
+
+bool TableEntity::moveColumnBoundary(std::size_t index, const Point2D& world)
+{
+    const std::size_t cols = columnCount();
+    if (index < 1 || index > cols) return false;
+
+    const std::vector<double> bounds = columnBoundaries();
+    const double x = toLocal(world).x;
+
+    if (index < cols) {
+        // 内部界线：左右两格互相让，总宽不变
+        const double delta = x - bounds[index];
+        const double d = std::clamp(delta,
+                                    -(m_columnWidths[index - 1] - kMinSize),
+                                    m_columnWidths[index] - kMinSize);
+        m_columnWidths[index - 1] += d;
+        m_columnWidths[index] -= d;
+        return true;
+    }
+
+    // 最右界线：没有右邻可让，只能改总宽
+    setColumnWidth(index - 1, x - bounds[index - 1]);
+    return true;
+}
+
+bool TableEntity::moveRowBoundary(std::size_t index, const Point2D& world)
+{
+    const std::size_t rows = rowCount();
+    if (index < 1 || index > rows) return false;
+
+    const std::vector<double> bounds = rowBoundaries();
+    const double y = toLocal(world).y;
+
+    if (index < rows) {
+        // 内部界线：上下两格互相让，总高不变
+        const double delta = y - bounds[index];
+        const double d = std::clamp(delta,
+                                    -(m_rowHeights[index] - kMinSize),
+                                    m_rowHeights[index - 1] - kMinSize);
+        m_rowHeights[index - 1] -= d;
+        m_rowHeights[index] += d;
+        return true;
+    }
+
+    // 最下界线：没有下邻可让，只能改总高
+    setRowHeight(index - 1, bounds[index - 1] - y);
+    return true;
+}
+
+std::pair<Point2D, Point2D> TableEntity::columnBoundarySegment(std::size_t index) const
+{
+    if (index < 1 || index > columnCount()) return { Point2D(), Point2D() };
+    const double x = columnBoundaries()[index];
+    return { Point2D(x, 0.0), Point2D(x, -totalHeight()) };
+}
+
+std::pair<Point2D, Point2D> TableEntity::rowBoundarySegment(std::size_t index) const
+{
+    if (index < 1 || index > rowCount()) return { Point2D(), Point2D() };
+    const double y = rowBoundaries()[index];
+    return { Point2D(0.0, y), Point2D(totalWidth(), y) };
+}
+
+std::array<Point2D, 4> TableEntity::outerCorners() const
+{
     const double w = totalWidth();
     const double h = totalHeight();
+    // 左上、右上、右下、左下（局部坐标 Y 向下为负）
     return { toWorld(Point2D(0.0, 0.0)), toWorld(Point2D(w, 0.0)),
              toWorld(Point2D(w, -h)), toWorld(Point2D(0.0, -h)) };
 }
 
+std::vector<Point2D> TableEntity::gripPoints() const
+{
+    // 只有四角：夹点用来整体等比缩放。改行高 / 列宽不走夹点——直接把线拖走
+    // （见 moveColumnBoundary / moveRowBoundary）。界线上画满方块既闹，也和
+    // "整条线都能抓"的命中范围重复。
+    const std::array<Point2D, 4> corners = outerCorners();
+    return { corners[0], corners[1], corners[2], corners[3] };
+}
+
+QString TableEntity::gripLabel(std::size_t index) const
+{
+    return index < 4 ? QStringLiteral("角点（整体缩放）") : QString();
+}
+
 bool TableEntity::moveGrip(std::size_t index, const Point2D& newPos)
 {
-    // 拖拽四角：以对角为锚点重算总宽高，行列尺寸按比例缩放，锚点保持不动。
+    // ---- 四角：整体等比缩放（保持对角锚点不动）------------------------------
     // 局部四角顺序（与 gripPoints 一致）：0=(0,0) 1=(w,0) 2=(w,-h) 3=(0,-h)
     if (index >= 4) return false;
 
     const double curW = totalWidth();
     const double curH = totalHeight();
     if (curW <= kGeomTol || curH <= kGeomTol) return false;
+    const Point2D localTarget = toLocal(newPos);
 
     // 锚点 = 对角（index + 2）
     const std::size_t anchorIndex = (index + 2) % 4;
-    const Point2D localTarget = toLocal(newPos);
 
-    // 目标宽高：拖拽点相对锚点在局部坐标下的跨距
     const double anchorLocalX = (anchorIndex == 1 || anchorIndex == 2) ? curW : 0.0;
     const double anchorLocalY = (anchorIndex == 2 || anchorIndex == 3) ? -curH : 0.0;
 

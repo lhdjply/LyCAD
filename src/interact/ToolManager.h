@@ -111,6 +111,9 @@ public:
     /// 选择工具双击文字时调用：转发为 textEditRequested 信号
     void requestTextEdit(lycad::EntityId id);
 
+    /// 选择工具双击表格单元格时调用：转发为 tableCellEditRequested 信号
+    void requestTableCellEdit(lycad::EntityId id, int row, int col);
+
     // ---- CanvasInputHandler --------------------------------------------------
     bool handleMousePress(const CanvasEvent& event) override;
     bool handleMouseMove(const CanvasEvent& event) override;
@@ -130,6 +133,8 @@ signals:
     void modeChanged();
     /// 双击文字图元请求编辑；id 对应一个 TextEntity，由界面层弹出对话框
     void textEditRequested(lycad::EntityId id);
+    /// 双击表格单元格请求编辑；id 对应一个 TableEntity，(row, col) 是要改的那一格
+    void tableCellEditRequested(lycad::EntityId id, int row, int col);
 
 private:
     struct CommandEntry {

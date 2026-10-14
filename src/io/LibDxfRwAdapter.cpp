@@ -79,6 +79,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <optional>
 #include <numeric>
 #include <set>
 #include <string>
@@ -452,9 +453,15 @@ private:
     std::unique_ptr<TableEntity> buildTableFromGeometry(const TableRef& ref,
                                                         const BlockDef& def) const;
     /// 本体结构有效但 cells 为空（DWG 写出端编码未完全逆向）时，
-    /// 从配对的 *Tnn 几何块把单元格文字按格归位补回，并反推合并区
+    /// 把配对几何块（*Tnn）里的文字按格归位，并取回**逐格**的字高与字体。
+    ///
+    /// 逐格样式（字高 / 字体）是本体（DXF/DWG 的 ACAD_TABLE 记录）**不带**的东西，块内
+    /// 每条 TEXT 的字高与样式名是它们唯一的落点，所以不管文字从哪来都要走这一趟：
+    ///   fillText = true   本体没给出单元格文字（DWG 的 cells 编码尚未完全逆向）时，
+    ///                     用块内文字补回文字、并反推合并区；
+    ///   fillText = false  文字以本体为准，只用块内文字取回逐格样式，一个字符都不改。
     void mergeTableCellTexts(TableEntity& table, const TableRef& ref,
-                             const BlockDef& def) const;
+                             const BlockDef& def, bool fillText) const;
 
     /// DWG 路径的 ATTRIB 是**独立对象**，不跟在 INSERT 后面，只能靠「同一个属主
     /// （块记录）+ 标签命中该块的属性定义」回填。读取期块定义还没装配好（属性
@@ -1724,22 +1731,31 @@ void Builder::finishTables()
     for (TableRef& ref : m_tables) {
         std::unique_ptr<TableEntity> table = buildTableFromNative(ref);
 
+        // 配对几何块：逐格的字高与字体只烘在这里（本体不带），所以文字来自本体时
+        // 也要用它把样式取回来
+        const BlockDef* named = nullptr;
+        if (const auto it = byKey.find(BlockTable::normalizedKey(ref.blockName));
+            it != byKey.end() && it->second) {
+            named = it->second;
+        }
+
         // 本体结构有效但 cells 数组为空：DWG 的 cells 编码尚未完全逆向
         // 而完整的单元格文字烘在 *Tnn 匿名几何块里。此时结构仍以本体为准，
         // 再从几何块把文字按格归位补回来——不算降级，行列尺寸、合并、图层
         // 全部保持本体值，也不触发「按几何块反推」警告。
         if (table && ref.nativeCells.empty()) {
-            const BlockDef* paired = nullptr;
-            const auto named = byKey.find(BlockTable::normalizedKey(ref.blockName));
-            if (named != byKey.end() && named->second) {
-                paired = named->second;
-                m_claimedTableGeometry.insert(named->first);
+            const BlockDef* paired = named;
+            if (paired) {
+                m_claimedTableGeometry.insert(BlockTable::normalizedKey(ref.blockName));
             } else {
                 // DWG(R2000) 里表格本体的块头句柄解不出来 → blockName 为空，
                 // 退回「各取未被认领的一个」配对（每个表格恰对应一个 *Tnn 块）。
                 paired = takeUnclaimedTableGeometry();
             }
-            if (paired) mergeTableCellTexts(*table, ref, *paired);
+            if (paired) mergeTableCellTexts(*table, ref, *paired, true);
+        } else if (table && named) {
+            // 文字以本体为准（一个字符都不改），只把逐格样式从块里取回来
+            mergeTableCellTexts(*table, ref, *named, false);
         }
 
         // 块名缺失/失配：DWG（R2000/AC1015）里 ACAD_TABLE 的本体是一段不透明的
@@ -1771,6 +1787,11 @@ void Builder::finishTables()
             if (table->layerName().isEmpty() || table->layerName() == QLatin1String("0"))
                 table->setLayerName(ref.layer);
         }
+
+        // 没从块里拿到字高的格子（块缺失、或那一格在块里没有对应文字）按各自行的
+        // 行高冻一个初值：此后文档里任何非空单元格的字高都是明确的，渲染与写出都不必
+        // 再"实时算一个"——那正是「拖一下行高，字跟着变大变小」的来源。
+        table->assignMissingCellHeights();
         m_doc.addEntity(std::move(table));
     }
 
@@ -1840,11 +1861,13 @@ std::unique_ptr<TableEntity> Builder::buildTableFromGeometry(const TableRef& ref
     std::vector<std::pair<Point2D, Point2D>> segments;
     segments.reserve(def.entities.size());
 
-    // 文字：记录基线点与内容，稍后按所在单元格归位
+    // 文字：记录基线点、内容与**逐格样式**（字高 / 字体），稍后按所在单元格归位。
+    // 样式只能在写出侧烘进块里，所以块内 TEXT 是它们的唯一来源。
     struct BlockText {
         QString text;
         Point2D anchor;
         double  height = 0.0;
+        QString fontStyle;
     };
     std::vector<BlockText> texts;
     // 几何块内首个非空图层名——表格本体图层不可信（DWG 兜底）时用它。
@@ -1873,7 +1896,8 @@ std::unique_ptr<TableEntity> Builder::buildTableFromGeometry(const TableRef& ref
         }
         case EntityType::Text: {
             const auto* text = static_cast<const TextEntity*>(entity.get());
-            texts.push_back(BlockText{ text->displayString(), text->position(), text->height() });
+            texts.push_back(BlockText{ text->displayString(), text->position(),
+                                       text->height(), text->fontStyle() });
             break;
         }
         default:
@@ -2007,6 +2031,9 @@ std::unique_ptr<TableEntity> Builder::buildTableFromGeometry(const TableRef& ref
             existing.text += QLatin1Char('\n') + text.text;   // 多行堆叠
         } else {
             existing.text = text.text;
+            // 逐格样式只在**该格第一行**时取：同格多行本就同高同字体
+            existing.height = text.height;
+            existing.fontStyle = text.fontStyle;
         }
         existing.align = TableCellAlign::MiddleCenter;
         table->setCell(static_cast<std::size_t>(row), static_cast<std::size_t>(col), existing);
@@ -2020,19 +2047,24 @@ std::unique_ptr<TableEntity> Builder::buildTableFromGeometry(const TableRef& ref
     return table;
 }
 
-//! 本体结构有效但 cells 为空时的补全：*Tnn 匿名几何块里除了网格线，
-//! 还烘着每个非空单元格的 TEXT（写出端与 AutoCAD 原生写法一致）。块基点
-//! 取原点，块内坐标即表格局部坐标，与 rowBoundaries()/columnBoundaries()
+//! 把配对几何块（*Tnn）里的文字按格归位，并取回**逐格**的字高与字体。
+//! 块基点取原点，块内坐标即表格局部坐标，与 rowBoundaries()/columnBoundaries()
 //! 同一参考系——锚点减去块基点（再按块参照缩放折算）后，行按 Y 区间
-//! （第 0 行在最上方）、列按 X 区间归属。只补文字，不动结构：已有内容的
-//! 格用 \n 堆叠，对齐一律置 MiddleCenter（基线锚点反推不出原始对齐）。
+//! （第 0 行在最上方）、列按 X 区间归属。
+//!
+//! 逐格样式（字高 / 字体）**只有这里能拿到**：本体（ACAD_TABLE 记录）既不写字高也不
+//! 写单元格字体，块内每条 TEXT 的字高与样式名是它们唯一的落点——所以 fillText=false
+//! 时（文字以本体为准）也要走这一趟，只是不动任何一个字符。
+//!
+//! fillText=true 时顺带补文字：已有内容的格用 \n 堆叠，对齐一律置 MiddleCenter
+//! （基线锚点反推不出原始对齐）。
 //!
 //! 合并区同样从几何块反推：写出约定「合并区内部的网格线段不画」，因此
 //! 某条内部竖线在行带上找不到覆盖段 → 相邻两格横向连通；内部横线缺失 →
 //! 纵向连通。连通块恰为实心矩形时登记为合并区（addMerge 自拒越界/重叠，
 //! 畸形几何最多被丢弃，不会污染结构）。本体已带 merges 时跳过反推。
 void Builder::mergeTableCellTexts(TableEntity& table, const TableRef& ref,
-                                  const BlockDef& def) const
+                                  const BlockDef& def, bool fillText) const
 {
     // 块参照缩放异常时按 1 处理（LyCAD 写出的表格比例恒为 1）
     const double sx = (std::isfinite(ref.scaleX) && std::abs(ref.scaleX) > 1e-9
@@ -2054,7 +2086,7 @@ void Builder::mergeTableCellTexts(TableEntity& table, const TableRef& ref,
     // 块内内容：轴对齐线段（网格线）与文字锚点，均折算到表格局部参考系
     // （块内坐标 - 块基点，再乘块参照缩放）。
     struct BlockSeg { double x1, y1, x2, y2; };
-    struct BlockText { QString text; double x, y, height; };
+    struct BlockText { QString text; double x, y, height; QString fontStyle; };
     std::vector<BlockSeg> segments;
     std::vector<BlockText> texts;
 
@@ -2086,7 +2118,8 @@ void Builder::mergeTableCellTexts(TableEntity& table, const TableRef& ref,
                 texts.push_back({ text->displayString(),
                                   (text->position().x - baseX) * sx,
                                   (text->position().y - baseY) * sy,
-                                  text->height() * sy });
+                                  text->height() * sy,
+                                  text->fontStyle() });
             }
             break;
         }
@@ -2183,7 +2216,8 @@ void Builder::mergeTableCellTexts(TableEntity& table, const TableRef& ref,
         }
     }
 
-    // ---- 文字按格归位 -------------------------------------------------------
+    // ---- 文字按格归位（顺带取回逐格样式）------------------------------------
+    std::set<std::pair<int, int>> styled;      // 已经取过样式的格子（同格多行只取一次）
     for (const BlockText& text : texts) {
         const double lx = text.x;
         const double ly = text.y;
@@ -2218,14 +2252,29 @@ void Builder::mergeTableCellTexts(TableEntity& table, const TableRef& ref,
 
         if (row < 0 || col < 0) continue;
 
-        TableCell existing = table.cell(static_cast<std::size_t>(row),
-                                        static_cast<std::size_t>(col));
-        if (!existing.text.isEmpty())
-            existing.text += QLatin1Char('\n') + text.text;   // 同格多行堆叠
-        else
-            existing.text = text.text;
-        existing.align = TableCellAlign::MiddleCenter;
-        table.setCell(static_cast<std::size_t>(row), static_cast<std::size_t>(col), existing);
+        const auto r = static_cast<std::size_t>(row);
+        const auto c = static_cast<std::size_t>(col);
+        TableCell existing = table.cell(r, c);
+
+        // 逐格样式：块内文字的字高与样式名就是这一格的真值（本体不带这两项）。
+        // 同一格的多行共用一份样式，所以只在**该格第一行**（还空着、或本体给了文字但
+        // 样式尚未取过）时写一次。判据用"这一格还没取过样式"，避免多行互相覆盖。
+        if (!styled.count({ row, col })) {
+            if (std::isfinite(text.height) && text.height > kGeomTol) {
+                existing.height = text.height;
+            }
+            if (!text.fontStyle.isEmpty()) {
+                existing.fontStyle = text.fontStyle;
+            }
+            styled.insert({ row, col });
+        }
+
+        if (fillText) {
+            if (existing.text.isEmpty()) existing.text = text.text;
+            else existing.text += QLatin1Char('\n') + text.text;   // 同格多行堆叠
+            existing.align = TableCellAlign::MiddleCenter;
+        }
+        table.setCell(r, c, existing);
     }
 }
 
@@ -3146,21 +3195,21 @@ private:
             const double right = cols[c + 1];
             const double midY = (top + bottom) * 0.5;
 
-            const double boxH = std::abs(top - bottom);
             const double boxW = std::abs(right - left);
-            // 文字高度：单元格高度的 60%，再按最长行文字宽度收敛，避免溢出格子
+            // 字高直接取表格自己的属性——**不按格子的高宽实时算**：否则拖一下行列
+            // 界线，块（旧软件的显示依据）里的字就会跟着变大变小，与画布上的渲染
+            // 也不一致。格子装不下就让它溢出，和 AutoCAD 一样。
             const QStringList textLines = cell.text.split(QLatin1Char('\n'));
-            double height = boxH * 0.6;
-            const int longest = [&] {
-                int n = 1;
-                for (const QString& l : textLines) n = std::max(n, static_cast<int>(l.size()));
-                return n;
-            }();
-            if (longest > 0 && boxW > 0.0) {
-                // 粗估：平均字宽约 0.6 倍字高
-                height = std::min(height, boxW / (0.6 * static_cast<double>(longest)));
-            }
+            // 字高与字体都取自**这一格自己**——逐格设置、写入文字时就冻住了，不按
+            // 格子的高宽实时算：否则拖一下行列界线，块（旧软件的显示依据）里的字就会
+            // 跟着变大变小，与画布上的渲染也不一致。格子装不下就让它溢出，和 AutoCAD 一样。
+            const double height = table->cellHeightOr(r, c);
             if (height <= kGeomTol) continue;
+            // 块内 TEXT 的样式名是这一格的字体**唯一的落点**（本体 ACAD_TABLE 的单元格
+            // 不带字体与字高），读回时就从这里取
+            const std::string style = cell.fontStyle.isEmpty()
+                                          ? std::string("Standard")
+                                          : cell.fontStyle.toStdString();
 
             // 对齐 -> 水平锚点与基线 Y（块内局部坐标，Y 向下为负）
             const bool toLeft = cell.align == TableCellAlign::TopLeft
@@ -3188,7 +3237,7 @@ private:
                 text.height = height;
                 text.angle = 0.0;
                 text.widthscale = 1.0;
-                text.style = "Standard";
+                text.style = style;
                 applyCoord(text.basePoint, Point2D(anchorX, baselineY));
                 applyCoord(text.secPoint, Point2D(anchorX, baselineY));
                 if (toLeft || toRight || (cell.align != TableCellAlign::MiddleCenter

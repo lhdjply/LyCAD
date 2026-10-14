@@ -445,6 +445,11 @@ void ToolManager::requestTextEdit(lycad::EntityId id)
     emit textEditRequested(id);
 }
 
+void ToolManager::requestTableCellEdit(lycad::EntityId id, int row, int col)
+{
+    emit tableCellEditRequested(id, row, col);
+}
+
 // -----------------------------------------------------------------------------
 //  CanvasInputHandler
 // -----------------------------------------------------------------------------

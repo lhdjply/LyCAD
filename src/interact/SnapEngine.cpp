@@ -295,6 +295,8 @@ void SnapEngine::collectEntityCandidates(const Document& document,
         case EntityType::Table: {
             // 表格：单元格角点按节点语义捕捉（对齐到表格网格的最常用落点），
             // 外框四角额外按端点上报。
+            // 端点这里取 outerCorners 而不是 gripPoints：夹点里还有行列界线的
+            // 中点（拖动改行高列宽用），把它当"端点"报出去会污染捕捉。
             const auto& table = static_cast<const TableEntity&>(e);
             if (m_settings.node) {
                 for (const Point2D& p : table.snapPoints()) {
@@ -302,7 +304,7 @@ void SnapEngine::collectEntityCandidates(const Document& document,
                 }
             }
             if (m_settings.endpoint) {
-                for (const Point2D& p : table.gripPoints()) {
+                for (const Point2D& p : table.outerCorners()) {
                     hit |= add(p, SnapKind::Endpoint);
                 }
             }

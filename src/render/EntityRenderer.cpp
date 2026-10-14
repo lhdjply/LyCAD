@@ -708,11 +708,16 @@ void drawTableEntity(QPainter& painter, const TableEntity& table,
             const double cx = 0.5 * (cols[c] + cols[cEnd + 1]);
             const double cy = 0.5 * (rows[r] + rows[rEnd + 1]);
 
-            const double rowHeight = rows[r] - rows[rEnd + 1];
-            const double textHeight = std::max(rowHeight * 0.5, 1e-6);
+            // 字高取自**这一格自己**（写入文字时就冻住了，不按行高实时算）：否则拖一下
+            // 行列界线，格里的字就跟着变大变小；行太矮时该溢出的就是溢出，而不是缩字。
+            // 0 只可能是"手工构造的表格"漏填，此时退回该行的默认值。
+            const double textHeight = table.cellHeightOr(r, c);
 
             TextEntity label(cell.text, table.toWorld(Point2D(cx, cy)), textHeight,
                              table.rotation());
+            // 字体同样取这一格自己的；系统没装同名字体时渲染器会自动退回默认字体——
+            // 与单行文字走的是同一条判定，不另开一套
+            if (!cell.fontStyle.isEmpty()) label.setFontStyle(cell.fontStyle);
             TextEntity::HAlign hAlign = TextEntity::HAlign::Center;
             TextEntity::VAlign vAlign = TextEntity::VAlign::Middle;
             mapCellAlign(cell.align, hAlign, vAlign);

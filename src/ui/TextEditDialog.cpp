@@ -5,6 +5,7 @@
 
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
@@ -63,6 +64,7 @@ protected:
 TextEditDialog::TextEditDialog(Mode mode,
                                const QString& content,
                                const QString& fontFamily,
+                               double textHeight,
                                QWidget* parent)
     : QDialog(parent)
     , m_mode(mode)
@@ -95,6 +97,38 @@ TextEditDialog::TextEditDialog(Mode mode,
     fontRow->setContentsMargins(0, 0, 0, 0);
     fontRow->addWidget(new QLabel(QStringLiteral("字体"), this));
     fontRow->addWidget(m_font, 1);
+
+    // 字高：与特性面板同一套量纲与步进（大写字母高度、世界单位），改这里的数值与在
+    // 特性面板里改是同一件事。范围下限取正数——字高为 0 的文字画不出来，也没有意义。
+    m_height = new QDoubleSpinBox(this);
+    m_height->setObjectName(QStringLiteral("textEditDialog.height"));
+    m_height->setDecimals(2);
+    m_height->setRange(0.01, 100000.0);
+    m_height->setSingleStep(0.5);
+    m_height->setKeyboardTracking(false);
+    m_height->setToolTip(QStringLiteral("文字字高（大写字母高度，世界单位）"));
+    m_height->setValue(textHeight > 0.0 ? textHeight : 3.5);
+
+    auto* heightRow = new QHBoxLayout();
+    heightRow->setContentsMargins(0, 0, 0, 0);
+    heightRow->addWidget(new QLabel(QStringLiteral("字高"), this));
+    heightRow->addWidget(m_height, 1);
+
+    // 说明行：默认不显示，需要时由 setStyleNote 填上（表格用它说明"改的是整表"）
+    m_note = new QLabel(this);
+    m_note->setObjectName(QStringLiteral("textEditDialog.styleNote"));
+    m_note->setWordWrap(true);
+    m_note->setEnabled(false);          // 视觉上退到次要位置
+    m_note->setVisible(false);
+
+    auto* styleLayout = new QVBoxLayout();
+    styleLayout->setContentsMargins(0, 0, 0, 0);
+    styleLayout->setSpacing(4);
+    styleLayout->addLayout(fontRow);
+    styleLayout->addLayout(heightRow);
+    styleLayout->addWidget(m_note);
+    auto* styleBox = new QWidget(this);
+    styleBox->setLayout(styleLayout);
 
     QWidget* editor = nullptr;
     QLabel* hint = nullptr;
@@ -130,7 +164,7 @@ TextEditDialog::TextEditDialog(Mode mode,
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     auto* layout = new QVBoxLayout(this);
-    layout->addLayout(fontRow);
+    layout->addWidget(styleBox);
     layout->addWidget(editor, 1);
     layout->addWidget(hint);
     layout->addWidget(buttons);
@@ -154,7 +188,7 @@ TextEditDialog::TextEditDialog(Mode mode,
         m_multiEdit->setFocus();
         m_multiEdit->moveCursor(QTextCursor::End);
     } else {
-        // 单行没有行数要顾虑：一行的高度加上字体行与按钮行即可
+        // 单行没有行数要顾虑：一行的高度加上样式块与按钮行即可
         resize(520, layout->sizeHint().height());
         m_singleEdit->setFocus();
         // 全选：新建时初值通常来自命令行输入或为空，全选便于直接覆盖重打
@@ -181,6 +215,21 @@ int TextEditDialog::lineCount() const
 QString TextEditDialog::fontFamily() const
 {
     return m_font->currentData().toString();
+}
+
+double TextEditDialog::textHeight() const
+{
+    return m_height ? m_height->value() : 0.0;
+}
+
+void TextEditDialog::setStyleNote(const QString& note)
+{
+    if (!m_note) return;
+    m_note->setText(note);
+    m_note->setVisible(!note.isEmpty());
+    if (QLayout* contentLayout = layout()) {
+        resize(width(), contentLayout->sizeHint().height());
+    }
 }
 
 } // namespace lycad

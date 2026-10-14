@@ -190,12 +190,14 @@ bool DrawTextToolBase::mousePress(const CanvasEvent& event)
 
     const ResolvedPoint resolved = resolve(event.worldPos);
 
-    // 内容与字体都从编辑框取。未装配回调（纯交互环境 / 单元测试）时按"取消"
+    // 内容、字体与字高都从编辑框取。未装配回调（纯交互环境 / 单元测试）时按"取消"
     // 处理——不能静默落一条空文字下去，那会让用户以为点击没反应。
     QString content = m_text;
     QString fontFamily;
+    double textHeight = kDefaultTextHeight;
     if (!ctx().editText
-        || !ctx().editText(multiLine(), m_text, QString(), content, fontFamily)) {
+        || !ctx().editText(multiLine(), m_text, QString(), textHeight,
+                           content, fontFamily)) {
         message(QStringLiteral("已取消文字输入。"));
         return true;
     }
@@ -207,7 +209,7 @@ bool DrawTextToolBase::mousePress(const CanvasEvent& event)
         return true;
     }
 
-    commit(resolved.position, content, fontFamily);
+    commit(resolved.position, content, fontFamily, textHeight);
     finish();
     return true;
 }
@@ -243,7 +245,7 @@ void DrawTextToolBase::paintOverlay(QPainter& painter, const EntityRenderer::Dra
 }
 
 void DrawTextToolBase::commit(const Point2D& position, const QString& content,
-                              const QString& fontFamily)
+                              const QString& fontFamily, double textHeight)
 {
     Document* document = ctx().document;
     if (!document) return;
@@ -253,12 +255,15 @@ void DrawTextToolBase::commit(const Point2D& position, const QString& content,
     const QString style = fontFamily.trimmed();
     if (!style.isEmpty()) document->ensureTextFontStyle(style);
 
+    // 字高来自编辑框（用户可以在那里改）；异常值退回默认，绝不落一条画不出来的文字
+    const double height = (textHeight > 0.0) ? textHeight : kDefaultTextHeight;
+
     if (multiLine()) {
         // 多行文字：编辑框里的换行是段落分隔，模型内部一律存 \P
         // （与文件里的写法一致，双击编辑时再转回换行显示）。
         QString raw = content;
         raw.replace(QStringLiteral("\n"), QStringLiteral("\\P"));
-        auto entity = std::make_unique<MTextEntity>(raw, position, kDefaultTextHeight);
+        auto entity = std::make_unique<MTextEntity>(raw, position, height);
         if (!style.isEmpty()) entity->setFontStyle(style);
         applyDefaults(*entity, ctx());
         const int paragraphs = entity->paragraphCount();
@@ -271,7 +276,7 @@ void DrawTextToolBase::commit(const Point2D& position, const QString& content,
         // 归并，避免换行混进单行对象把版面语义（以及导出时的对象类型）改掉。
         QString plain = content;
         plain.replace(QLatin1Char('\n'), QLatin1Char(' '));
-        auto entity = std::make_unique<TextEntity>(plain, position, kDefaultTextHeight);
+        auto entity = std::make_unique<TextEntity>(plain, position, height);
         if (!style.isEmpty()) entity->setFontStyle(style);
         applyDefaults(*entity, ctx());
         document->addEntity(std::move(entity));

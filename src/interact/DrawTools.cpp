@@ -1589,6 +1589,9 @@ void DrawTableTool::commit(const Point2D& insertion, const Point2D& opposite)
     for (std::size_t c = 0; c < m_columns; ++c) {
         table->setColumnWidth(c, width / static_cast<double>(m_columns));
     }
+    // 新建时不需要设字号：字高是**逐格**的，在第一次往格子里写文字时按该行行高冻
+    // 一个初值（行高的一半，与旧观感一致）。冻住之后拖行列界线不再改它——调行高
+    // 不该顺手把字也改了大小。
     applyDefaults(*table, ctx());
     ctx().document->addEntity(std::move(table));
 

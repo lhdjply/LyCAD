@@ -9,6 +9,7 @@
 #include "core/Format.h"
 #include "core/Layer.h"
 #include "core/MTextEntity.h"
+#include "core/TableEntity.h"
 #include "core/TextEntity.h"
 #include "interact/ToolManager.h"
 #include "io/CadFile.h"
@@ -66,6 +67,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 
 namespace lycad {
 
@@ -1199,15 +1201,19 @@ void MainWindow::connectSession(DocumentSession* session)
     // interact 层不依赖 ui 层（工具不该 include 对话框），所以把"弹出编辑框"作为
     // 回调装进工具上下文。单行文字走单行输入框、多行文字走可换行的多行编辑框——
     // 两种形态是不同的控件，用户在框里就能看出自己正在写的是哪一种文字。
+    //
+    // 内容之外还带字体与字高：新建时字高的初值是工具的默认值（由工具传进来），
+    // 用户在框里改了就按改的建。
     tools->context().editText =
         [this](bool multiLine, const QString& initialContent, const QString& initialFont,
-               QString& content, QString& fontFamily) {
+               double& textHeight, QString& content, QString& fontFamily) {
             TextEditDialog dialog(multiLine ? TextEditDialog::Mode::MultiLine
                                             : TextEditDialog::Mode::SingleLine,
-                                  initialContent, initialFont, this);
+                                  initialContent, initialFont, textHeight, this);
             if (dialog.exec() != QDialog::Accepted) return false;
             content = dialog.content();
             fontFamily = dialog.fontFamily();
+            textHeight = dialog.textHeight();
             return true;
         };
 
@@ -1314,7 +1320,7 @@ void MainWindow::connectSession(DocumentSession* session)
         if (session == m_session) refreshPanels();
     });
 
-    // ---- 双击文字 -> 编辑内容（两种文字走**不同的编辑框**）--------------------
+    // ---- 双击文字 -> 编辑内容、字体与字高（两种文字走**不同的编辑框**）--------
     //
     // 单行文字（TEXT）与多行文字（MTEXT）的对象语义不同，编辑入口也分开：
     //   · MTEXT -> 多行编辑框（QPlainTextEdit，Enter 确认 / Alt+Enter 换行）
@@ -1336,6 +1342,11 @@ void MainWindow::connectSession(DocumentSession* session)
         if (isMText) currentContent.replace(QStringLiteral("\\P"), QStringLiteral("\n"));
         const QString currentFont = isMText ? static_cast<MTextEntity*>(entity)->fontStyle()
                                             : static_cast<TextEntity*>(entity)->fontStyle();
+        // 字高也一并编辑：字号与内容同属"这一次编辑该顺手改完"的东西，用户不必
+        // 再绕回特性面板。多行文字若用了内联绝对字高（\H5;），改这里改的是图元整体
+        // 字高，那几段仍按自己的绝对高绘制——与 AutoCAD 一致，不去动内联格式码。
+        const double currentHeight = isMText ? static_cast<MTextEntity*>(entity)->height()
+                                             : static_cast<TextEntity*>(entity)->height();
 
         // 按文字的类别选编辑框。例外：单行文字的内容里若含换行（旧文件或手工构造，
         // 本版工具不会再产生），仍用多行编辑框——单行框只会显示第一行，让用户在
@@ -1345,7 +1356,7 @@ void MainWindow::connectSession(DocumentSession* session)
 
         TextEditDialog dialog(useMultiLine ? TextEditDialog::Mode::MultiLine
                                           : TextEditDialog::Mode::SingleLine,
-                              currentContent, currentFont, this);
+                              currentContent, currentFont, currentHeight, this);
         if (dialog.exec() != QDialog::Accepted) return;
 
         // 首尾空白一律去掉（避免误留空行改变字高与包围盒），行内的换行原样保留。
@@ -1355,9 +1366,14 @@ void MainWindow::connectSession(DocumentSession* session)
             return;
         }
         const QString newFont = dialog.fontFamily();
+        const double newHeight = dialog.textHeight();
         const bool contentChanged = editedContent != currentContent;
         const bool fontChanged = newFont != currentFont;
-        if (!contentChanged && !fontChanged) return;   // 未变化不产生撤销记录
+        const bool heightChanged = newHeight > 0.0
+                                   && std::abs(newHeight - currentHeight) > 1e-9;
+        if (!contentChanged && !fontChanged && !heightChanged) {
+            return;     // 未变化不产生撤销记录
+        }
 
         // 行数会随内容变化（也可能从单行变成多行，版面与包围盒都不一样），
         // 命令行里说清楚结果，用户不必自己数。
@@ -1375,17 +1391,109 @@ void MainWindow::connectSession(DocumentSession* session)
             auto* edited = static_cast<MTextEntity*>(replacement.get());
             edited->setContent(raw);
             if (fontChanged) edited->setFontStyle(newFont);
+            if (heightChanged) edited->setHeight(newHeight);
         } else {
             auto* edited = static_cast<TextEntity*>(replacement.get());
             edited->setContent(editedContent);
             if (fontChanged) edited->setFontStyle(newFont);
+            if (heightChanged) edited->setHeight(newHeight);
             lines = edited->lineCount();
         }
         if (m_document->replaceEntity(id, std::move(replacement),
                                       QStringLiteral("编辑文字"))) {
+            const QString heightNote = heightChanged
+                                           ? QStringLiteral("，字高 %1")
+                                                 .arg(formatLength(newHeight, 2))
+                                           : QString();
             pushMessage(lines > 1
-                            ? QStringLiteral("已编辑文字（%1 行）。").arg(lines)
-                            : QStringLiteral("已编辑文字。"));
+                            ? QStringLiteral("已编辑文字（%1 行%2）。").arg(lines).arg(heightNote)
+                            : QStringLiteral("已编辑文字%1。").arg(heightNote));
+            refreshPanels();
+        }
+    });
+
+    // 表格单元格：双击改落点那一格的文字（字高则属于整张表）。表格是单一图元、内部
+    // 没有可编辑的子对象，所以「改哪一格」由工具层按落点算好（含合并区归左上角的规则）
+    // 后传进来。
+    connect(tools, &ToolManager::tableCellEditRequested, this,
+            [this](EntityId id, int row, int col) {
+        Entity* entity = m_document->entity(id);
+        if (!entity || entity->type() != EntityType::Table) return;
+        auto* table = static_cast<TableEntity*>(entity);
+        if (row < 0 || col < 0) return;
+        const auto r = static_cast<std::size_t>(row);
+        const auto c = static_cast<std::size_t>(col);
+        if (r >= table->rowCount() || c >= table->columnCount()) return;
+
+        // 单元格文字可以含换行（同格多行在读取时就会拼成 '\n'，写出时按行拆成多个
+        // TEXT）。已有换行时只能用多行框：单行框只看得到第一行，回车确认就把后面的
+        // 行悄悄丢了——与双击单行文字那条既有约定同一个道理。
+        const TableCell currentCell = table->cell(r, c);
+        const QString currentContent = currentCell.text;
+        const bool useMultiLine = currentContent.contains(QLatin1Char('\n'));
+        // 字高与字体都是**这一格自己的**（表格没有"整表字号"这回事）。空格的初值按
+        // 该行行高给——与"第一次写入文字时冻的默认值"同一口径。
+        const double currentHeight = table->cellHeightOr(r, c);
+        const QString currentFont = currentCell.fontStyle;
+
+        TextEditDialog dialog(useMultiLine ? TextEditDialog::Mode::MultiLine
+                                           : TextEditDialog::Mode::SingleLine,
+                              currentContent, currentFont, currentHeight, this);
+        // 说清作用范围：这三项改的都是**当前这一格**，同表的其它格一个字、一号字都不动
+        dialog.setStyleNote(QStringLiteral("字体与字高只作用于这一格，同表其它格不受影响。"));
+        dialog.setWindowTitle(QStringLiteral("编辑单元格文字（第 %1 行 第 %2 列）")
+                                  .arg(row + 1)
+                                  .arg(col + 1));
+        if (dialog.exec() != QDialog::Accepted) return;
+
+        // 内容原样写回：表格里前导空格常用来做缩进，不做 trim。
+        // 空串是合法的——那就是清空该格（空白单元格不占存储，见 TableEntity::setCell）。
+        const QString editedContent = dialog.content();
+        const double newHeight = dialog.textHeight();
+        const QString newFont = dialog.fontFamily();
+        const bool heightChanged = newHeight > 0.0
+                                   && std::abs(newHeight - currentHeight) > 1e-9;
+        const bool fontChanged = newFont != currentFont;
+        if (editedContent == currentContent && !heightChanged && !fontChanged) {
+            return;     // 未变化不产生撤销记录
+        }
+
+        // 与双击文字同一条链路：字体先进文字样式表，否则导出时会退化成 txt.shx
+        if (fontChanged) m_document->ensureTextFontStyle(newFont);
+
+        auto replacement = entity->clone();
+        auto* edited = static_cast<TableEntity*>(replacement.get());
+        TableCell cell = edited->cell(r, c);
+        cell.text = editedContent;
+        if (heightChanged) cell.height = newHeight;
+        if (fontChanged) cell.fontStyle = newFont;
+        edited->setCell(r, c, cell);
+        // 撤销标签要说实话：只改了样式的时候，写「编辑单元格文字」会让人以为动的是文字
+        const bool contentChanged = editedContent != currentContent;
+        const QString undoLabel =
+            contentChanged ? QStringLiteral("编辑单元格")
+                           : (fontChanged && heightChanged
+                                  ? QStringLiteral("修改单元格字体与字高")
+                                  : (fontChanged ? QStringLiteral("修改单元格字体")
+                                                 : QStringLiteral("修改单元格字高")));
+        if (m_document->replaceEntity(id, std::move(replacement), undoLabel)) {
+            QString styleNote;
+            if (heightChanged) {
+                styleNote += QStringLiteral("，本格字高 %1").arg(formatLength(newHeight, 2));
+            }
+            if (fontChanged) {
+                styleNote += QStringLiteral("，本格字体 %1")
+                                 .arg(newFont.isEmpty() ? QStringLiteral("（默认）") : newFont);
+            }
+            pushMessage(editedContent.isEmpty()
+                            ? QStringLiteral("已清空单元格（第 %1 行 第 %2 列%3）。")
+                                  .arg(row + 1)
+                                  .arg(col + 1)
+                                  .arg(styleNote)
+                            : QStringLiteral("已编辑单元格（第 %1 行 第 %2 列%3）。")
+                                  .arg(row + 1)
+                                  .arg(col + 1)
+                                  .arg(styleNote));
             refreshPanels();
         }
     });

@@ -181,6 +181,10 @@ public:
     /// 夹点集合（拖拽编辑用）。默认与 snapPoints 相同。
     virtual std::vector<Point2D> gripPoints() const { return snapPoints(); }
 
+    /// 第 index 个夹点的说明（「第 2 行行高」「端点」之类），用于拖拽时的命令行提示。
+    /// 默认空串 = 没什么可说的，界面也就不提。
+    virtual QString gripLabel(std::size_t index) const;
+
     /// 拖拽第 index 个夹点到 newPos。返回是否支持该操作。
     virtual bool moveGrip(std::size_t index, const Point2D& newPos);
 

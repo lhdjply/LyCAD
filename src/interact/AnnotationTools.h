@@ -48,7 +48,8 @@ protected:
 
 private:
     /// 把用户确认的内容落成图元（单行 TextEntity / 多行 MTextEntity）
-    void commit(const Point2D& position, const QString& content, const QString& fontFamily);
+    void commit(const Point2D& position, const QString& content,
+                const QString& fontFamily, double textHeight);
 
     QString m_text;                 ///< 命令行预输入的内容（可为空）
     ResolvedPoint m_cursor;

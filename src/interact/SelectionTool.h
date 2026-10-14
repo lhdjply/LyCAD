@@ -12,6 +12,7 @@
 // =============================================================================
 #pragma once
 
+#include "core/TableEntity.h"
 #include "interact/Tool.h"
 
 namespace lycad {
@@ -23,6 +24,9 @@ public:
     QString name() const override;
     QString displayName() const override;
     QString prompt() const override;
+
+    /// 悬停在表格的行列界线上时换成「可拖动」的调整光标
+    Qt::CursorShape cursorShape() const override;
 
     /// 不在空白处独占左键，从而允许框选
     bool capturesLeftButton() const override { return false; }
@@ -40,15 +44,30 @@ private:
     enum class Mode {
         Idle,
         BoxSelect,
-        GripDrag
+        GripDrag,       ///< 拖角点：整体等比缩放
+        EdgeDrag        ///< 拖表格的行列界线：改行高 / 列宽（内部界线只挪线）
     };
 
     /// 在光标处查找选中图元的夹点，命中返回 true
     bool findGripUnderCursor(const Point2D& world, double tolerance,
                              EntityId& entityId, int& gripIndex) const;
 
+    /// 在光标处查找表格的行列界线（**不必先选中表格**）的命中结果
+    struct EdgeTarget {
+        EntityId            id = kInvalidEntityId;
+        TableEntity::EdgeHit hit;
+        explicit operator bool() const noexcept { return id != kInvalidEntityId; }
+    };
+    EdgeTarget findTableEdgeUnderCursor(const Point2D& world, double tolerance) const;
+
+    /// 刷新「光标是否压在表格界线上」的状态，供 cursorShape 使用
+    void updateHoverEdge(const Point2D& world);
+
     /// 提交夹点拖拽（生成一条可撤销的替换记录）
     void commitGripDrag();
+
+    /// 提交界线拖拽（同上，但走的是改行高 / 列宽那条路）
+    void commitEdgeDrag();
 
     Mode    m_mode = Mode::Idle;
     bool    m_additive = false;         ///< 按住 Shift：加入选择集而非替换
@@ -56,9 +75,21 @@ private:
     Point2D m_pressWorld;
     Point2D m_cursorWorld;
 
+    /// 悬停反馈：压在列界线（左右拖）或行界线（上下拖）上
+    bool    m_hoverColumnEdge = false;
+    bool    m_hoverRowEdge = false;
+
     EntityId m_gripEntity = kInvalidEntityId;
     int      m_gripIndex = -1;
     Point2D  m_gripOriginal;
+
+    /// 界线拖拽：正在拖的那一条（列界线左右拖、行界线上下拖）
+    EntityId    m_edgeEntity = kInvalidEntityId;
+    bool        m_edgeVertical = false;
+    std::size_t m_edgeIndex = 0;
+    QString     m_edgeLabel;
+    Point2D     m_edgeOriginal;         ///< 按下时线的中点：只用于"有没有真的拖动"
+    bool        m_edgeArmed = false;    ///< 光标已越过拖动阈值，才真的开始改尺寸
 };
 
 } // namespace lycad
